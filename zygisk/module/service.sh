@@ -149,18 +149,22 @@ fi
 
 # Background: keep webroot status files fresh so the WebUI can read them
 # via fetch() without needing ksu.exec(). Runs every 15 s indefinitely.
+# Includes config values (host/port/token) so the WebUI can display them.
 (
     WROOT="$MODDIR/webroot"
     while true; do
         P=$(cat /data/local/tmp/audio_bridge.pid 2>/dev/null | tr -d ' \t\n\r')
+        H=$(grep '^HOST='  /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
+        PR=$(grep '^PORT=' /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
+        TK=$(grep '^TOKEN=' /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
         if [ -n "$P" ] && [ -d "/proc/$P" ]; then
             C=$(grep -aE "Connected to server!|Disconnected,|No server configured" \
-                /data/local/tmp/audio_bridge.log 2>/dev/null | tail -1 | sed "s/\"/'/g")
-            printf '{"running":true,"pid":"%s","conn":"%s"}\n' "$P" "$C" \
-                > "$WROOT/status.json" 2>/dev/null
+                /data/local/tmp/audio_bridge.log 2>/dev/null | tail -1 | sed 's/"/'"'"'/g')
+            printf '{"running":true,"pid":"%s","conn":"%s","host":"%s","port":"%s","token":"%s"}\n' \
+                "$P" "$C" "$H" "$PR" "$TK" > "$WROOT/status.json" 2>/dev/null
         else
-            printf '{"running":false,"pid":"","conn":""}\n' \
-                > "$WROOT/status.json" 2>/dev/null
+            printf '{"running":false,"pid":"","conn":"","host":"%s","port":"%s","token":"%s"}\n' \
+                "$H" "$PR" "$TK" > "$WROOT/status.json" 2>/dev/null
         fi
         tail -n 60 /data/local/tmp/audio_bridge.log \
             > "$WROOT/daemon.log" 2>/dev/null

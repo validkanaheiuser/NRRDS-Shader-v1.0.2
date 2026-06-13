@@ -58,9 +58,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function sq(s) { return String(s).replace(/'/g, "'\\''"); }
 
-    // ── Config load — fetch() primary, ksu.exec() fallback ───────────────────
+    // ── Config load — ksu.exec() primary, status.json fallback ──────────────
     async function loadConfig() {
-        // Try fetch first (conf is not in webroot, but try ksu.exec for read)
         const res = await runCmd(`cat ${CONFFILE} 2>/dev/null`);
         if (res.errno === 0 && res.stdout) {
             res.stdout.split('\n').forEach(line => {
@@ -71,6 +70,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (k) config[k] = v;
                 }
             });
+        } else {
+            // ksu.exec unavailable — read config embedded in status.json
+            const status = await fetchJSON('./status.json');
+            if (status) {
+                if (status.host)  config.HOST  = status.host;
+                if (status.port)  config.PORT  = status.port;
+                if (status.token) config.TOKEN = status.token;
+            }
         }
         hostInput.value  = config.HOST  || '';
         portInput.value  = config.PORT  || '59100';
@@ -221,8 +228,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         if (res.errno === 0) {
             showResult('success', 'Connection successful! TLS handshake passed.');
-        } else if (res.stderr === 'ksu unavailable') {
-            showResult('error', 'ksu.exec unavailable — cannot test from this WebUI.\nRun the daemon manually to verify connectivity.');
+        } else if (res.errno !== 0 && !res.stdout && !res.stderr.includes('fail')) {
+            // ksu.exec unavailable — check if daemon is already connected via status.json
+            const status = await fetchJSON('./status.json');
+            const conn   = (status && status.conn) || '';
+            if (conn.includes('Connected to server!')) {
+                showResult('success', 'Daemon is connected to the server (verified via status).');
+            } else if (status && status.running) {
+                showResult('error', 'Daemon running but not connected.\nStatus: ' + (conn || 'unknown'));
+            } else {
+                showResult('error', 'ksu.exec unavailable — cannot run connection test.\nCheck status card above for connection state.');
+            }
         } else {
             showResult('error', `Connection failed.\n${res.stderr || res.stdout || 'Check IP / Port / Token.'}`);
         }
