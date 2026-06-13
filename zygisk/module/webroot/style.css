@@ -95,7 +95,36 @@ header p {
     margin-top: 12px;
     font-size: 14px;
     color: var(--text-muted);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
 }
+
+.detail-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.detail-label {
+    color: var(--text-muted);
+}
+
+.detail-row span:last-child {
+    color: var(--text-main);
+    font-weight: 500;
+}
+
+.conn-badge {
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.conn-badge.connected    { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+.conn-badge.disconnected { background: rgba(239, 68, 68, 0.15);  color: var(--danger); }
+.conn-badge.waiting      { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
 
 .badge {
     padding: 4px 10px;

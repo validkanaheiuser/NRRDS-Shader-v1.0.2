@@ -579,39 +579,36 @@ else
     echo "$(date) WARNING: no sepolicy tool found" >> $LOG
 fi
 
-# Start daemon if not running.
-# Prefer $MODDIR path — /system/bin/ overlay may not be visible yet on KernelSU
-# when service.sh runs (the overlay is applied, but the binary linker cache for
-# /system/bin may not have been refreshed). $MODDIR is always a real directory.
-if ! pidof audio-bridge >/dev/null 2>&1; then
-    echo "$(date) Starting audio bridge daemon" >> $LOG
-    DAEMON_BIN=""
-    if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
-        chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
-        DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
-    elif [ -f /system/bin/audio-bridge ]; then
-        DAEMON_BIN="/system/bin/audio-bridge"
-    fi
+# Locate daemon binary once — used in every branch below.
+# Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
+# KernelSU when service.sh runs at boot. $MODDIR is always a real directory.
+DAEMON_BIN=""
+if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
+    chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
+    DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
+elif [ -f /system/bin/audio-bridge ]; then
+    DAEMON_BIN="/system/bin/audio-bridge"
+fi
 
-    if [ -n "$DAEMON_BIN" ]; then
-        echo "$(date) Launching: $DAEMON_BIN" >> $LOG
-        "$DAEMON_BIN" --daemon >> $LOG 2>&1 &
-        sleep 3
-        if pidof audio-bridge >/dev/null 2>&1; then
-            echo "$(date) Daemon started OK, PID=$(pidof audio-bridge)" >> $LOG
-        else
-            echo "$(date) WARNING: Daemon failed to start — check SELinux or binary integrity" >> $LOG
-            # Dump first 20 lines of log in case it printed an error before dying
-            head -20 $LOG >> $LOG 2>/dev/null || true
-        fi
+start_daemon() {
+    echo "$(date) Launching: $DAEMON_BIN" >> $LOG
+    "$DAEMON_BIN" --daemon >> $LOG 2>&1 &
+    sleep 3
+    if pidof audio-bridge >/dev/null 2>&1; then
+        echo "$(date) Daemon started OK, PID=$(pidof audio-bridge)" >> $LOG
     else
-        echo "$(date) ERROR: audio-bridge binary not found in MODDIR or /system/bin" >> $LOG
+        echo "$(date) WARNING: Daemon failed to start — check SELinux or binary integrity" >> $LOG
     fi
+}
+
+if [ -z "$DAEMON_BIN" ]; then
+    echo "$(date) ERROR: audio-bridge binary not found in MODDIR or /system/bin" >> $LOG
+elif ! pidof audio-bridge >/dev/null 2>&1; then
+    echo "$(date) Starting audio bridge daemon" >> $LOG
+    start_daemon
 else
-    # At reboot the old daemon may be in the middle of dying from SIGTERM;
-    # pidof still sees it for a second or two. Wait up to 5s for it to exit
-    # before concluding it's truly healthy — if it dies, fall through and
-    # restart it; if it's still alive after 5s it really is running fine.
+    # At reboot the daemon may still be visible in pidof while dying from SIGTERM.
+    # Wait up to 5 s; if it exits we restart, otherwise it is genuinely healthy.
     STALE=0
     for _w in 1 2 3 4 5; do
         sleep 1
@@ -621,16 +618,8 @@ else
         fi
     done
     if [ "$STALE" = "1" ]; then
-        echo "$(date) Stale daemon PID was dying; restarting" >> $LOG
-        if [ -n "$DAEMON_BIN" ]; then
-            $DAEMON_BIN >> $LOG 2>&1 &
-            sleep 1
-            if pidof audio-bridge >/dev/null 2>&1; then
-                echo "$(date) Daemon restarted, PID=$(pidof audio-bridge)" >> $LOG
-            else
-                echo "$(date) WARNING: Daemon failed to restart after stale PID" >> $LOG
-            fi
-        fi
+        echo "$(date) Stale daemon was dying; restarting" >> $LOG
+        start_daemon
     else
         echo "$(date) Daemon already running, PID=$(pidof audio-bridge)" >> $LOG
     fi
@@ -716,16 +705,17 @@ if pidof audio-bridge >/dev/null 2>&1; then
     echo "$(date) daemon killed (was PID $PID)" >> $LOG
 fi
 
-# Stop the foreground service + remove the app if it was installed via
-# pm install fallback (priv-app overlay clean-up is automatic on next boot,
-# but the data-app copy is persistent).
+# Stop the foreground service and uninstall the APK.
+# pm uninstall removes the package entry in all cases — both the data-app
+# copy (persistent) and the priv-app overlay copy (user-space record).
+# The overlay file itself is removed automatically when the module unmounts.
 am stopservice --user 0 -n com.audiobridge/.AudioBridgeService 2>&1 >> $LOG
 APK_PATH=$(pm path com.audiobridge 2>/dev/null)
-if echo "$APK_PATH" | grep -q "/data/app/"; then
+if [ -n "$APK_PATH" ]; then
     pm uninstall --user 0 com.audiobridge >> $LOG 2>&1
     echo "$(date) pm uninstall com.audiobridge (was $APK_PATH)" >> $LOG
 else
-    echo "$(date) priv-app copy at $APK_PATH — will be removed by overlay unmount" >> $LOG
+    echo "$(date) com.audiobridge not installed, nothing to uninstall" >> $LOG
 fi
 
 # Clean diagnostic/runtime files

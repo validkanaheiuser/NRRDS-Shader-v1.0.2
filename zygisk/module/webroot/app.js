@@ -1,265 +1,232 @@
 document.addEventListener('DOMContentLoaded', async () => {
-    console.log('[DEBUG] DOM Content Loaded - Initializing Audio Bridge WebUI');
 
-    // UI Elements
-    const hostInput = document.getElementById('host');
-    const portInput = document.getElementById('port');
-    const tokenInput = document.getElementById('token');
+    const hostInput       = document.getElementById('host');
+    const portInput       = document.getElementById('port');
+    const tokenInput      = document.getElementById('token');
+    const daemonBadge     = document.getElementById('daemon-badge');
+    const daemonPid       = document.getElementById('daemon-pid');
+    const daemonConnection = document.getElementById('daemon-connection');
+    const daemonServer    = document.getElementById('daemon-server');
+    const logOutput       = document.getElementById('log-output');
+    const btnTest         = document.getElementById('btn-test');
+    const btnSave         = document.getElementById('btn-save');
+    const btnRefreshLogs  = document.getElementById('btn-refresh-logs');
+    const testResult      = document.getElementById('test-result');
 
-    const daemonBadge = document.getElementById('daemon-badge');
-    const daemonPid = document.getElementById('daemon-pid');
-    const logOutput = document.getElementById('log-output');
+    const MODDIR  = '/data/adb/modules/audio_bridge';
+    const CONFFILE = '/data/local/tmp/audio_bridge.conf';
+    const LOGFILE  = '/data/local/tmp/audio_bridge.log';
+    // Shell snippet that resolves the daemon binary path (MODDIR preferred)
+    const FIND_DAEMON =
+        `DAEMON=$(ls ${MODDIR}/system/bin/audio-bridge /system/bin/audio-bridge 2>/dev/null | head -1)`;
 
-    const btnTest = document.getElementById('btn-test');
-    const btnSave = document.getElementById('btn-save');
-    const btnRefreshLogs = document.getElementById('btn-refresh-logs');
-    const testResult = document.getElementById('test-result');
+    let config = { HOST: '', PORT: '59100', TOKEN: '' };
 
-    // Verify all UI elements exist
-    const elements = {
-        hostInput, portInput, tokenInput, daemonBadge, daemonPid,
-        logOutput, btnTest, btnSave, btnRefreshLogs, testResult
-    };
-    for (const [name, element] of Object.entries(elements)) {
-        if (!element) {
-            console.error(`[ERROR] UI element not found: ${name}`);
-        } else {
-            console.log(`[DEBUG] UI element found: ${name}`);
-        }
-    }
-
-    // Default configuration fallback
-    let config = {
-        HOST: "192.168.2.153",
-        PORT: "59100",
-        TOKEN: "default_secure_token_123"
-    };
-    console.log('[DEBUG] Default config loaded:', { ...config, TOKEN: '***HIDDEN***' });
-
-    // Helper: Run shell command via KernelSU
+    // ── Shell exec via KernelSU ───────────────────────────────────────────────
     async function runCmd(cmd) {
-        console.log(`[DEBUG] Executing command: ${cmd}`);
-
         if (typeof ksu === 'undefined') {
-            console.error('[ERROR] KernelSU API not available - Not running inside KernelSU WebUI');
-            return { errno: 1, stdout: "Error: Not running inside KernelSU WebUI", stderr: "" };
+            return { errno: 1, stdout: '', stderr: 'KernelSU WebUI not available' };
         }
-
         try {
-            const result = await ksu.exec(cmd);
-            console.log(`[DEBUG] Command result - errno: ${result.errno}, stdout length: ${result.stdout?.length || 0}, stderr length: ${result.stderr?.length || 0}`);
-            if (result.errno !== 0) {
-                console.warn(`[WARN] Command failed with errno ${result.errno}: ${cmd}`);
-                if (result.stderr) console.warn(`[WARN] stderr: ${result.stderr}`);
-            }
-            return result;
-        } catch (error) {
-            console.error(`[ERROR] Exception executing command: ${cmd}`, error);
-            return { errno: 1, stdout: "", stderr: error.message };
+            return await ksu.exec(cmd);
+        } catch (e) {
+            return { errno: 1, stdout: '', stderr: e.message };
         }
     }
 
-    // Load Configuration
+    // Escape a value for embedding inside a shell single-quoted string
+    function sq(s) {
+        return String(s).replace(/'/g, "'\\''");
+    }
+
+    // ── Config load ───────────────────────────────────────────────────────────
     async function loadConfig() {
-        console.log('[DEBUG] Loading configuration from /data/local/tmp/audio_bridge.conf');
-        const res = await runCmd('cat /data/local/tmp/audio_bridge.conf');
-
+        const res = await runCmd(`cat ${CONFFILE} 2>/dev/null`);
         if (res.errno === 0 && res.stdout) {
-            console.log('[DEBUG] Config file found, parsing content');
-            const lines = res.stdout.split('\n');
-            console.log(`[DEBUG] Config file has ${lines.length} lines`);
-
-            lines.forEach(line => {
-                const parts = line.split('=');
-                if (parts.length >= 2) {
-                    const key = parts[0].trim();
-                    const value = parts.slice(1).join('=').trim();
-                    config[key] = value;
-                    console.log(`[DEBUG] Config parsed: ${key}=${key === 'TOKEN' ? '***HIDDEN***' : value}`);
+            res.stdout.split('\n').forEach(line => {
+                const eq = line.indexOf('=');
+                if (eq > 0) {
+                    const k = line.slice(0, eq).trim();
+                    const v = line.slice(eq + 1).trim();
+                    if (k) config[k] = v;
                 }
             });
-        } else {
-            console.warn('[WARN] Config file not found or empty, using defaults');
         }
-
-        hostInput.value = config.HOST || "";
-        portInput.value = config.PORT || "";
-        tokenInput.value = config.TOKEN || "";
-
-        console.log('[DEBUG] Configuration loaded - Host:', hostInput.value, 'Port:', portInput.value, 'Token:', tokenInput.value ? '***SET***' : '***EMPTY***');
+        hostInput.value  = config.HOST  || '';
+        portInput.value  = config.PORT  || '59100';
+        tokenInput.value = config.TOKEN || '';
+        updateServerLabel();
     }
 
-    // Check Daemon Status
+    function updateServerLabel() {
+        const h = hostInput.value.trim() || config.HOST;
+        const p = portInput.value.trim() || config.PORT;
+        daemonServer.textContent = h ? `${h}:${p}` : 'Not configured';
+    }
+
+    hostInput.addEventListener('input', updateServerLabel);
+    portInput.addEventListener('input', updateServerLabel);
+
+    // ── Daemon status ─────────────────────────────────────────────────────────
     async function checkStatus() {
-        console.log('[DEBUG] Checking daemon status');
-        
-        // Verify process is actually running via pidof
-        const procCheck = await runCmd('pidof audio-bridge');
-        if (procCheck.errno === 0 && procCheck.stdout.trim() !== '') {
-            const runningPid = procCheck.stdout.trim().split(' ')[0];
-            console.log(`[DEBUG] Process ${runningPid} is running`);
+        // Try pidof first, then pgrep, then PID file
+        let pid = '';
+
+        const r1 = await runCmd('pidof audio-bridge 2>/dev/null');
+        if (r1.errno === 0 && r1.stdout.trim()) {
+            pid = r1.stdout.trim().split(/\s+/)[0];
+        }
+
+        if (!pid) {
+            const r2 = await runCmd('pgrep -x audio-bridge 2>/dev/null');
+            if (r2.errno === 0 && r2.stdout.trim()) {
+                pid = r2.stdout.trim().split(/\s+/)[0];
+            }
+        }
+
+        if (!pid) {
+            const r3 = await runCmd(`cat /data/local/tmp/audio_bridge.pid 2>/dev/null`);
+            if (r3.errno === 0 && r3.stdout.trim()) {
+                const candidate = r3.stdout.trim();
+                const alive = await runCmd(`[ -d /proc/${candidate} ] && echo yes`);
+                if (alive.stdout.includes('yes')) pid = candidate;
+            }
+        }
+
+        if (pid) {
             daemonBadge.textContent = 'Running';
-            daemonBadge.className = 'badge running';
-            daemonPid.textContent = runningPid;
-            return;
-        }
+            daemonBadge.className   = 'badge running';
+            daemonPid.textContent   = pid;
 
-        console.log('[DEBUG] No running daemon detected via pidof');
-        daemonBadge.textContent = 'Stopped';
-        daemonBadge.className = 'badge stopped';
-        daemonPid.textContent = '--';
+            // Determine connection state from the daemon log
+            const logRes = await runCmd(
+                `grep -aE 'Connected to server!|Disconnected,|reconnecting|No server configured' ${LOGFILE} 2>/dev/null | tail -1`
+            );
+            const lastLine = logRes.stdout || '';
+            if (lastLine.includes('Connected to server!')) {
+                daemonConnection.textContent = 'Connected';
+                daemonConnection.className   = 'conn-badge connected';
+            } else if (lastLine.includes('No server configured')) {
+                daemonConnection.textContent = 'Waiting for config';
+                daemonConnection.className   = 'conn-badge waiting';
+            } else {
+                daemonConnection.textContent = 'Disconnected';
+                daemonConnection.className   = 'conn-badge disconnected';
+            }
+        } else {
+            daemonBadge.textContent      = 'Stopped';
+            daemonBadge.className        = 'badge stopped';
+            daemonPid.textContent        = '--';
+            daemonConnection.textContent = '--';
+            daemonConnection.className   = 'conn-badge';
+        }
     }
 
-    // Fetch Logs
+    // ── Log fetch ─────────────────────────────────────────────────────────────
     async function fetchLogs() {
-        console.log('[DEBUG] Fetching logs from /data/local/tmp/audio_bridge.log');
-        const res = await runCmd('tail -n 25 /data/local/tmp/audio_bridge.log');
-
-        if (res.errno === 0) {
-            const logContent = res.stdout || "No logs available yet.";
-            logOutput.textContent = logContent;
-            console.log(`[DEBUG] Logs fetched successfully, ${logContent.length} characters`);
-        } else {
-            console.error('[ERROR] Failed to fetch logs:', res.stderr);
-            logOutput.textContent = "Log file not found or unreadable.";
-        }
-
-        // Auto scroll to bottom
+        // Combine daemon log (last 30 lines) with service log (last 10 lines)
+        const res = await runCmd(
+            `{ echo '── daemon ──'; tail -n 30 ${LOGFILE} 2>/dev/null; ` +
+            `echo '── service ──'; tail -n 10 /data/local/tmp/audio_bridge_service.log 2>/dev/null; } 2>/dev/null`
+        );
+        logOutput.textContent = res.stdout || 'No logs available yet.';
         const terminal = document.querySelector('.terminal');
-        if (terminal) {
-            terminal.scrollTop = terminal.scrollHeight;
-            console.log('[DEBUG] Terminal scrolled to bottom');
-        } else {
-            console.warn('[WARN] Terminal element not found for auto-scroll');
-        }
+        if (terminal) terminal.scrollTop = terminal.scrollHeight;
     }
 
-    // Test Server Connection
+    // ── Test connection ───────────────────────────────────────────────────────
     btnTest.addEventListener('click', async () => {
-        console.log('[DEBUG] Test connection button clicked');
-        const host = hostInput.value.trim();
-        const port = portInput.value.trim();
+        const host  = hostInput.value.trim();
+        const port  = portInput.value.trim();
         const token = tokenInput.value.trim();
 
-        console.log(`[DEBUG] Test parameters - Host: ${host}, Port: ${port}, Token: ${token ? '***PROVIDED***' : '***MISSING***'}`);
-
         if (!host || !port) {
-            console.warn('[WARN] Test failed - missing host or port');
             showResult('error', 'Please enter a valid Host and Port.');
             return;
         }
 
-        btnTest.disabled = true;
+        btnTest.disabled    = true;
         btnTest.textContent = 'Testing...';
         showResult('hidden', '');
 
-        // Run the daemon with --check-server flag
-        const cmd = `/system/bin/audio-bridge --host "${host}" --port ${port} --token "${token}" --check-server`;
-        console.log(`[DEBUG] Executing test command: ${cmd.replace(token, '***HIDDEN***')}`);
-
+        const cmd =
+            `${FIND_DAEMON}; ` +
+            `"$DAEMON" --host '${sq(host)}' --port '${sq(port)}' --token '${sq(token)}' --check-server 2>&1`;
         const res = await runCmd(cmd);
-        console.log(`[DEBUG] Test command result - errno: ${res.errno}`);
 
         if (res.errno === 0) {
-            console.log('[DEBUG] Connection test successful');
-            showResult('success', 'Connection successful! TLS Handshake passed.');
+            showResult('success', 'Connection successful! TLS handshake passed.');
         } else {
-            const errorMsg = `Connection failed.\n${res.stderr || res.stdout || 'Check your IP/Port/Token.'}`;
-            console.error('[ERROR] Connection test failed:', errorMsg);
-            showResult('error', errorMsg);
+            showResult('error', `Connection failed.\n${res.stderr || res.stdout || 'Check IP / Port / Token.'}`);
         }
 
-        btnTest.disabled = false;
+        btnTest.disabled    = false;
         btnTest.textContent = 'Test Connection';
     });
 
-    // Save & Restart Daemon
+    // ── Save & Restart ────────────────────────────────────────────────────────
     btnSave.addEventListener('click', async () => {
-        console.log('[DEBUG] Save button clicked');
-        const host = hostInput.value.trim();
-        const port = portInput.value.trim();
+        const host  = hostInput.value.trim();
+        const port  = portInput.value.trim();
         const token = tokenInput.value.trim();
 
-        console.log(`[DEBUG] Save parameters - Host: ${host}, Port: ${port}, Token: ${token ? '***PROVIDED***' : '***MISSING***'}`);
-
         if (!host || !port) {
-            console.warn('[WARN] Save failed - missing host or port');
             showResult('error', 'Please enter a valid Host and Port.');
             return;
         }
 
-        btnSave.disabled = true;
+        btnSave.disabled    = true;
         btnSave.textContent = 'Saving...';
 
-        // Write config
-        const confContent = `HOST=${host}\nPORT=${port}\nTOKEN=${token}\n`;
-        console.log('[DEBUG] Writing config file with content:\n', confContent.replace(token, '***HIDDEN***'));
+        // Write config with printf %s format specifiers to avoid backslash
+        // interpretation in the format string, and single-quote each argument
+        // so shell metacharacters in host/token are harmless.
+        await runCmd(
+            `printf '%s\\n%s\\n%s\\n' 'HOST=${sq(host)}' 'PORT=${sq(port)}' 'TOKEN=${sq(token)}' > ${CONFFILE}`
+        );
 
-        // Use printf to handle newlines correctly in shell
-        const writeResult = await runCmd(`printf '${confContent}' > /data/local/tmp/audio_bridge.conf`);
-        if (writeResult.errno !== 0) {
-            console.error('[ERROR] Failed to write config file:', writeResult.stderr);
-        } else {
-            console.log('[DEBUG] Config file written successfully');
-        }
+        // Kill existing daemon cleanly (SIGTERM → clean shutdown)
+        await runCmd(`kill $(pidof audio-bridge 2>/dev/null) 2>/dev/null; sleep 2`);
 
-        // Restart Daemon
-        console.log('[DEBUG] Attempting to kill existing daemon process');
-        const killResult = await runCmd('killall audio-bridge || kill -9 $(cat /data/local/tmp/audio_bridge.pid 2>/dev/null)');
-        console.log(`[DEBUG] Kill command result - errno: ${killResult.errno}`);
+        // Restart daemon directly using the module binary (avoids running the
+        // full boot service.sh which applies SELinux rules, pm-grant, etc.)
+        await runCmd(
+            `${FIND_DAEMON}; [ -n "$DAEMON" ] && "$DAEMON" --daemon >> ${LOGFILE} 2>&1 || true`
+        );
 
-        console.log('[DEBUG] Removing PID file');
-        await runCmd('rm -f /data/local/tmp/audio_bridge.pid');
+        showResult('success', 'Saved. Daemon restarting — status updates in 4 s.');
+        updateServerLabel();
 
-        console.log('[DEBUG] Starting daemon via service script');
-        // Run service.sh in background to handle SELinux context safely
-        const startResult = await runCmd('nohup sh /data/adb/modules/audio_bridge/service.sh >/dev/null 2>&1 &');
-        console.log(`[DEBUG] Start daemon result - errno: ${startResult.errno}`);
-
-        showResult('success', 'Configuration saved. Daemon restarted!');
-        console.log('[DEBUG] Save operation completed');
-
-        setTimeout(() => {
-            btnSave.disabled = false;
+        setTimeout(async () => {
+            btnSave.disabled    = false;
             btnSave.textContent = 'Save & Restart';
-            console.log('[DEBUG] Checking status and fetching logs after save');
-            checkStatus();
-            fetchLogs();
+            await checkStatus();
+            await fetchLogs();
             showResult('hidden', '');
-        }, 2000);
+        }, 4000);
     });
 
-    btnRefreshLogs.addEventListener('click', () => {
-        console.log('[DEBUG] Manual refresh requested');
-        fetchLogs();
-        checkStatus();
+    // ── Refresh button ────────────────────────────────────────────────────────
+    btnRefreshLogs.addEventListener('click', async () => {
+        await fetchLogs();
+        await checkStatus();
     });
 
+    // ── Helpers ───────────────────────────────────────────────────────────────
     function showResult(type, message) {
-        console.log(`[DEBUG] Showing result - Type: ${type}, Message: ${message}`);
-        testResult.className = `test-result ${type}`;
+        testResult.className   = `test-result ${type}`;
         testResult.textContent = message;
     }
 
-    // Initialization
-    console.log('[DEBUG] Starting initialization sequence');
+    // ── Init ──────────────────────────────────────────────────────────────────
     await loadConfig();
     await checkStatus();
     await fetchLogs();
-    console.log('[DEBUG] Initialization complete');
 
-    // Auto-refresh logs every 5 seconds
-    const intervalId = setInterval(() => {
-        console.log('[DEBUG] Auto-refresh triggered (5 second interval)');
-        checkStatus();
-        fetchLogs();
+    const intervalId = setInterval(async () => {
+        await checkStatus();
+        await fetchLogs();
     }, 5000);
 
-    console.log('[DEBUG] Auto-refresh interval set with ID:', intervalId);
-
-    // Optional: Cleanup interval on page unload
-    window.addEventListener('beforeunload', () => {
-        console.log('[DEBUG] Page unloading, clearing auto-refresh interval');
-        clearInterval(intervalId);
-    });
+    window.addEventListener('beforeunload', () => clearInterval(intervalId));
 });
