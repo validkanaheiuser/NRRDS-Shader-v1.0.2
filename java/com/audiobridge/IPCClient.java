@@ -101,10 +101,18 @@ public class IPCClient {
 
         LocalSocket sock = new LocalSocket();
         sock.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
-        mSocket = sock;
 
-        mOut = new PrintWriter(new OutputStreamWriter(sock.getOutputStream()), true);
-        mIn  = new BufferedReader(new InputStreamReader(sock.getInputStream()));
+        // Assign mOut/mIn/mSocket under the instance lock so sendEvent()
+        // can safely read mOut from any thread without using mExecutor
+        // (mExecutor is single-threaded and blocked here in readLine, so
+        // any mExecutor.execute() submitted by sendEvent() would queue
+        // forever and never run — this was the root cause of call state
+        // events never reaching the server).
+        synchronized (this) {
+            mSocket = sock;
+            mOut = new PrintWriter(new OutputStreamWriter(sock.getOutputStream()), true);
+            mIn  = new BufferedReader(new InputStreamReader(sock.getInputStream()));
+        }
 
         mOut.println("HELO_JAVA");
         diag("Connected — HELO_JAVA sent");
@@ -121,12 +129,12 @@ public class IPCClient {
             }
         }
 
-        // Clean up socket resources but do NOT set mRunning=false — the
-        // retry loop in startConnectionThread() must keep running so we
-        // reconnect when the daemon restarts.
-        mOut = null;
-        mIn  = null;
-        mSocket = null;
+        // Clean up under lock so sendEvent() sees a consistent null state.
+        synchronized (this) {
+            mOut = null;
+            mIn  = null;
+            mSocket = null;
+        }
         try { sock.close(); } catch (IOException ignored) {}
         throw new IOException("Socket closed by remote");
     }
@@ -158,13 +166,16 @@ public class IPCClient {
     }
 
     public void sendEvent(JSONObject json) {
-        mExecutor.execute(() -> {
-            if (mOut != null && mSocket != null && mSocket.isConnected()) {
+        // Write directly under the instance lock — NOT via mExecutor, which
+        // is single-threaded and permanently blocked in connectAndListen()'s
+        // readLine loop. Tasks submitted there would queue forever.
+        synchronized (this) {
+            if (mOut != null) {
                 mOut.println(json.toString());
             } else {
-                Log.w(TAG, "Cannot send event, IPC not connected: " + json.toString());
+                Log.w(TAG, "sendEvent: IPC not connected, dropped: " + json.toString());
             }
-        });
+        }
     }
 
     public void disconnect() {
