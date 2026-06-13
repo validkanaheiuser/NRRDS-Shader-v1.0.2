@@ -541,6 +541,12 @@ async def ws_ui(ws: WebSocket) -> None:
                         number=data.get("number"),
                         message=data.get("message"),
                     )
+                elif cmd == "dtmf":
+                    await d.send_control("dtmf", digit=str(data.get("digit", "")))
+                elif cmd == "audio_route":
+                    await d.send_control("audio_route", route=str(data.get("route", "earpiece")))
+                elif cmd == "volume":
+                    await d.send_control("volume", level=int(data.get("level", 7)))
             except Exception as e:
                 log.warning("send_control %s → %s: %s", cmd, did, e)
     except WebSocketDisconnect:

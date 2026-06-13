@@ -1,13 +1,14 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>audio bridge</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
-:root[data-theme='dark'] {
+:root {
   --bg:#080808; --card:#0f0f0f; --card2:#141414;
   --border:rgba(255,255,255,0.07); --bhi:rgba(255,255,255,0.14);
   --text:#efefef; --dim:#909090; --muted:#555;
@@ -15,7 +16,7 @@
   --chip:#181818; --chip-hi:#202020; --inp:#0c0c0c;
   --danger:#f55; --good:#4d4; --warn:#fb3;
 }
-:root[data-theme='light'] {
+[data-theme="light"] {
   --bg:#f3f3f3; --card:#fff; --card2:#fafafa;
   --border:rgba(0,0,0,0.08); --bhi:rgba(0,0,0,0.16);
   --text:#111; --dim:#555; --muted:#999;
@@ -24,123 +25,158 @@
   --danger:#d33; --good:#090; --warn:#a60;
 }
 
+[v-cloak]{display:none;}
 *{margin:0;padding:0;box-sizing:border-box;}
-html,body{background:var(--bg);color:var(--text);}
-body{font-family:'Inter',system-ui,sans-serif;min-height:100vh;
-     padding:2.5rem 1.5rem 5rem;-webkit-font-smoothing:antialiased;}
-.wrap{max-width:1220px;margin:0 auto;}
+html,body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
+body{min-height:100vh;padding:1.5rem 1.25rem 5rem;}
+.wrap{max-width:1340px;margin:0 auto;}
 
-/* header */
-.hdr{display:flex;align-items:center;gap:.75rem;margin-bottom:2rem;}
-.hdr-logo{width:46px;height:46px;border-radius:12px;background:var(--chip) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z'/%3E%3Cpath d='M19 10v2a7 7 0 0 1-14 0v-2'/%3E%3Cline x1='12' y1='19' x2='12' y2='22'/%3E%3C/svg%3E") center/55% no-repeat;flex-shrink:0;}
-.hdr h1{font-size:1.65rem;font-weight:800;letter-spacing:-.02em;text-transform:lowercase;line-height:1;}
-.hdr p{font-size:.8rem;color:var(--muted);margin-top:.15rem;}
+/* ── Header ── */
+.hdr{display:flex;align-items:center;gap:.75rem;margin-bottom:1.5rem;}
+.hdr-logo{width:44px;height:44px;border-radius:11px;background:var(--chip);display:grid;place-items:center;color:var(--dim);flex-shrink:0;}
+.hdr h1{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;text-transform:lowercase;line-height:1;}
+.hdr p{font-size:.78rem;color:var(--muted);margin-top:.1rem;}
 .hdr-right{margin-left:auto;display:flex;gap:.5rem;align-items:center;}
-.conn-pill{font-size:.72rem;color:var(--muted);padding:.28rem .65rem;border:1px solid var(--border);
-  border-radius:999px;display:flex;align-items:center;gap:.38rem;}
+.conn-pill{font-size:.72rem;color:var(--muted);padding:.28rem .65rem;border:1px solid var(--border);border-radius:999px;display:flex;align-items:center;gap:.38rem;transition:all .3s;}
 .conn-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);transition:background .3s;}
 .conn-pill.online .conn-dot{background:var(--good);box-shadow:0 0 5px var(--good);}
+.conn-pill.online{border-color:rgba(68,221,68,.2);}
 .conn-pill.offline .conn-dot{background:var(--danger);}
-.ibtn{width:36px;height:36px;border-radius:9px;background:var(--card);border:1px solid var(--border);
-  cursor:pointer;display:grid;place-items:center;color:var(--text);}
-.ibtn:hover{background:var(--chip);}
+.ibtn{width:34px;height:34px;border-radius:8px;background:var(--card);border:1px solid var(--border);cursor:pointer;display:grid;place-items:center;color:var(--dim);transition:all .15s;}
+.ibtn:hover{background:var(--chip);color:var(--text);}
 .ibtn svg{width:15px;height:15px;}
 
-/* grid */
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem;margin-bottom:.85rem;}
-.g2.wide{grid-template-columns:5fr 7fr;}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.2rem;}
+/* ── Layout ── */
+.grid3{display:grid;grid-template-columns:210px 1fr 270px;gap:.85rem;margin-bottom:.85rem;align-items:start;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.1rem;}
+.card+.card{margin-top:.75rem;}
 .card.full{grid-column:1/-1;}
-.card.hidden{display:none;}
-.lbl{font-size:.67rem;font-weight:600;color:var(--muted);text-transform:uppercase;
-     letter-spacing:.11em;margin-bottom:.85rem;}
+.lbl{font-size:.67rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.11em;margin-bottom:.75rem;}
 
-/* inputs */
-.fld{margin-bottom:.6rem;}
-.fld label{display:block;font-size:.7rem;color:var(--muted);margin-bottom:.28rem;text-transform:lowercase;}
-input,textarea{width:100%;background:var(--inp);border:1px solid transparent;border-radius:8px;
-  padding:.6rem .75rem;color:var(--text);font-family:inherit;font-size:.87rem;outline:none;transition:border-color .15s;}
-input:focus,textarea:focus{border-color:var(--bhi);}
-input::placeholder,textarea::placeholder{color:var(--muted);}
-textarea{resize:vertical;min-height:78px;font-size:.78rem;}
+/* ── Devices ── */
+.devs{display:flex;flex-direction:column;gap:.35rem;}
+.dev{padding:.6rem .75rem;border:1px solid var(--border);border-radius:9px;cursor:pointer;background:var(--chip);transition:all .15s;position:relative;}
+.dev:hover{background:var(--chip-hi);border-color:var(--bhi);}
+.dev.sel{border-color:var(--bhi);}
+.dev-name{font-weight:600;font-size:.84rem;}
+.dev-meta{font-size:.67rem;color:var(--muted);margin-top:.12rem;font-family:'JetBrains Mono',monospace;}
+.dev-state{font-size:.7rem;margin-top:.12rem;}
+.dev-state.idle{color:var(--muted);}
+.dev-state.dialing,.dev-state.ringing{color:var(--warn);}
+.dev-state.active{color:var(--good);}
+.dev-badge{position:absolute;top:.55rem;right:.65rem;font-size:.63rem;padding:.15rem .42rem;border-radius:999px;font-weight:600;}
+.badge-d{background:rgba(255,187,51,.12);color:var(--warn);border:1px solid rgba(255,187,51,.28);}
+.badge-r{background:rgba(255,85,85,.12);color:var(--danger);border:1px solid rgba(255,85,85,.28);animation:pulse 1s ease-in-out infinite;}
+.badge-a{background:rgba(68,221,68,.12);color:var(--good);border:1px solid rgba(68,221,68,.28);}
+.empty-h{padding:1.2rem;color:var(--muted);font-size:.8rem;text-align:center;border:1px dashed var(--border);border-radius:9px;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 
-/* buttons */
-.brow{display:flex;gap:.45rem;margin-top:.65rem;flex-wrap:wrap;}
-button{flex:1;min-width:0;padding:.6rem .85rem;border:1px solid var(--border);border-radius:8px;
-  background:var(--chip);color:var(--text);font-family:inherit;font-size:.83rem;font-weight:500;
-  cursor:pointer;transition:all .15s;text-transform:lowercase;letter-spacing:.01em;}
+/* ── Quick contacts ── */
+.qc-list{display:flex;flex-direction:column;gap:.3rem;}
+.qc-item{display:flex;align-items:center;gap:.45rem;padding:.4rem .55rem;border-radius:7px;background:var(--chip);cursor:pointer;font-size:.78rem;transition:all .15s;}
+.qc-item:hover{background:var(--chip-hi);}
+.qc-avatar{width:26px;height:26px;border-radius:50%;background:var(--card2);display:grid;place-items:center;font-size:.65rem;font-weight:700;color:var(--dim);flex-shrink:0;}
+.qc-info{flex:1;min-width:0;}
+.qc-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.78rem;}
+.qc-num{font-size:.65rem;color:var(--muted);}
+.qc-del{opacity:0;font-size:.7rem;padding:.15rem .3rem;border-radius:5px;transition:opacity .15s;color:var(--muted);}
+.qc-item:hover .qc-del{opacity:.6;}
+.add-ctct{display:flex;gap:.35rem;margin-top:.45rem;}
+.add-ctct input{font-size:.74rem;padding:.38rem .55rem;}
+.add-ctct button{flex:0;padding:.38rem .55rem;font-size:.72rem;}
+
+/* ── Call history ── */
+.hist-list{display:flex;flex-direction:column;gap:.28rem;}
+.hist-item{padding:.42rem .55rem;border-radius:7px;background:var(--chip);cursor:pointer;transition:all .15s;}
+.hist-item:hover{background:var(--chip-hi);}
+.hist-num{font-size:.78rem;font-weight:600;}
+.hist-meta{font-size:.65rem;color:var(--muted);margin-top:.08rem;}
+
+/* ── Call panel ── */
+.call-num-display{font-size:1.85rem;font-weight:700;letter-spacing:.02em;min-height:2.6rem;display:flex;align-items:center;justify-content:center;padding:.4rem .5rem;transition:all .2s;word-break:break-all;}
+.call-num-display.ph{color:var(--muted);}
+
+/* ── Dial pad ── */
+.dialpad{display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;margin:.65rem 0;}
+.key{padding:.75rem .4rem;border:1px solid var(--border);border-radius:10px;background:var(--chip);cursor:pointer;transition:all .1s;text-align:center;user-select:none;}
+.key:hover{background:var(--chip-hi);border-color:var(--bhi);}
+.key:active{transform:scale(.93);}
+.key-digit{font-size:1.2rem;font-weight:700;line-height:1;}
+.key-sub{font-size:.52rem;color:var(--muted);margin-top:.1rem;letter-spacing:.06em;}
+.key.dtmf{border-color:rgba(68,221,68,.18);background:rgba(68,221,68,.04);}
+.key.dtmf:hover{background:rgba(68,221,68,.1);border-color:rgba(68,221,68,.3);}
+.key.dtmf:active{background:rgba(68,221,68,.18);}
+
+/* ── Call states ── */
+.cs-center{text-align:center;padding:.75rem 0;}
+.cs-tag{font-size:.65rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin-bottom:.45rem;}
+.cs-num{font-size:1.6rem;font-weight:700;margin-bottom:.3rem;word-break:break-all;}
+.cs-sub{font-size:.8rem;color:var(--dim);margin-bottom:.9rem;}
+.cs-sub.ring{color:var(--danger);animation:pulse 1s ease-in-out infinite;}
+.anim-dots::after{content:'·';animation:dot3 1.2s steps(3,end) infinite;}
+@keyframes dot3{0%{content:'·'}33%{content:'··'}66%{content:'···'}}
+
+/* ── Active call ── */
+.active-num{font-size:1.05rem;font-weight:700;text-align:center;margin-bottom:.15rem;}
+.active-via{font-size:.74rem;color:var(--muted);text-align:center;margin-bottom:.4rem;}
+.timer{font-family:'JetBrains Mono',monospace;font-size:2.6rem;font-weight:700;letter-spacing:.04em;color:var(--good);margin:.3rem 0 .7rem;text-align:center;}
+
+/* ── Controls ── */
+.ctrl-row{display:flex;align-items:center;gap:.6rem;margin:.4rem 0;}
+.ctrl-lbl{font-size:.65rem;color:var(--muted);width:42px;flex-shrink:0;}
+input[type="range"]{flex:1;-webkit-appearance:none;appearance:none;height:3px;border-radius:999px;background:var(--bhi);outline:none;cursor:pointer;}
+input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--text);cursor:pointer;}
+input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:var(--text);border:none;cursor:pointer;}
+.ctrl-val{font-size:.68rem;color:var(--muted);width:22px;text-align:right;flex-shrink:0;}
+
+/* ── Meters ── */
+.meters{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin:.4rem 0;}
+.meter-lbl{font-size:.63rem;color:var(--muted);margin-bottom:.18rem;}
+.meter-bar{height:3px;background:var(--inp);border-radius:999px;overflow:hidden;}
+.meter-fill{height:100%;background:var(--text);width:0%;transition:width .08s;}
+
+/* ── Section divider ── */
+.sec-lbl{font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin:.6rem 0 .4rem;display:flex;align-items:center;gap:.4rem;}
+.sec-lbl::before,.sec-lbl::after{content:'';flex:1;height:1px;background:var(--border);}
+.sec-lbl::before{max-width:10px;}
+
+/* ── Buttons ── */
+.brow{display:flex;gap:.4rem;flex-wrap:wrap;}
+button{flex:1;min-width:55px;padding:.58rem .65rem;border:1px solid var(--border);border-radius:8px;background:var(--chip);color:var(--text);font-family:inherit;font-size:.82rem;font-weight:500;cursor:pointer;transition:all .15s;text-transform:lowercase;letter-spacing:.01em;}
 button:hover:not(:disabled){background:var(--chip-hi);border-color:var(--bhi);}
 button:active:not(:disabled){transform:translateY(1px);}
-button:disabled{opacity:.32;cursor:not-allowed;}
+button:disabled{opacity:.3;cursor:not-allowed;}
 .bp{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600;}
 .bp:hover:not(:disabled){filter:brightness(.9);}
 .bd{color:var(--danger);border-color:rgba(255,85,85,.28);}
 .bd:hover:not(:disabled){background:rgba(255,85,85,.1);}
 .bg{color:var(--good);border-color:rgba(68,221,68,.28);}
 .bg:hover:not(:disabled){background:rgba(68,221,68,.1);}
-.bw{color:var(--warn);border-color:rgba(255,187,51,.28);}
-.bw:hover:not(:disabled){background:rgba(255,187,51,.1);}
+.bact{background:rgba(68,221,68,.1);color:var(--good);border-color:rgba(68,221,68,.3);}
+.bact:hover:not(:disabled){background:rgba(68,221,68,.18);}
 
-/* devices */
-.devs{display:flex;flex-direction:column;gap:.4rem;}
-.dev{padding:.7rem .85rem;border:1px solid var(--border);border-radius:9px;cursor:pointer;
-  background:var(--chip);transition:all .15s;position:relative;}
-.dev:hover{background:var(--chip-hi);border-color:var(--bhi);}
-.dev.sel{border-color:var(--text);}
-.dev-name{font-weight:600;font-size:.87rem;}
-.dev-meta{font-size:.68rem;color:var(--muted);margin-top:.18rem;font-family:'JetBrains Mono',monospace;}
-.dev-status{font-size:.72rem;color:var(--dim);margin-top:.18rem;}
-.dev-badge{position:absolute;top:.6rem;right:.75rem;font-size:.67rem;padding:.17rem .48rem;
-  border-radius:999px;font-weight:600;}
-.badge-d{background:rgba(255,187,51,.12);color:var(--warn);border:1px solid rgba(255,187,51,.3);}
-.badge-r{background:rgba(255,85,85,.12);color:var(--danger);border:1px solid rgba(255,85,85,.3);
-  animation:pulse 1s ease-in-out infinite;}
-.badge-a{background:rgba(68,221,68,.12);color:var(--good);border:1px solid rgba(68,221,68,.3);}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.empty-h{padding:1.5rem;color:var(--muted);font-size:.82rem;text-align:center;
-  border:1px dashed var(--border);border-radius:9px;}
+/* ── Forms ── */
+.fld{margin-bottom:.55rem;}
+.fld label{display:block;font-size:.7rem;color:var(--muted);margin-bottom:.22rem;text-transform:lowercase;}
+input:not([type="range"]),textarea{width:100%;background:var(--inp);border:1px solid transparent;border-radius:8px;padding:.58rem .72rem;color:var(--text);font-family:inherit;font-size:.85rem;outline:none;transition:border-color .15s;}
+input:not([type="range"]):focus,textarea:focus{border-color:var(--bhi);}
+input::placeholder,textarea::placeholder{color:var(--muted);}
+textarea{resize:vertical;min-height:70px;font-size:.78rem;}
 
-/* call panel states — only one visible at a time */
-.cs{display:none;}
-.cs.on{display:block;}
+/* ── SMS threads ── */
+.threads{display:flex;flex-direction:column;gap:.3rem;max-height:290px;overflow-y:auto;padding-right:.1rem;}
+.thread{padding:.5rem .65rem;border:1px solid var(--border);border-radius:9px;background:var(--chip);cursor:pointer;transition:all .15s;}
+.thread:hover{background:var(--chip-hi);}
+.thread.unread{border-color:rgba(255,187,51,.22);}
+.th-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:.18rem;}
+.th-from{font-size:.76rem;font-weight:600;}
+.th-ts{font-size:.63rem;color:var(--muted);}
+.th-preview{font-size:.74rem;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.th-badge{font-size:.58rem;padding:.08rem .32rem;border-radius:999px;background:rgba(255,187,51,.15);color:var(--warn);font-weight:700;margin-right:.25rem;}
+.inbox-empty{color:var(--muted);font-size:.8rem;padding:.9rem;text-align:center;}
 
-/* dialing + ringing */
-.call-big{text-align:center;padding:.5rem 0 .2rem;}
-.call-tag{font-size:.67rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin-bottom:.45rem;}
-.call-num{font-size:1.85rem;font-weight:700;letter-spacing:-.01em;margin-bottom:.3rem;word-break:break-all;}
-.call-sub{font-size:.82rem;color:var(--dim);margin-bottom:1rem;}
-.anim-dots::after{content:'·';animation:dot3 1.2s steps(3,end) infinite;}
-@keyframes dot3{0%{content:'·'}33%{content:'··'}66%{content:'···'}100%{content:'·'}}
-
-/* active call */
-.active-center{text-align:center;margin-bottom:.9rem;}
-.active-num{font-size:1.1rem;font-weight:700;margin-bottom:.15rem;}
-.active-via{font-size:.75rem;color:var(--muted);}
-.timer{font-family:'JetBrains Mono',monospace;font-size:2.5rem;font-weight:700;
-  letter-spacing:.04em;color:var(--good);margin:.5rem 0 1rem;text-align:center;}
-
-/* audio panel */
-.audio-wrap{margin-top:.5rem;}
-.meters{display:grid;grid-template-columns:1fr 1fr;gap:.8rem;margin-top:.8rem;}
-.meter-lbl{font-size:.67rem;color:var(--muted);margin-bottom:.25rem;}
-.meter-bar{height:3px;background:var(--inp);border-radius:999px;overflow:hidden;}
-.meter-fill{height:100%;background:var(--text);width:0%;transition:width .08s;}
-
-/* sms inbox */
-.inbox{display:flex;flex-direction:column;gap:.4rem;max-height:270px;overflow-y:auto;padding-right:.15rem;}
-.sms-item{background:var(--inp);border-radius:8px;padding:.55rem .7rem;}
-.sms-from{font-size:.72rem;font-weight:600;margin-bottom:.15rem;display:flex;justify-content:space-between;}
-.sms-from .sms-ts{color:var(--muted);font-weight:400;font-size:.68rem;}
-.sms-body{font-size:.8rem;line-height:1.5;color:var(--dim);word-break:break-word;}
-.inbox-empty{color:var(--muted);font-size:.8rem;padding:1rem;text-align:center;}
-.inbox-hdr{display:flex;align-items:center;margin-bottom:.85rem;}
-.inbox-hdr .lbl{margin-bottom:0;}
-.inbox-cnt{font-size:.68rem;color:var(--muted);margin-left:.4rem;}
-
-/* log */
-.log{background:var(--inp);border:1px solid var(--border);border-radius:10px;
-  padding:.75rem .85rem;font-family:'JetBrains Mono',monospace;font-size:.74rem;
-  max-height:220px;overflow-y:auto;color:var(--dim);line-height:1.75;}
+/* ── Log ── */
+.log{background:var(--inp);border:1px solid var(--border);border-radius:10px;padding:.7rem .85rem;font-family:'JetBrains Mono',monospace;font-size:.73rem;max-height:200px;overflow-y:auto;color:var(--dim);line-height:1.75;}
 .le{display:flex;gap:.55rem;}
 .le .ts{color:var(--muted);flex-shrink:0;user-select:none;}
 .le.ev .msg{color:var(--good);}
@@ -148,565 +184,665 @@ button:disabled{opacity:.32;cursor:not-allowed;}
 .le.au .msg{color:#a78bfa;}
 .le.sm .msg{color:var(--warn);}
 
-/* toasts */
-.toasts{position:fixed;top:1rem;right:1rem;display:flex;flex-direction:column;
-  gap:.4rem;z-index:999;pointer-events:none;}
-.toast{background:var(--card);border:1px solid var(--border);border-radius:9px;
-  padding:.6rem .8rem;min-width:190px;max-width:330px;font-size:.8rem;
-  animation:tslide .18s ease-out;pointer-events:auto;cursor:pointer;}
+/* ── Toasts ── */
+.toasts{position:fixed;top:1rem;right:1rem;display:flex;flex-direction:column;gap:.4rem;z-index:999;pointer-events:none;}
+.toast{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:.6rem .8rem;min-width:190px;max-width:320px;font-size:.8rem;animation:tslide .18s ease-out;pointer-events:auto;cursor:pointer;}
 .toast.ev{border-color:rgba(68,221,68,.3);}
 .toast.er{border-color:rgba(255,85,85,.3);}
 .toast.sm{border-color:rgba(255,187,51,.3);}
-.t-ttl{font-weight:600;margin-bottom:.12rem;}
+.t-ttl{font-weight:600;margin-bottom:.1rem;}
 .toast.ev .t-ttl{color:var(--good);}
 .toast.er .t-ttl{color:var(--danger);}
 .toast.sm .t-ttl{color:var(--warn);}
 .t-bod{color:var(--dim);font-size:.72rem;font-family:'JetBrains Mono',monospace;}
 @keyframes tslide{from{transform:translateX(14px);opacity:0}to{transform:translateX(0);opacity:1}}
 
-@media(max-width:760px){
-  body{padding:1.25rem .9rem 3rem;}
-  .g2,.g2.wide{grid-template-columns:1fr;}
-  .hdr h1{font-size:1.35rem;}
-}
+/* ── Call panel transitions ── */
+.cpanel-enter-active,.cpanel-leave-active{transition:opacity .18s,transform .18s;}
+.cpanel-enter-from{opacity:0;transform:translateY(6px);}
+.cpanel-leave-to{opacity:0;transform:translateY(-6px);}
+
+/* ── Responsive ── */
+@media(max-width:960px){.grid3{grid-template-columns:1fr;}body{padding:1rem .75rem 4rem;}}
+@media(min-width:961px) and (max-width:1140px){.grid3{grid-template-columns:180px 1fr 240px;}}
 </style>
 </head>
-<body>
+<body data-theme="dark">
+<div id="app" v-cloak>
+
+<!-- Toasts -->
+<div class="toasts">
+  <div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind" @click="removeToast(t.id)">
+    <div class="t-ttl">{{ t.title }}</div>
+    <div class="t-bod">{{ t.body }}</div>
+  </div>
+</div>
+
 <div class="wrap">
 
-<!-- ── header ── -->
+<!-- Header -->
 <header class="hdr">
-  <div class="hdr-logo"></div>
+  <div class="hdr-logo">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:22px;height:22px;">
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+      <line x1="12" y1="19" x2="12" y2="22"/>
+    </svg>
+  </div>
   <div>
     <h1>audio bridge</h1>
-    <p id="hdr-sub">connecting…</p>
+    <p>{{ headerSub }}</p>
   </div>
   <div class="hdr-right">
-    <div class="conn-pill offline" id="conn-pill">
+    <div class="conn-pill" :class="connected ? 'online' : 'offline'">
       <span class="conn-dot"></span>
-      <span id="conn-txt">offline</span>
+      <span>{{ connected ? 'online' : 'offline' }}</span>
     </div>
-    <button class="ibtn" id="theme-btn" title="toggle theme">
-      <svg id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+    <button class="ibtn" @click="toggleTheme" title="toggle theme">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <template v-if="theme === 'dark'"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></template>
+        <template v-else><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></template>
       </svg>
     </button>
   </div>
 </header>
 
-<!-- ── row 1: devices + call ── -->
-<div class="g2 wide">
+<!-- 3-column grid -->
+<div class="grid3">
 
-  <div class="card">
-    <div class="lbl">devices</div>
-    <div class="devs" id="dev-list">
-      <div class="empty-h">no devices · configure the daemon on your phone</div>
+  <!-- LEFT: Devices + Quick Contacts + Call History -->
+  <div>
+    <div class="card">
+      <div class="lbl">devices</div>
+      <div class="devs">
+        <div v-if="!devices.length" class="empty-h">no devices · configure daemon on phone</div>
+        <div v-for="d in devices" :key="d.id" class="dev" :class="{sel: d.id === selectedId}" @click="selectedId = d.id">
+          <div class="dev-name">{{ d.name || d.id }}</div>
+          <div class="dev-meta">{{ d.id }}{{ d.android ? ' · api ' + d.android : '' }}</div>
+          <div class="dev-state" :class="(d.call?.state||'IDLE').toLowerCase()">
+            {{ (d.call?.state||'idle').toLowerCase() }}{{ d.call?.number ? ' · ' + d.call.number : '' }}
+          </div>
+          <div v-if="d.call?.state === 'DIALING'" class="dev-badge badge-d">dialing</div>
+          <div v-else-if="d.call?.state === 'RINGING'" class="dev-badge badge-r">ringing</div>
+          <div v-else-if="d.call?.state === 'ACTIVE'" class="dev-badge badge-a">active</div>
+        </div>
+      </div>
     </div>
-  </div>
 
+    <div class="card">
+      <div class="lbl">quick contacts</div>
+      <div class="qc-list">
+        <div v-if="!contacts.length" style="color:var(--muted);font-size:.75rem;padding:.2rem 0;">add contacts below</div>
+        <div v-for="(c, i) in contacts" :key="i" class="qc-item" @click="dialContact(c)">
+          <div class="qc-avatar">{{ c.name.charAt(0).toUpperCase() }}</div>
+          <div class="qc-info">
+            <div class="qc-name">{{ c.name }}</div>
+            <div class="qc-num">{{ c.number }}</div>
+          </div>
+          <button @click.stop="removeContact(i)" class="qc-del" style="flex:0;min-width:0;padding:.15rem .3rem;font-size:.68rem;">✕</button>
+        </div>
+      </div>
+      <div class="add-ctct">
+        <input v-model="newCName" placeholder="name" @keydown.enter="addContact">
+        <input v-model="newCNum" placeholder="+1234567890" @keydown.enter="addContact">
+        <button @click="addContact">+</button>
+      </div>
+    </div>
+
+    <div v-if="callHistory.length" class="card">
+      <div class="lbl">recent calls</div>
+      <div class="hist-list">
+        <div v-for="(h, i) in callHistory.slice(0, 8)" :key="i" class="hist-item" @click="dialNumber(h.number)">
+          <div class="hist-num">{{ h.number }}</div>
+          <div class="hist-meta">{{ h.dir }} · {{ fmtClock(h.ts) }}{{ h.dur ? ' · ' + fmtDur(h.dur) : '' }}</div>
+        </div>
+      </div>
+    </div>
+  </div><!-- end left -->
+
+  <!-- CENTER: Call card -->
   <div class="card">
-    <div class="lbl" id="call-lbl">call</div>
+    <div class="lbl">{{ callLbl }}</div>
 
-    <!-- idle -->
-    <div class="cs on" id="cs-idle">
+    <transition name="cpanel" mode="out-in">
+
+      <!-- IDLE: number input + dial pad -->
+      <div v-if="callPanel === 'idle'" key="idle">
+        <div class="call-num-display" :class="{ph: !phoneNum}">{{ phoneNum || 'enter number' }}</div>
+        <div class="brow" style="margin-bottom:.5rem;">
+          <button @click="delChar" style="flex:0;padding:.52rem .75rem;">⌫</button>
+          <button @click="phoneNum = ''" style="flex:0;padding:.52rem .75rem;">✕</button>
+          <button v-if="callHistory.length" @click="dialNumber(callHistory[0].number)" style="flex:0;padding:.52rem .7rem;font-size:.75rem;">redial</button>
+        </div>
+        <div class="dialpad">
+          <div v-for="k in dialKeys" :key="k.d" class="key" @click="pressKey(k.d)">
+            <div class="key-digit">{{ k.d }}</div>
+            <div class="key-sub">{{ k.l }}</div>
+          </div>
+        </div>
+        <div class="brow">
+          <button class="bp" :disabled="!selectedId || !phoneNum" @click="dial">call</button>
+        </div>
+      </div>
+
+      <!-- DIALING -->
+      <div v-else-if="callPanel === 'dialing'" key="dialing" class="cs-center">
+        <div class="cs-tag">calling</div>
+        <div class="cs-num">{{ selectedDevice?.call?.number || '—' }}</div>
+        <div class="cs-sub" style="color:var(--warn)">ringing<span class="anim-dots"></span></div>
+        <div class="brow"><button class="bd" @click="hangup">cancel call</button></div>
+      </div>
+
+      <!-- RINGING incoming -->
+      <div v-else-if="callPanel === 'ringing-in'" key="ringing-in" class="cs-center">
+        <div class="cs-tag cs-sub ring">incoming call</div>
+        <div class="cs-num">{{ selectedDevice?.call?.number || 'unknown' }}</div>
+        <div class="cs-sub">via {{ selectedDevice?.name || selectedDevice?.id }}</div>
+        <div class="brow">
+          <button class="bg" @click="answer">answer</button>
+          <button class="bd" @click="hangup">reject</button>
+        </div>
+      </div>
+
+      <!-- RINGING outgoing -->
+      <div v-else-if="callPanel === 'ringing-out'" key="ringing-out" class="cs-center">
+        <div class="cs-tag">ringing</div>
+        <div class="cs-num">{{ selectedDevice?.call?.number || '—' }}</div>
+        <div class="cs-sub" style="color:var(--warn)">waiting for answer<span class="anim-dots"></span></div>
+        <div class="brow"><button class="bd" @click="hangup">cancel</button></div>
+      </div>
+
+      <!-- ACTIVE call -->
+      <div v-else key="active">
+        <div class="active-num">{{ selectedDevice?.call?.number || 'connected' }}</div>
+        <div class="active-via">via {{ selectedDevice?.name || selectedDevice?.id }}</div>
+        <div class="timer">{{ timerDisplay }}</div>
+
+        <div class="brow" style="margin-bottom:.6rem;">
+          <button :class="selectedDevice?.call?.muted ? 'bact' : ''" @click="toggleMute">
+            {{ selectedDevice?.call?.muted ? 'unmute' : 'mute' }}
+          </button>
+          <button :class="speakerOn ? 'bact' : ''" @click="toggleSpeaker">
+            spkr {{ speakerOn ? 'on' : 'off' }}
+          </button>
+          <button class="bd" @click="hangup">hang up</button>
+        </div>
+
+        <div class="ctrl-row">
+          <span class="ctrl-lbl">volume</span>
+          <input type="range" min="0" max="15" v-model.number="callVolume" @change="applyVolume">
+          <span class="ctrl-val">{{ callVolume }}</span>
+        </div>
+
+        <div class="sec-lbl">audio</div>
+        <div class="brow">
+          <button v-if="!audioActive" @click="startAudio(false)">listen in</button>
+          <button v-if="!audioActive" class="bp" @click="startAudio(true)">speak</button>
+          <button v-if="audioActive" class="bd" @click="stopAudio">stop audio</button>
+        </div>
+        <div v-if="audioActive" class="meters">
+          <div><div class="meter-lbl">rx · phone speaker</div><div class="meter-bar"><div class="meter-fill" :style="{width: meterRx + '%'}"></div></div></div>
+          <div><div class="meter-lbl">tx · your mic</div><div class="meter-bar"><div class="meter-fill" :style="{width: meterTx + '%'}"></div></div></div>
+        </div>
+
+        <div class="sec-lbl">dtmf</div>
+        <div class="dialpad">
+          <div v-for="k in dialKeys" :key="'dt'+k.d" class="key dtmf" @click="sendDtmf(k.d)">
+            <div class="key-digit">{{ k.d }}</div>
+          </div>
+        </div>
+      </div>
+
+    </transition>
+  </div><!-- end center -->
+
+  <!-- RIGHT: SMS -->
+  <div>
+    <div class="card">
+      <div class="lbl">send sms</div>
       <div class="fld">
-        <label>phone number</label>
-        <input type="tel" id="phone-num" placeholder="+1 (234) 567-8900">
+        <label>to</label>
+        <input type="tel" v-model="smsTo" placeholder="+1234567890" @keydown.enter="smsBody && sendSms()">
+      </div>
+      <div class="fld">
+        <label>message</label>
+        <textarea v-model="smsBody" placeholder="type a message…" @keydown.enter.ctrl="sendSms" @keydown.enter.meta="sendSms"></textarea>
       </div>
       <div class="brow">
-        <button class="bp" id="btn-dial" disabled>call</button>
+        <button class="bp" :disabled="!selectedId || !smsTo || !smsBody" @click="sendSms">send</button>
       </div>
     </div>
 
-    <!-- dialing / outgoing ringing -->
-    <div class="cs" id="cs-dialing">
-      <div class="call-big">
-        <div class="call-tag">calling</div>
-        <div class="call-num" id="dial-num">—</div>
-        <div class="call-sub" style="color:var(--warn)">ringing<span class="anim-dots"></span></div>
+    <div class="card">
+      <div style="display:flex;align-items:center;margin-bottom:.75rem;">
+        <span class="lbl" style="margin-bottom:0;">messages</span>
+        <span v-if="threads.length" style="font-size:.67rem;color:var(--muted);margin-left:.38rem;">({{ threads.length }})</span>
+        <button v-if="threads.length" @click="clearSms" style="flex:0;padding:.2rem .42rem;font-size:.66rem;margin-left:auto;">clear</button>
       </div>
-      <div class="brow">
-        <button class="bd" id="btn-cancel">cancel call</button>
-      </div>
-    </div>
-
-    <!-- incoming ringing -->
-    <div class="cs" id="cs-ringing">
-      <div class="call-big">
-        <div class="call-tag">incoming call</div>
-        <div class="call-num" id="ring-num">—</div>
-        <div class="call-sub" id="ring-via"></div>
-      </div>
-      <div class="brow">
-        <button class="bg" id="btn-answer">answer</button>
-        <button class="bd" id="btn-reject">reject</button>
-      </div>
-    </div>
-
-    <!-- active call -->
-    <div class="cs" id="cs-active">
-      <div class="active-center">
-        <div class="active-num" id="active-num">—</div>
-        <div class="active-via" id="active-via"></div>
-      </div>
-      <div class="timer" id="call-timer">00:00</div>
-      <div class="brow">
-        <button id="btn-mute">mute</button>
-        <button class="bd" id="btn-hangup">hang up</button>
-      </div>
-
-      <!-- audio controls inline during active call -->
-      <div class="audio-wrap">
-        <div class="brow" style="margin-top:.9rem;">
-          <button id="btn-listen">listen in</button>
-          <button class="bp" id="btn-speak">speak</button>
-          <button id="btn-stop-audio" disabled>stop audio</button>
-        </div>
-        <div class="meters">
-          <div>
-            <div class="meter-lbl">rx · phone speaker</div>
-            <div class="meter-bar"><div class="meter-fill" id="meter-rx"></div></div>
+      <div class="threads">
+        <div v-if="!threads.length" class="inbox-empty">no messages yet</div>
+        <div v-for="t in threads" :key="t.from" class="thread" :class="{unread: t.unread}" @click="openThread(t)">
+          <div class="th-hdr">
+            <span class="th-from">
+              <span v-if="t.unread" class="th-badge">new</span>{{ t.from }}
+            </span>
+            <span class="th-ts">{{ fmtClock(t.lastTs) }}</span>
           </div>
-          <div>
-            <div class="meter-lbl">tx · your mic</div>
-            <div class="meter-bar"><div class="meter-fill" id="meter-tx"></div></div>
-          </div>
+          <div class="th-preview">{{ t.lastMsg }}</div>
         </div>
       </div>
     </div>
+  </div><!-- end right -->
 
-  </div><!-- end call card -->
-</div><!-- end row 1 -->
+</div><!-- end grid3 -->
 
-<!-- ── row 2: sms compose + inbox ── -->
-<div class="g2">
-
-  <div class="card">
-    <div class="lbl">send sms</div>
-    <div class="fld">
-      <label>to</label>
-      <input type="tel" id="sms-to" placeholder="+1234567890">
-    </div>
-    <div class="fld">
-      <label>message</label>
-      <textarea id="sms-body" placeholder="type a message…"></textarea>
-    </div>
-    <div class="brow">
-      <button class="bp" id="btn-sms" disabled>send</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="inbox-hdr">
-      <span class="lbl">messages</span>
-      <span class="inbox-cnt" id="inbox-cnt"></span>
-      <button id="btn-clear" style="flex:0;padding:.22rem .5rem;font-size:.68rem;margin-left:auto;">clear</button>
-    </div>
-    <div class="inbox" id="sms-inbox">
-      <div class="inbox-empty" id="inbox-empty">no messages received yet</div>
-    </div>
-  </div>
-
-</div><!-- end row 2 -->
-
-<!-- ── event log ── -->
+<!-- Event log -->
 <div class="card full">
   <div class="lbl">event log</div>
-  <div class="log" id="log"></div>
+  <div class="log" ref="logEl">
+    <div v-for="(e, i) in eventLog" :key="i" class="le" :class="e.cls">
+      <span class="ts">{{ e.ts }}</span><span class="msg">{{ e.msg }}</span>
+    </div>
+  </div>
 </div>
 
 </div><!-- wrap -->
-<div class="toasts" id="toasts"></div>
+</div><!-- app -->
 
 <script>
-/* ── theme ─────────────────────────────────────────────────── */
-const html = document.documentElement;
-html.setAttribute('data-theme', localStorage.getItem('ab-theme') || 'dark');
+const { createApp, ref, computed, reactive, watch, nextTick, onMounted, onUnmounted } = Vue;
 
-function paintTheme() {
-  const dark = html.getAttribute('data-theme') === 'dark';
-  document.getElementById('theme-icon').innerHTML = dark
-    ? '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>'
-    : '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>';
-}
-paintTheme();
-document.getElementById('theme-btn').onclick = () => {
-  html.setAttribute('data-theme', html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
-  localStorage.setItem('ab-theme', html.getAttribute('data-theme'));
-  paintTheme();
-};
+createApp({
+  setup() {
+    // ── Reactive state ────────────────────────────────────────────
+    const theme      = ref(localStorage.getItem('ab-theme') || 'dark');
+    const connected  = ref(false);
+    const devices    = ref([]);
+    const selectedId = ref(null);
+    const phoneNum   = ref('');
+    const smsTo      = ref('');
+    const smsBody    = ref('');
+    const eventLog   = ref([]);
+    const logEl      = ref(null);
+    const toasts     = ref([]);
+    const timerDisplay = ref('00:00');
+    const speakerOn  = ref(false);
+    const callVolume = ref(7);
+    const meterRx    = ref(0);
+    const meterTx    = ref(0);
+    const audioActive = ref(false);
+    const contacts   = ref(JSON.parse(localStorage.getItem('ab-contacts') || '[]'));
+    const newCName   = ref('');
+    const newCNum    = ref('');
+    const callHistory = ref(JSON.parse(localStorage.getItem('ab-callhist') || '[]'));
+    const smsThreads = ref({});  // { [from]: { from, lastMsg, lastTs, unread } }
 
-/* ── utils ──────────────────────────────────────────────────── */
-const $ = id => document.getElementById(id);
-function esc(s) {
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-function fmtTime(ms) {
-  const s = Math.max(0, Math.floor(ms/1000));
-  return String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
-}
-function fmtClock(ts) {
-  if (!ts) return '';
-  try { return new Date(ts).toLocaleTimeString(); } catch(_) { return ''; }
-}
+    // ── Computed ──────────────────────────────────────────────────
+    const selectedDevice = computed(() =>
+      devices.value.find(d => d.id === selectedId.value) || null
+    );
+    const callState = computed(() => selectedDevice.value?.call?.state || 'IDLE');
 
-/* ── log + toast ────────────────────────────────────────────── */
-function addLog(msg, type='') {
-  const area = $('log');
-  const el = document.createElement('div');
-  el.className = 'le ' + ({event:'ev',error:'er',audio:'au',sms:'sm'}[type]||'');
-  el.innerHTML = `<span class="ts">${new Date().toLocaleTimeString()}</span><span class="msg">${esc(msg)}</span>`;
-  area.appendChild(el);
-  area.scrollTop = area.scrollHeight;
-  if (area.childElementCount > 300) area.removeChild(area.firstChild);
-}
-function toast(kind, title, body) {
-  const host = $('toasts');
-  const t = document.createElement('div');
-  t.className = 'toast ' + kind;
-  t.innerHTML = `<div class="t-ttl">${esc(title)}</div><div class="t-bod">${esc(body)}</div>`;
-  t.onclick = () => t.remove();
-  host.appendChild(t);
-  setTimeout(() => { try { t.remove(); } catch(_){} }, 7000);
-}
-
-/* ── global state ───────────────────────────────────────────── */
-let ws = null;
-let selectedDevice = null;
-let devicesById = {};
-let timerHandle = null;
-let smsLog = [];   // { from, body, ts, deviceId }
-
-/* ── call panel ─────────────────────────────────────────────── */
-const PANELS = ['cs-idle','cs-dialing','cs-ringing','cs-active'];
-
-function showPanel(id) {
-  PANELS.forEach(p => $(p).classList.toggle('on', p === id));
-}
-
-function refreshCallUI() {
-  const dev = selectedDevice ? devicesById[selectedDevice] : null;
-  const has = !!dev;
-  $('btn-dial').disabled = !has;
-  $('btn-sms').disabled  = !has;
-
-  if (!has) { showPanel('cs-idle'); stopTimer(); stopAudio(); return; }
-
-  const call = dev.call || { state: 'IDLE' };
-  const state = call.state || 'IDLE';
-  const num = call.number || '';
-
-  switch (state) {
-    case 'DIALING':
-      $('dial-num').textContent = num || '—';
-      showPanel('cs-dialing');
-      stopTimer(); stopAudio();
-      $('call-lbl').textContent = 'call · dialing';
-      break;
-
-    case 'RINGING':
-      if ((call.direction || '') === 'incoming') {
-        $('ring-num').textContent = num || 'unknown';
-        $('ring-via').textContent = 'from ' + esc(dev.name || dev.id);
-        showPanel('cs-ringing');
-        toast('ev', 'incoming call', num || 'unknown number');
-      } else {
-        $('dial-num').textContent = num || '—';
-        showPanel('cs-dialing');
-      }
-      stopTimer(); stopAudio();
-      $('call-lbl').textContent = 'call · ringing';
-      break;
-
-    case 'ACTIVE':
-      $('active-num').textContent = num || 'connected';
-      $('active-via').textContent = 'via ' + (dev.name || dev.id);
-      $('btn-mute').textContent = call.muted ? 'unmute' : 'mute';
-      showPanel('cs-active');
-      startTimer(call.started_at || Date.now());
-      $('call-lbl').textContent = 'call · active';
-      break;
-
-    case 'IDLE':
-    default:
-      showPanel('cs-idle');
-      stopTimer(); stopAudio();
-      $('call-lbl').textContent = 'call';
-      break;
-  }
-}
-
-function startTimer(startMs) {
-  stopTimer();
-  const tick = () => { $('call-timer').textContent = fmtTime(Date.now() - startMs); };
-  tick();
-  timerHandle = setInterval(tick, 500);
-}
-function stopTimer() {
-  if (timerHandle) { clearInterval(timerHandle); timerHandle = null; }
-  $('call-timer').textContent = '00:00';
-}
-
-/* ── device list ────────────────────────────────────────────── */
-function renderDevices(devices) {
-  devicesById = {};
-  devices.forEach(d => { devicesById[d.id] = d; });
-
-  const list = $('dev-list');
-  if (!devices.length) {
-    list.innerHTML = '<div class="empty-h">no devices · configure the daemon on your phone</div>';
-    selectedDevice = null;
-    refreshCallUI();
-    $('hdr-sub').textContent = 'no devices';
-    return;
-  }
-
-  if (selectedDevice && !devicesById[selectedDevice]) selectedDevice = null;
-  if (!selectedDevice) selectedDevice = devices[0].id;
-
-  list.innerHTML = '';
-  for (const d of devices) {
-    const call = d.call || {};
-    const st = (call.state || 'IDLE').toLowerCase();
-    const badgeCls = {DIALING:'dev-badge badge-d',RINGING:'dev-badge badge-r',ACTIVE:'dev-badge badge-a'}[call.state||''] || '';
-    const item = document.createElement('div');
-    item.className = 'dev' + (d.id === selectedDevice ? ' sel' : '');
-    item.innerHTML =
-      `<div class="dev-name">${esc(d.name||d.id)}</div>` +
-      `<div class="dev-meta">${esc(d.id)}${d.android ? ' · android '+esc(d.android) : ''}</div>` +
-      `<div class="dev-status">${st}${call.number?' · '+esc(call.number):''}</div>` +
-      (badgeCls ? `<div class="${badgeCls}">${st}</div>` : '');
-    item.onclick = () => { selectedDevice = d.id; renderDevices(devices); };
-    list.appendChild(item);
-  }
-
-  refreshCallUI();
-  $('hdr-sub').textContent = devices.length === 1
-    ? (devices[0].name || devices[0].id)
-    : devices.length + ' devices connected';
-}
-
-/* ── ws commands ────────────────────────────────────────────── */
-function cmd(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
-
-$('btn-dial').onclick = () => {
-  const num = $('phone-num').value.trim();
-  if (!num || !selectedDevice) return;
-  cmd({ command:'dial', device_id:selectedDevice, number:num });
-  addLog('dial → '+num, 'event');
-};
-$('phone-num').addEventListener('keydown', e => { if (e.key==='Enter') $('btn-dial').click(); });
-
-$('btn-cancel').onclick = () => { if (selectedDevice) cmd({command:'hangup',device_id:selectedDevice}); };
-$('btn-answer').onclick = () => { if (selectedDevice) cmd({command:'answer',device_id:selectedDevice}); };
-$('btn-reject').onclick = () => { if (selectedDevice) cmd({command:'hangup',device_id:selectedDevice}); };
-$('btn-hangup').onclick = () => { if (selectedDevice) cmd({command:'hangup',device_id:selectedDevice}); };
-$('btn-mute').onclick = () => {
-  if (!selectedDevice) return;
-  const call = (devicesById[selectedDevice]||{}).call || {};
-  cmd({ command:'mute', device_id:selectedDevice, on:!call.muted });
-};
-
-/* ── sms ────────────────────────────────────────────────────── */
-$('btn-sms').onclick = () => {
-  const to = $('sms-to').value.trim();
-  const body = $('sms-body').value.trim();
-  if (!to || !body || !selectedDevice) return;
-  cmd({ command:'send_sms', device_id:selectedDevice, number:to, message:body });
-  $('sms-body').value = '';
-  addLog('sms → '+to+': '+body.slice(0,50), 'sms');
-};
-$('sms-body').addEventListener('keydown', e => {
-  if (e.key==='Enter' && (e.ctrlKey||e.metaKey)) $('btn-sms').click();
-});
-
-function addToInbox(from, body, ts, deviceId) {
-  smsLog.unshift({ from, body, ts, deviceId });
-  if (smsLog.length > 60) smsLog.pop();
-  renderInbox();
-  // Pre-fill reply-to if empty
-  if (!$('sms-to').value) $('sms-to').value = from;
-}
-
-function renderInbox() {
-  const box = $('sms-inbox');
-  const empty = $('inbox-empty');
-  const cnt = $('inbox-cnt');
-  Array.from(box.querySelectorAll('.sms-item')).forEach(el => el.remove());
-  if (!smsLog.length) {
-    if (empty) empty.style.display = '';
-    if (cnt) cnt.textContent = '';
-    return;
-  }
-  if (empty) empty.style.display = 'none';
-  if (cnt) cnt.textContent = `(${smsLog.length})`;
-  for (const m of smsLog) {
-    const el = document.createElement('div');
-    el.className = 'sms-item';
-    el.innerHTML =
-      `<div class="sms-from">${esc(m.from)}<span class="sms-ts">${fmtClock(m.ts)}</span></div>` +
-      `<div class="sms-body">${esc(m.body)}</div>`;
-    el.onclick = () => { $('sms-to').value = m.from; $('sms-body').focus(); };
-    box.appendChild(el);
-  }
-}
-
-$('btn-clear').onclick = () => { smsLog = []; renderInbox(); };
-
-/* ── event handler ──────────────────────────────────────────── */
-function handleEvent(kind, deviceId, payload) {
-  switch (kind) {
-    case 'call': {
-      const s = payload.state||'IDLE', n=payload.number||'', d=payload.direction||'';
-      addLog(`call · ${s}${d?' ('+d+')':''}${n?' · '+n:''}`, 'event');
-      break;
-    }
-    case 'sms_received': {
-      const from = payload.sender || 'unknown';
-      const body = payload.message || '';
-      const ts = payload.timestamp || Date.now();
-      addToInbox(from, body, ts, deviceId);
-      addLog(`sms received · ${from}: ${body.slice(0,60)}`, 'sms');
-      toast('sm', 'SMS from '+from, body.length>80?body.slice(0,80)+'…':body);
-      break;
-    }
-    case 'sms_sent': {
-      const ok = payload.result_code === -1 || payload.result === 'sent';
-      addLog('sms '+(ok?'sent ok':'send failed (code '+payload.result_code+')'),'sms');
-      if (!ok) toast('er','SMS failed','result: '+payload.result_code);
-      break;
-    }
-    case 'sms_delivered': {
-      addLog('sms delivered', 'sms');
-      break;
-    }
-    case 'error': {
-      const msg = `${payload.op||'op'} failed · ${payload.code||'?'}: ${payload.message||''}`;
-      addLog(msg, 'error');
-      toast('er', (payload.op||'error')+' failed', payload.message||payload.code||'');
-      break;
-    }
-    default:
-      addLog(`event · ${kind}: ${JSON.stringify(payload).slice(0,100)}`, '');
-  }
-}
-
-/* ── websocket ──────────────────────────────────────────────── */
-function connectUI() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/ui`);
-  ws.onopen = () => {
-    const pill = $('conn-pill');
-    pill.className = 'conn-pill online';
-    $('conn-txt').textContent = 'online';
-    addLog('control channel connected', 'event');
-  };
-  ws.onclose = () => {
-    const pill = $('conn-pill');
-    pill.className = 'conn-pill offline';
-    $('conn-txt').textContent = 'offline';
-    addLog('connection lost · retrying…', 'error');
-    setTimeout(connectUI, 3000);
-  };
-  ws.onmessage = ev => {
-    let data;
-    try { data = JSON.parse(ev.data); } catch(_) { return; }
-    if (data.type === 'state_update') {
-      renderDevices(data.devices || []);
-    } else if (data.type === 'event') {
-      handleEvent(data.kind, data.device_id, data.data || {});
-    }
-  };
-}
-
-/* ── audio streaming ────────────────────────────────────────── */
-let audioWs=null, audioCtx=null, playNode=null, micStream=null, micNode=null, playHead=0;
-
-function peakMeter(id, pcm16) {
-  let p=0;
-  for (let i=0;i<pcm16.length;i++){const v=Math.abs(pcm16[i]);if(v>p)p=v;}
-  $(id).style.width = Math.min(100,(p/32768)*200)+'%';
-}
-
-async function ensureAudioCtx(rate) {
-  if (audioCtx && audioCtx.sampleRate===rate) return;
-  if (audioCtx) await audioCtx.close();
-  audioCtx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:rate});
-  const src = `class P extends AudioWorkletProcessor{process(i){const c=i[0][0];if(!c)return true;
-    const o=new Int16Array(c.length);
-    for(let j=0;j<c.length;j++){let s=Math.max(-1,Math.min(1,c[j]));o[j]=s<0?s*0x8000:s*0x7fff;}
-    this.port.postMessage(o.buffer,[o.buffer]);return true;}}registerProcessor('mp',P);`;
-  await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([src],{type:'application/javascript'})));
-  playNode = audioCtx.createGain();
-  playNode.connect(audioCtx.destination);
-}
-
-function schedPCM(pcm16, rate) {
-  if (!audioCtx) return;
-  const buf = audioCtx.createBuffer(1,pcm16.length,rate);
-  const d = buf.getChannelData(0);
-  for (let i=0;i<pcm16.length;i++) d[i]=pcm16[i]/32768;
-  const s = audioCtx.createBufferSource();
-  s.buffer=buf; s.connect(playNode);
-  const now = audioCtx.currentTime;
-  if (playHead < now+0.05) playHead = now+0.05;
-  s.start(playHead); playHead += buf.duration;
-}
-
-async function startAudio(withMic) {
-  if (!selectedDevice) return;
-  const rate = 48000;
-  await ensureAudioCtx(rate);
-  if (audioCtx.state==='suspended') await audioCtx.resume();
-  const proto = location.protocol==='https:' ? 'wss' : 'ws';
-  const dir = withMic ? 'both' : 'listen';
-  audioWs = new WebSocket(`${proto}://${location.host}/ws/audio/${selectedDevice}?rate=${rate}&dir=${dir}`);
-  audioWs.binaryType = 'arraybuffer';
-  audioWs.onopen  = () => addLog(`audio open @ ${rate}Hz · ${dir}`, 'audio');
-  audioWs.onclose = () => { addLog('audio stream closed', 'audio'); stopAudio(); };
-  audioWs.onerror = () => addLog('audio stream error', 'error');
-  audioWs.onmessage = ev => {
-    const pcm = new Int16Array(ev.data);
-    peakMeter('meter-rx', pcm);
-    schedPCM(pcm, rate);
-  };
-  if (withMic) {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio:{echoCancellation:true,noiseSuppression:true,sampleRate:rate,channelCount:1}
+    const callPanel = computed(() => {
+      const s = callState.value;
+      const dir = selectedDevice.value?.call?.direction;
+      if (s === 'DIALING') return 'dialing';
+      if (s === 'RINGING' && dir === 'incoming') return 'ringing-in';
+      if (s === 'RINGING') return 'ringing-out';
+      if (s === 'ACTIVE') return 'active';
+      return 'idle';
     });
-    const src = audioCtx.createMediaStreamSource(micStream);
-    micNode = new AudioWorkletNode(audioCtx, 'mp');
-    micNode.port.onmessage = ev => {
-      const pcm = new Int16Array(ev.data);
-      peakMeter('meter-tx', pcm);
-      if (audioWs && audioWs.readyState===1) audioWs.send(ev.data);
+
+    const callLbl = computed(() => {
+      const p = callPanel.value;
+      if (p === 'dialing') return 'call · dialing';
+      if (p === 'ringing-in') return 'call · incoming';
+      if (p === 'ringing-out') return 'call · ringing';
+      if (p === 'active') return 'call · active';
+      return 'call';
+    });
+
+    const headerSub = computed(() => {
+      if (!connected.value) return 'connecting…';
+      if (!devices.value.length) return 'no devices connected';
+      if (devices.value.length === 1) return devices.value[0].name || devices.value[0].id;
+      return devices.value.length + ' devices connected';
+    });
+
+    const threads = computed(() =>
+      Object.values(smsThreads.value).sort((a, b) => b.lastTs - a.lastTs)
+    );
+
+    // ── Dial keys ─────────────────────────────────────────────────
+    const dialKeys = [
+      {d:'1',l:''},{d:'2',l:'ABC'},{d:'3',l:'DEF'},
+      {d:'4',l:'GHI'},{d:'5',l:'JKL'},{d:'6',l:'MNO'},
+      {d:'7',l:'PQRS'},{d:'8',l:'TUV'},{d:'9',l:'WXYZ'},
+      {d:'*',l:''},{d:'0',l:'+'},{d:'#',l:''},
+    ];
+
+    // ── Theme ─────────────────────────────────────────────────────
+    function toggleTheme() {
+      theme.value = theme.value === 'dark' ? 'light' : 'dark';
+      document.body.setAttribute('data-theme', theme.value);
+      localStorage.setItem('ab-theme', theme.value);
+    }
+
+    // ── Log ───────────────────────────────────────────────────────
+    function addLog(msg, cls = '') {
+      const ts = new Date().toLocaleTimeString();
+      eventLog.value.push({ ts, msg, cls });
+      if (eventLog.value.length > 300) eventLog.value.shift();
+      nextTick(() => { if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight; });
+    }
+
+    // ── Toasts ───────────────────────────────────────────────────
+    let toastSeq = 0;
+    function showToast(kind, title, body) {
+      const id = ++toastSeq;
+      toasts.value.push({ id, kind, title, body });
+      setTimeout(() => removeToast(id), 7000);
+    }
+    function removeToast(id) {
+      const i = toasts.value.findIndex(t => t.id === id);
+      if (i >= 0) toasts.value.splice(i, 1);
+    }
+
+    // ── Contacts ─────────────────────────────────────────────────
+    function addContact() {
+      const name = newCName.value.trim(), number = newCNum.value.trim();
+      if (!name || !number) return;
+      contacts.value.push({ name, number });
+      localStorage.setItem('ab-contacts', JSON.stringify(contacts.value));
+      newCName.value = ''; newCNum.value = '';
+    }
+    function removeContact(i) {
+      contacts.value.splice(i, 1);
+      localStorage.setItem('ab-contacts', JSON.stringify(contacts.value));
+    }
+    function dialContact(c) {
+      phoneNum.value = c.number;
+      if (selectedId.value) dial();
+    }
+
+    // ── Dial pad ─────────────────────────────────────────────────
+    function pressKey(d) {
+      phoneNum.value += (d === '0' && phoneNum.value === '') ? '+' : d;
+    }
+    function delChar() { phoneNum.value = phoneNum.value.slice(0, -1); }
+    function dialNumber(num) { phoneNum.value = num; if (selectedId.value) dial(); }
+
+    // ── Call history ──────────────────────────────────────────────
+    let _callNum = '', _callDir = '', _callStart = 0;
+    function recordCall(number, dir, dur) {
+      callHistory.value.unshift({ number, dir, ts: Date.now(), dur });
+      if (callHistory.value.length > 20) callHistory.value.pop();
+      localStorage.setItem('ab-callhist', JSON.stringify(callHistory.value));
+    }
+    function fmtDur(ms) {
+      if (!ms) return '';
+      const s = Math.round(ms / 1000);
+      return Math.floor(s / 60) + 'm' + (s % 60) + 's';
+    }
+
+    // ── Timer ────────────────────────────────────────────────────
+    let timerHandle = null;
+    function startTimer(startMs) {
+      stopTimer();
+      const tick = () => {
+        const s = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+        timerDisplay.value = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+      };
+      tick(); timerHandle = setInterval(tick, 500);
+    }
+    function stopTimer() {
+      if (timerHandle) { clearInterval(timerHandle); timerHandle = null; }
+      timerDisplay.value = '00:00';
+    }
+
+    // ── WS send ──────────────────────────────────────────────────
+    let ws = null;
+    function cmd(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+    // ── Call control ─────────────────────────────────────────────
+    function dial() {
+      const num = phoneNum.value.trim();
+      if (!num || !selectedId.value) return;
+      cmd({ command: 'dial', device_id: selectedId.value, number: num });
+      addLog('dial → ' + num, 'ev');
+    }
+    function hangup() {
+      if (!selectedId.value) return;
+      cmd({ command: 'hangup', device_id: selectedId.value });
+    }
+    function answer() {
+      if (!selectedId.value) return;
+      cmd({ command: 'answer', device_id: selectedId.value });
+    }
+    function toggleMute() {
+      if (!selectedId.value) return;
+      const muted = selectedDevice.value?.call?.muted;
+      cmd({ command: 'mute', device_id: selectedId.value, on: !muted });
+    }
+    function toggleSpeaker() {
+      speakerOn.value = !speakerOn.value;
+      if (!selectedId.value) return;
+      cmd({ command: 'audio_route', device_id: selectedId.value, route: speakerOn.value ? 'speaker' : 'earpiece' });
+    }
+    function applyVolume() {
+      if (!selectedId.value) return;
+      cmd({ command: 'volume', device_id: selectedId.value, level: callVolume.value });
+    }
+    function sendDtmf(digit) {
+      if (!selectedId.value) return;
+      cmd({ command: 'dtmf', device_id: selectedId.value, digit });
+      addLog('dtmf: ' + digit, 'ev');
+    }
+
+    // ── SMS ──────────────────────────────────────────────────────
+    function sendSms() {
+      const to = smsTo.value.trim(), body = smsBody.value.trim();
+      if (!to || !body || !selectedId.value) return;
+      cmd({ command: 'send_sms', device_id: selectedId.value, number: to, message: body });
+      smsBody.value = '';
+      addLog('sms → ' + to + ': ' + body.slice(0, 50), 'sm');
+    }
+    function addToThread(from, msg, ts) {
+      const t = smsThreads.value[from] || { from, lastMsg: '', lastTs: 0, unread: false };
+      smsThreads.value = { ...smsThreads.value, [from]: { ...t, lastMsg: msg, lastTs: ts, unread: true } };
+      if (!smsTo.value) smsTo.value = from;
+    }
+    function openThread(t) {
+      smsTo.value = t.from;
+      smsThreads.value = { ...smsThreads.value, [t.from]: { ...t, unread: false } };
+    }
+    function clearSms() { smsThreads.value = {}; }
+
+    // ── Event dispatch ────────────────────────────────────────────
+    function handleEvent(kind, deviceId, payload) {
+      switch (kind) {
+        case 'call': {
+          const s = payload.state || 'IDLE', n = payload.number || '', d = payload.direction || '';
+          addLog('call · ' + s + (d ? ' (' + d + ')' : '') + (n ? ' · ' + n : ''), 'ev');
+          if (s === 'ACTIVE') {
+            _callNum = n; _callDir = d; _callStart = payload.started_at || Date.now();
+            startTimer(_callStart);
+          } else if (s === 'IDLE') {
+            if (_callNum) recordCall(_callNum, _callDir, _callStart > 0 ? Date.now() - _callStart : 0);
+            _callNum = ''; _callDir = ''; _callStart = 0;
+            stopTimer(); stopAudio(); speakerOn.value = false;
+          } else if (s === 'RINGING' && d === 'incoming') {
+            showToast('ev', 'incoming call', n || 'unknown number');
+            if (Notification.permission === 'granted') {
+              new Notification('Incoming call', { body: (n || 'unknown') + ' · ' + (deviceId || ''), tag: 'ab-ring' });
+            }
+          }
+          break;
+        }
+        case 'sms_received': {
+          const from = payload.sender || 'unknown', body = payload.message || '', ts = payload.timestamp || Date.now();
+          addToThread(from, body, ts);
+          addLog('sms · ' + from + ': ' + body.slice(0, 60), 'sm');
+          showToast('sm', 'SMS from ' + from, body.length > 80 ? body.slice(0, 80) + '…' : body);
+          if (Notification.permission === 'granted') new Notification('SMS from ' + from, { body: body.slice(0, 100) });
+          break;
+        }
+        case 'sms_sent': {
+          const ok = payload.result_code === -1 || payload.result === 'sent';
+          addLog('sms ' + (ok ? 'sent ok' : 'send failed (code ' + payload.result_code + ')'), 'sm');
+          if (!ok) showToast('er', 'SMS failed', 'code: ' + payload.result_code);
+          break;
+        }
+        case 'sms_delivered': addLog('sms delivered', 'sm'); break;
+        case 'error': {
+          const msg = (payload.op || 'op') + ' failed · ' + (payload.code || '?') + ': ' + (payload.message || '');
+          addLog(msg, 'er');
+          showToast('er', (payload.op || 'error') + ' failed', payload.message || payload.code || '');
+          break;
+        }
+        default: addLog('event · ' + kind + ': ' + JSON.stringify(payload).slice(0, 100), '');
+      }
+    }
+
+    // ── WebSocket ────────────────────────────────────────────────
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(proto + '://' + location.host + '/ws/ui');
+      ws.onopen = () => { connected.value = true; addLog('control channel connected', 'ev'); };
+      ws.onclose = () => {
+        connected.value = false;
+        addLog('connection lost · retrying…', 'er');
+        setTimeout(connectWS, 3000);
+      };
+      ws.onmessage = ev => {
+        let d; try { d = JSON.parse(ev.data); } catch(_) { return; }
+        if (d.type === 'state_update') {
+          devices.value = d.devices || [];
+          if (!selectedId.value && devices.value.length) selectedId.value = devices.value[0].id;
+          if (selectedId.value && !devices.value.find(x => x.id === selectedId.value))
+            selectedId.value = devices.value[0]?.id || null;
+          // Sync timer with ACTIVE call started_at
+          const sel = devices.value.find(x => x.id === selectedId.value);
+          if (sel?.call?.state === 'ACTIVE' && !timerHandle)
+            startTimer(sel.call.started_at || Date.now());
+        } else if (d.type === 'event') {
+          handleEvent(d.kind, d.device_id, d.data || {});
+        }
+      };
+    }
+
+    // ── Audio ────────────────────────────────────────────────────
+    let audioWs = null, audioCtx = null, playNode = null, micStream = null, micNode = null, playHead = 0;
+
+    function peakMeter(which, pcm16) {
+      let p = 0;
+      for (let i = 0; i < pcm16.length; i++) { const v = Math.abs(pcm16[i]); if (v > p) p = v; }
+      const pct = Math.min(100, (p / 32768) * 200);
+      if (which === 'rx') meterRx.value = pct; else meterTx.value = pct;
+    }
+
+    async function ensureAudioCtx(rate) {
+      if (audioCtx && audioCtx.sampleRate === rate) return;
+      if (audioCtx) await audioCtx.close();
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: rate });
+      const src = `class P extends AudioWorkletProcessor{process(i){const c=i[0][0];if(!c)return true;const o=new Int16Array(c.length);for(let j=0;j<c.length;j++){let s=Math.max(-1,Math.min(1,c[j]));o[j]=s<0?s*0x8000:s*0x7fff;}this.port.postMessage(o.buffer,[o.buffer]);return true;}}registerProcessor('mp',P);`;
+      await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+      playNode = audioCtx.createGain(); playNode.connect(audioCtx.destination);
+    }
+
+    function schedPCM(pcm16, rate) {
+      if (!audioCtx) return;
+      const buf = audioCtx.createBuffer(1, pcm16.length, rate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < pcm16.length; i++) d[i] = pcm16[i] / 32768;
+      const s = audioCtx.createBufferSource();
+      s.buffer = buf; s.connect(playNode);
+      const now = audioCtx.currentTime;
+      if (playHead < now + 0.05) playHead = now + 0.05;
+      s.start(playHead); playHead += buf.duration;
+    }
+
+    async function startAudio(withMic) {
+      if (!selectedId.value) return;
+      const rate = 48000;
+      await ensureAudioCtx(rate);
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const dir = withMic ? 'both' : 'listen';
+      audioWs = new WebSocket(proto + '://' + location.host + '/ws/audio/' + selectedId.value + '?rate=' + rate + '&dir=' + dir);
+      audioWs.binaryType = 'arraybuffer';
+      audioWs.onopen  = () => { audioActive.value = true; addLog('audio open @ ' + rate + 'Hz · ' + dir, 'au'); };
+      audioWs.onclose = () => { addLog('audio closed', 'au'); stopAudio(); };
+      audioWs.onerror = () => addLog('audio error', 'er');
+      audioWs.onmessage = ev => { const p = new Int16Array(ev.data); peakMeter('rx', p); schedPCM(p, rate); };
+      if (withMic) {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: rate, channelCount: 1 } });
+        const src = audioCtx.createMediaStreamSource(micStream);
+        micNode = new AudioWorkletNode(audioCtx, 'mp');
+        micNode.port.onmessage = ev => {
+          const p = new Int16Array(ev.data);
+          peakMeter('tx', p);
+          if (audioWs && audioWs.readyState === 1) audioWs.send(ev.data);
+        };
+        src.connect(micNode);
+      }
+    }
+
+    function stopAudio() {
+      if (audioWs)   { try { audioWs.close(); } catch(_) {} audioWs = null; }
+      if (micNode)   { try { micNode.disconnect(); } catch(_) {} micNode = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      playHead = 0; audioActive.value = false; meterRx.value = 0; meterTx.value = 0;
+    }
+
+    // ── Keyboard shortcuts ────────────────────────────────────────
+    function onKey(e) {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      const p = callPanel.value;
+      if (p === 'idle') {
+        if ('0123456789*#'.includes(e.key)) { e.preventDefault(); pressKey(e.key); }
+        if (e.key === 'Backspace') { e.preventDefault(); delChar(); }
+        if (e.key === 'Enter') { e.preventDefault(); dial(); }
+        if (e.key === 'Escape') { e.preventDefault(); phoneNum.value = ''; }
+      } else if (p === 'active') {
+        if ('0123456789*#'.includes(e.key)) { e.preventDefault(); sendDtmf(e.key); }
+        if (e.key === 'm') toggleMute();
+        if (e.key === 'Escape') hangup();
+      } else if (p === 'ringing-in') {
+        if (e.key === 'Enter') answer();
+        if (e.key === 'Escape') hangup();
+      } else if (p === 'dialing' || p === 'ringing-out') {
+        if (e.key === 'Escape') hangup();
+      }
+    }
+
+    // ── Utils ────────────────────────────────────────────────────
+    function fmtClock(ts) {
+      if (!ts) return '';
+      try { return new Date(ts).toLocaleTimeString(); } catch(_) { return ''; }
+    }
+
+    // ── Mount ────────────────────────────────────────────────────
+    onMounted(() => {
+      document.body.setAttribute('data-theme', theme.value);
+      connectWS();
+      document.addEventListener('keydown', onKey);
+      if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+    });
+    onUnmounted(() => { document.removeEventListener('keydown', onKey); stopAudio(); if (ws) ws.close(); });
+
+    return {
+      theme, connected, devices, selectedId, selectedDevice, callPanel, callLbl, headerSub,
+      dialKeys, phoneNum, smsTo, smsBody, eventLog, logEl, toasts, timerDisplay,
+      speakerOn, callVolume, meterRx, meterTx, audioActive,
+      contacts, newCName, newCNum, threads, callHistory,
+      toggleTheme, addContact, removeContact, dialContact, dialNumber,
+      pressKey, delChar, dial, hangup, answer, toggleMute, toggleSpeaker,
+      applyVolume, sendDtmf, sendSms, openThread, clearSms,
+      startAudio, stopAudio, removeToast, fmtClock, fmtDur,
     };
-    src.connect(micNode);
   }
-  $('btn-stop-audio').disabled = false;
-  $('btn-listen').disabled = true;
-  $('btn-speak').disabled = true;
-}
-
-function stopAudio() {
-  if (audioWs)   { try{audioWs.close();}catch(_){} audioWs=null; }
-  if (micNode)   { try{micNode.disconnect();}catch(_){} micNode=null; }
-  if (micStream) { micStream.getTracks().forEach(t=>t.stop()); micStream=null; }
-  playHead=0;
-  $('btn-stop-audio').disabled = true;
-  $('btn-listen').disabled = false;
-  $('btn-speak').disabled = false;
-  $('meter-rx').style.width='0%';
-  $('meter-tx').style.width='0%';
-}
-
-$('btn-listen').onclick     = () => startAudio(false);
-$('btn-speak').onclick      = () => startAudio(true);
-$('btn-stop-audio').onclick = stopAudio;
-
-/* ── boot ───────────────────────────────────────────────────── */
-connectUI();
+}).mount('#app');
 </script>
 </body>
 </html>

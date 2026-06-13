@@ -20,7 +20,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const FIND_DAEMON =
         `DAEMON=$(ls ${MODDIR}/system/bin/audio-bridge /system/bin/audio-bridge 2>/dev/null | head -1)`;
 
-    let config = { HOST: '', PORT: '59100', TOKEN: '' };
+    let config = { HOST: '', PORT: '59100', TOKEN: 'default_secure_token_123' };
 
     // ── fetch() helper — reads files served from module webroot ──────────────
     async function fetchFile(path) {
@@ -122,25 +122,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         if (running) {
-            daemonBadge.textContent = 'Running';
-            daemonBadge.className   = 'badge running';
-            daemonPid.textContent   = pid;
+            daemonBadge.textContent = 'running';
+            daemonBadge.className   = 'badge badge-running';
+            daemonPid.textContent   = pid || '—';
             if (conn.includes('Connected to server!')) {
-                daemonConnection.textContent = 'Connected';
-                daemonConnection.className   = 'conn-badge connected';
+                daemonConnection.textContent = 'connected';
+                daemonConnection.className   = 'detail-val conn-ok';
             } else if (conn.includes('No server configured')) {
-                daemonConnection.textContent = 'Waiting for config';
-                daemonConnection.className   = 'conn-badge waiting';
+                daemonConnection.textContent = 'waiting for config';
+                daemonConnection.className   = 'detail-val conn-wait';
             } else {
-                daemonConnection.textContent = 'Disconnected';
-                daemonConnection.className   = 'conn-badge disconnected';
+                daemonConnection.textContent = 'disconnected';
+                daemonConnection.className   = 'detail-val conn-bad';
             }
         } else {
-            daemonBadge.textContent      = status === null ? 'Unknown' : 'Stopped';
-            daemonBadge.className        = 'badge stopped';
-            daemonPid.textContent        = '--';
-            daemonConnection.textContent = '--';
-            daemonConnection.className   = 'conn-badge';
+            daemonBadge.textContent      = status === null ? 'unknown' : 'stopped';
+            daemonBadge.className        = status === null ? 'badge badge-unknown' : 'badge badge-stopped';
+            daemonPid.textContent        = '—';
+            daemonConnection.textContent = '—';
+            daemonConnection.className   = 'detail-val';
         }
 
         // Zygisk — ksu.exec() only, no fetch() equivalent
@@ -294,7 +294,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
     function showResult(type, message) {
-        testResult.className   = `test-result ${type}`;
+        testResult.className   = `result ${type}`;
         testResult.textContent = message;
     }
 

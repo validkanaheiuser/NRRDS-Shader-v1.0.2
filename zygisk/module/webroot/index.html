@@ -3,67 +3,92 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Audio Bridge Settings</title>
+    <title>Audio Bridge</title>
     <link rel="stylesheet" href="style.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <div class="logo">
-                <div class="mic-icon">🎤</div>
-            </div>
-            <h1>Audio Bridge</h1>
-            <p>KernelSU Module Configuration</p>
-        </header>
+<div class="wrap">
 
-        <section class="card status-card">
-            <div class="status-header">
-                <h2>Daemon Status</h2>
-                <div id="daemon-badge" class="badge unknown">Checking...</div>
-            </div>
-            <div class="status-details">
-                <div class="detail-row"><span class="detail-label">PID</span><span id="daemon-pid">--</span></div>
-                <div class="detail-row"><span class="detail-label">Connection</span><span id="daemon-connection" class="conn-badge">--</span></div>
-                <div class="detail-row"><span class="detail-label">Server</span><span id="daemon-server">--</span></div>
-                <div class="detail-row"><span class="detail-label">Version</span><span>v3.1</span></div>
-                <div class="detail-row"><span class="detail-label">Zygisk hooks</span><span id="zygisk-status">--</span></div>
-            </div>
-        </section>
+    <header class="hdr">
+        <div class="hdr-logo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="22"/>
+            </svg>
+        </div>
+        <div>
+            <h1>audio bridge</h1>
+            <p>kernelsu module · v3.1</p>
+        </div>
+    </header>
 
-        <section class="card config-card">
-            <h2>Server Connection</h2>
-            <div class="input-group">
-                <label for="host">IP Address / Host</label>
-                <input type="text" id="host" placeholder="192.168.2.153">
+    <!-- Daemon Status -->
+    <section class="card">
+        <div class="card-hdr">
+            <div class="lbl">daemon status</div>
+            <div id="daemon-badge" class="badge badge-unknown">checking…</div>
+        </div>
+        <div class="detail-list">
+            <div class="detail-row">
+                <span class="detail-key">pid</span>
+                <span id="daemon-pid" class="detail-val mono">—</span>
             </div>
-            <div class="input-group">
-                <label for="port">Port</label>
-                <input type="number" id="port" placeholder="59100">
+            <div class="detail-row">
+                <span class="detail-key">connection</span>
+                <span id="daemon-connection" class="detail-val">—</span>
             </div>
-            <div class="input-group">
-                <label for="token">Security Token</label>
-                <input type="password" id="token" placeholder="Enter token">
+            <div class="detail-row">
+                <span class="detail-key">server</span>
+                <span id="daemon-server" class="detail-val mono">—</span>
             </div>
-            
-            <div class="actions">
-                <button id="btn-test" class="btn secondary">Test Connection</button>
-                <button id="btn-save" class="btn primary">Save & Restart</button>
+            <div class="detail-row">
+                <span class="detail-key">zygisk hooks</span>
+                <span id="zygisk-status" class="detail-val">—</span>
             </div>
-            <div id="test-result" class="test-result hidden"></div>
-        </section>
+        </div>
+    </section>
 
-        <section class="card debug-card">
-            <div class="debug-header">
-                <h2>Live Logs</h2>
-                <button id="btn-refresh-logs" class="btn-icon">🔄</button>
-            </div>
-            <div class="terminal">
-                <pre id="log-output">Loading logs...</pre>
-            </div>
-        </section>
-    </div>
-    
-    <script src="app.js"></script>
+    <!-- Server Connection -->
+    <section class="card">
+        <div class="lbl">server connection</div>
+        <div class="fld">
+            <label for="host">ip address / host</label>
+            <input type="text" id="host" placeholder="192.168.2.153" autocomplete="off">
+        </div>
+        <div class="fld">
+            <label for="port">port</label>
+            <input type="number" id="port" placeholder="59100">
+        </div>
+        <div class="fld">
+            <label for="token">security token</label>
+            <input type="password" id="token" autocomplete="new-password">
+        </div>
+        <div class="brow">
+            <button id="btn-test" class="btn-secondary">test connection</button>
+            <button id="btn-save" class="btn-primary">save &amp; restart</button>
+        </div>
+        <div id="test-result" class="result hidden"></div>
+    </section>
+
+    <!-- Live Logs -->
+    <section class="card">
+        <div class="card-hdr">
+            <div class="lbl">live logs</div>
+            <button id="btn-refresh-logs" class="btn-icon" title="refresh">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                </svg>
+            </button>
+        </div>
+        <div class="terminal">
+            <pre id="log-output">loading logs…</pre>
+        </div>
+    </section>
+
+</div>
+<script src="app.js"></script>
 </body>
 </html>

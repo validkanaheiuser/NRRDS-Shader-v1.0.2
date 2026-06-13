@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.media.AudioManager;
+import android.media.ToneGenerator;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -299,6 +300,61 @@ public class TelephonyHelper {
             }
         } catch (Exception e) {
             emitError("mute", "EXCEPTION", e.getMessage());
+        }
+    }
+
+    public void sendDtmf(String digit) {
+        if (digit == null || digit.isEmpty()) return;
+        int tone = charToTone(digit.charAt(0));
+        if (tone < 0) return;
+        try {
+            ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_VOICE_CALL, 80);
+            tg.startTone(tone, 160);
+            mMainHandler.postDelayed(() -> { tg.stopTone(); tg.release(); }, 220);
+        } catch (Exception e) {
+            emitError("dtmf", "EXCEPTION", e.getMessage());
+        }
+    }
+
+    private int charToTone(char c) {
+        switch (c) {
+            case '0': return ToneGenerator.TONE_DTMF_0;
+            case '1': return ToneGenerator.TONE_DTMF_1;
+            case '2': return ToneGenerator.TONE_DTMF_2;
+            case '3': return ToneGenerator.TONE_DTMF_3;
+            case '4': return ToneGenerator.TONE_DTMF_4;
+            case '5': return ToneGenerator.TONE_DTMF_5;
+            case '6': return ToneGenerator.TONE_DTMF_6;
+            case '7': return ToneGenerator.TONE_DTMF_7;
+            case '8': return ToneGenerator.TONE_DTMF_8;
+            case '9': return ToneGenerator.TONE_DTMF_9;
+            case '*': return ToneGenerator.TONE_DTMF_S;
+            case '#': return ToneGenerator.TONE_DTMF_P;
+            default:  return -1;
+        }
+    }
+
+    public void setAudioRoute(String route) {
+        if (mAudioManager == null) { emitError("audio_route", "NO_AUDIO_MGR", "AudioManager unavailable"); return; }
+        try {
+            boolean speaker = "speaker".equalsIgnoreCase(route);
+            mAudioManager.setMode(AudioManager.MODE_IN_CALL);
+            mAudioManager.setSpeakerphoneOn(speaker);
+            android.util.Log.i(TAG, "setAudioRoute(" + route + ") → speaker=" + speaker);
+        } catch (Exception e) {
+            emitError("audio_route", "EXCEPTION", e.getMessage());
+        }
+    }
+
+    public void setVolume(int level) {
+        if (mAudioManager == null) { emitError("volume", "NO_AUDIO_MGR", "AudioManager unavailable"); return; }
+        try {
+            int max = mAudioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+            int vol = Math.max(0, Math.min(max, level));
+            mAudioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, vol, 0);
+            android.util.Log.i(TAG, "setVolume(" + level + ") → clamped=" + vol + "/" + max);
+        } catch (Exception e) {
+            emitError("volume", "EXCEPTION", e.getMessage());
         }
     }
 

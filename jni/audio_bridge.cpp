@@ -252,10 +252,53 @@ public:
                 }
             }
         }
-        
+
+        // Parse string fields for new commands
+        for (const char* key : {"digit", "route"}) {
+            std::string needle = std::string("\"") + key + "\"";
+            pos = json.find(needle);
+            if(pos != std::string::npos) {
+                pos = json.find(":", pos);
+                if(pos != std::string::npos) {
+                    size_t start = json.find("\"", pos + 1);
+                    size_t end = json.find("\"", start + 1);
+                    if(start != std::string::npos && end != std::string::npos) {
+                        obj.object_value[key] = SimpleJson(json.substr(start + 1, end - start - 1));
+                    }
+                }
+            }
+        }
+
+        // Parse "on" (boolean)
+        pos = json.find("\"on\"");
+        if(pos != std::string::npos) {
+            pos = json.find(":", pos);
+            if(pos != std::string::npos) {
+                size_t vpos = pos + 1;
+                while(vpos < json.size() && (json[vpos] == ' ' || json[vpos] == '\t')) vpos++;
+                obj.object_value["on"] = SimpleJson(json.compare(vpos, 4, "true") == 0);
+            }
+        }
+
+        // Parse "level" (number)
+        pos = json.find("\"level\"");
+        if(pos != std::string::npos) {
+            pos = json.find(":", pos);
+            if(pos != std::string::npos) {
+                size_t vpos = pos + 1;
+                while(vpos < json.size() && (json[vpos] == ' ' || json[vpos] == '\t')) vpos++;
+                size_t end = vpos;
+                while(end < json.size() && (isdigit((unsigned char)json[end]) || json[end] == '-' || json[end] == '.')) end++;
+                if(end > vpos) {
+                    try { obj.object_value["level"] = SimpleJson(std::stod(json.substr(vpos, end - vpos))); }
+                    catch(...) {}
+                }
+            }
+        }
+
         return obj;
     }
-    
+
     std::string getString(const std::string& key, const std::string& def = "") const {
         auto it = object_value.find(key);
         return (it != object_value.end() && it->second.type == STRING) ?
@@ -267,6 +310,16 @@ public:
         if (it == object_value.end()) return def;
         if (it->second.type == BOOLEAN) return it->second.bool_value;
         if (it->second.type == NUMBER)  return it->second.number_value != 0.0;
+        return def;
+    }
+
+    double getNumber(const std::string& key, double def = 0.0) const {
+        auto it = object_value.find(key);
+        if (it == object_value.end()) return def;
+        if (it->second.type == NUMBER) return it->second.number_value;
+        if (it->second.type == STRING) {
+            try { return std::stod(it->second.string_value); } catch(...) {}
+        }
         return def;
     }
 
@@ -463,6 +516,30 @@ static std::string jni_send_sms(const std::string& number, const std::string& me
     json.object_value["message"] = SimpleJson(message);
     send_to_java(json);
     return "";
+}
+
+static void jni_send_dtmf(const std::string& digit) {
+    SimpleJson json;
+    json.type = SimpleJson::OBJECT;
+    json.object_value["command"] = SimpleJson("dtmf");
+    json.object_value["digit"] = SimpleJson(digit);
+    send_to_java(json);
+}
+
+static void jni_set_audio_route(const std::string& route) {
+    SimpleJson json;
+    json.type = SimpleJson::OBJECT;
+    json.object_value["command"] = SimpleJson("audio_route");
+    json.object_value["route"] = SimpleJson(route);
+    send_to_java(json);
+}
+
+static void jni_set_volume(int level) {
+    SimpleJson json;
+    json.type = SimpleJson::OBJECT;
+    json.object_value["command"] = SimpleJson("volume");
+    json.object_value["level"] = SimpleJson((double)level);
+    send_to_java(json);
 }
 
 static void remove_pid_file() {
@@ -993,6 +1070,20 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
                     std::string msg_id = jni_send_sms(number, message);
                     LOGI("SMS queued: %s", msg_id.c_str());
                 }
+            } else if(cmd == "dtmf") {
+                std::string digit = root.getString("digit");
+                if(!digit.empty()) {
+                    jni_send_dtmf(digit);
+                    LOGI("DTMF: %s", digit.c_str());
+                }
+            } else if(cmd == "audio_route") {
+                std::string route = root.getString("route", "earpiece");
+                jni_set_audio_route(route);
+                LOGI("Audio route: %s", route.c_str());
+            } else if(cmd == "volume") {
+                int level = (int)root.getNumber("level", 7.0);
+                jni_set_volume(level);
+                LOGI("Volume: %d", level);
             } else if(cmd == "ping") {
                 SimpleJson pong;
                 pong.type = SimpleJson::OBJECT;
