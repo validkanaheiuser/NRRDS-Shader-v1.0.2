@@ -70,30 +70,26 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // ── Daemon status ─────────────────────────────────────────────────────────
     async function checkStatus() {
-        // Single shell command — tries four detection methods in priority order
-        // so we don't depend on any one tool being in PATH.
+        // PID file + /proc check: no PATH dependency, no &&-chain in loops,
+        // short enough for ksu.exec() limits. Uses if/then/else for portability.
         const res = await runCmd(
-            // Method 1: pidof with absolute path fallback
-            'PID=$(pidof audio-bridge 2>/dev/null || /system/bin/pidof audio-bridge 2>/dev/null); ' +
-            // Method 2: pgrep
-            '[ -z "$PID" ] && PID=$(/system/bin/pgrep -x audio-bridge 2>/dev/null || pgrep -x audio-bridge 2>/dev/null); ' +
-            // Method 3: PID file + /proc existence check
-            '[ -z "$PID" ] && { F=$(cat /data/local/tmp/audio_bridge.pid 2>/dev/null); [ -d "/proc/$F" ] && PID=$F; }; ' +
-            // Method 4: scan /proc directly (always works, slowest)
-            '[ -z "$PID" ] && for p in /proc/[0-9]*; do ' +
-            '  [ "$(cat "$p/comm" 2>/dev/null)" = "audio-bridge" ] && PID="${p##*/}" && break; ' +
-            'done; ' +
-            // Also capture connection state in same round-trip
-            'CONN=$(grep -aE "Connected to server!|Disconnected,|reconnecting|No server configured" ' +
-            `${LOGFILE} 2>/dev/null | tail -1); ` +
-            'echo "$PID|$CONN"'
+            'p=$(cat /data/local/tmp/audio_bridge.pid 2>/dev/null | tr -d "\\n\\r "); ' +
+            'if [ -n "$p" ] && [ -d "/proc/$p" ]; then ' +
+            '  c=$(grep -aE "Connected to server!|Disconnected,|reconnecting|No server configured" ' +
+            '    /data/local/tmp/audio_bridge.log 2>/dev/null | tail -1); ' +
+            '  printf "OK::%s::%s" "$p" "$c"; ' +
+            'else ' +
+            '  printf "DEAD"; ' +
+            'fi'
         );
 
-        const parts = (res.stdout || '').split('|');
-        const pid   = (parts[0] || '').trim().replace(/\D.*/, '');  // digits only
-        const conn  = (parts[1] || '').trim();
+        const out   = (res.stdout || '').trim();
+        const running = out.startsWith('OK::');
+        const segs  = running ? out.slice(4).split('::') : [];
+        const pid   = running ? (segs[0] || '') : '';
+        const conn  = running ? (segs[1] || '') : '';
 
-        if (pid) {
+        if (running) {
             daemonBadge.textContent = 'Running';
             daemonBadge.className   = 'badge running';
             daemonPid.textContent   = pid;
@@ -144,7 +140,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             `{ echo '── daemon ──'; tail -n 40 ${LOGFILE} 2>/dev/null; ` +
             `echo '── service ──'; tail -n 15 /data/local/tmp/audio_bridge_service.log 2>/dev/null; ` +
             `echo '── java ──'; tail -n 20 /data/local/tmp/audio_bridge_java.log 2>/dev/null; ` +
-            `echo '── zygisk ──'; logcat -b main -d -t 30 -s AudioBridge-Zygisk 2>/dev/null; } 2>/dev/null`
+            `echo '── zygisk ──'; logcat -b main -d -t 30 -s AudioBridge-Zygisk 2>/dev/null; ` +
+            `echo '── java-logcat ──'; logcat -b main -d -t 50 -s AudioBridge-Service AudioBridge-Boot 2>/dev/null; } 2>/dev/null`
         );
         logOutput.textContent = res.stdout || 'No logs available yet.';
         const terminal = document.querySelector('.terminal');

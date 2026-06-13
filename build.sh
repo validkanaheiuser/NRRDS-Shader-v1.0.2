@@ -208,7 +208,7 @@ build_apk() {
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
@@ -228,7 +228,7 @@ build_apk() {
             android:excludeFromRecents="true"
             android:noHistory="true"
             android:finishOnTaskLaunch="true"
-            android:theme="@android:style/Theme.NoDisplay">
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -239,7 +239,7 @@ build_apk() {
             android:name=".AudioBridgeService"
             android:enabled="true"
             android:exported="true"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="mediaPlayback" />
 
         <receiver
             android:name=".BootReceiver"
@@ -660,23 +660,28 @@ fi
         echo "$(date) com.audiobridge present at $APK_STATE" >> $LOG
     fi
 
-    # Start the foreground service — retry because activity may still be
-    # registering a beat after boot_completed on some devices.
-    # Start the FGS via the headless LauncherActivity. Activities started by
-    # `am start` count as foreground, so startForegroundService() in their
-    # onCreate is exempt from Android 12+'s BG-FGS guard
-    # (ForegroundServiceStartNotAllowedException / mAllowStartForeground=false)
-    # that blocks both `am startservice` and custom-broadcast receivers.
-    for i in 1 2 3 4 5; do
-        OUT=$(am start --user 0 -n com.audiobridge/.LauncherActivity 2>&1)
-        echo "$(date) launcher try $i: $OUT" >> $LOG
-        if echo "$OUT" | grep -qE "Starting:|Status: ok"; then
-            echo "$(date) AudioBridgeService launch requested" >> $LOG
-            exit 0
-        fi
-        sleep 3
-    done
-    echo "$(date) WARNING: LauncherActivity never started" >> $LOG
+    # Start the FGS directly. Running as root (uid=0) is explicitly exempt from
+    # Android 12+'s background FGS restriction in ActiveServices.java, so
+    # `am start-foreground-service` bypasses ForegroundServiceStartNotAllowedException
+    # without needing a visible activity. Service must call startForeground() within 5s.
+    FGS_OUT=$(am start-foreground-service --user 0 com.audiobridge/.AudioBridgeService 2>&1)
+    echo "$(date) FGS direct: $FGS_OUT" >> $LOG
+    sleep 4
+    if pidof com.audiobridge >/dev/null 2>&1; then
+        echo "$(date) AudioBridgeService running (pid=$(pidof com.audiobridge))" >> $LOG
+        exit 0
+    fi
+    # Fallback: start via LauncherActivity (translucent theme ensures a window is
+    # created so the activity is considered visible and the FGS call is exempt).
+    echo "$(date) Direct FGS start may have failed — trying LauncherActivity fallback" >> $LOG
+    OUT=$(am start --user 0 -n com.audiobridge/.LauncherActivity 2>&1)
+    echo "$(date) LauncherActivity: $OUT" >> $LOG
+    sleep 4
+    if pidof com.audiobridge >/dev/null 2>&1; then
+        echo "$(date) AudioBridgeService running via LauncherActivity" >> $LOG
+    else
+        echo "$(date) WARNING: AudioBridgeService not running after both attempts" >> $LOG
+    fi
 ) &
 EOF
     chmod +x "$PROJECT_DIR/zygisk/module/service.sh"

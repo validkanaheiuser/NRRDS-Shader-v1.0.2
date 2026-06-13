@@ -12,15 +12,16 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * Headless (Theme.NoDisplay) activity whose only job is to kick the
- * foreground service into existence. Started by service.sh via `am start`.
+ * Transparent trampoline activity whose only job is to start AudioBridgeService
+ * as a foreground service. Used as a fallback when service.sh's direct
+ * am start-foreground-service call doesn't produce a running process.
  *
- * Why not a BroadcastReceiver? Since Android 12 (API 31), startForegroundService
- * from a custom broadcast is blocked with ForegroundServiceStartNotAllowedException
- * unless the broadcast is a system broadcast (BOOT_COMPLETED, etc.). Activities
- * don't have this restriction — an activity is considered "foreground" the
- * moment it starts, even with Theme.NoDisplay, so startForegroundService()
- * from its onCreate is permitted.
+ * Why not Theme.NoDisplay? On Android 14+ (API 34+), Theme.NoDisplay activities
+ * that call finish() in onCreate() without setContentView() may not be registered
+ * as "visible" by the ActivityManager, which can cause startForegroundService()
+ * to fail with ForegroundServiceStartNotAllowedException. Theme.Translucent creates
+ * a real (transparent) window, properly satisfying the "activity in foreground"
+ * exemption. The activity is on-screen for < 1 frame so there is no visual artifact.
  */
 public class LauncherActivity extends Activity {
     private static final String TAG = "AudioBridge-Launcher";
@@ -38,6 +39,7 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
+        overridePendingTransition(0, 0);  // suppress enter animation — transparent window
         diag("onCreate — starting foreground service");
         Intent svc = new Intent(this, AudioBridgeService.class);
         try {
