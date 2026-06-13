@@ -99,21 +99,20 @@ public class IPCClient {
     private void connectAndListen() throws IOException, JSONException {
         diag("Connecting to abstract socket @" + SOCKET_NAME);
 
-        mSocket = new LocalSocket();
-        mSocket.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+        LocalSocket sock = new LocalSocket();
+        sock.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+        mSocket = sock;
 
-        mOut = new PrintWriter(new OutputStreamWriter(mSocket.getOutputStream()), true);
-        mIn = new BufferedReader(new InputStreamReader(mSocket.getInputStream()));
+        mOut = new PrintWriter(new OutputStreamWriter(sock.getOutputStream()), true);
+        mIn  = new BufferedReader(new InputStreamReader(sock.getInputStream()));
 
-        // Handshake
         mOut.println("HELO_JAVA");
         diag("Connected — HELO_JAVA sent");
         setStatus("Daemon connected · telephony ready");
-        
+
         String line;
         while (mRunning && (line = mIn.readLine()) != null) {
             if (line.trim().isEmpty()) continue;
-            
             try {
                 JSONObject json = new JSONObject(line);
                 handleCommand(json);
@@ -121,8 +120,14 @@ public class IPCClient {
                 Log.e(TAG, "Invalid JSON from daemon: " + line);
             }
         }
-        
-        disconnect();
+
+        // Clean up socket resources but do NOT set mRunning=false — the
+        // retry loop in startConnectionThread() must keep running so we
+        // reconnect when the daemon restarts.
+        mOut = null;
+        mIn  = null;
+        mSocket = null;
+        try { sock.close(); } catch (IOException ignored) {}
         throw new IOException("Socket closed by remote");
     }
 
