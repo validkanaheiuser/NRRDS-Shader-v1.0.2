@@ -203,6 +203,7 @@ build_apk() {
     <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.READ_PRECISE_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_SMS" />
@@ -489,6 +490,7 @@ build_zygisk() {
         <permission name="android.permission.ANSWER_PHONE_CALLS"/>
         <permission name="android.permission.READ_PHONE_STATE"/>
         <permission name="android.permission.READ_PRECISE_PHONE_STATE"/>
+        <permission name="android.permission.READ_CALL_LOG"/>
         <permission name="android.permission.SEND_SMS"/>
         <permission name="android.permission.RECEIVE_SMS"/>
         <permission name="android.permission.READ_SMS"/>
@@ -551,6 +553,7 @@ pm grant com.audiobridge android.permission.CALL_PHONE 2>/dev/null
 pm grant com.audiobridge android.permission.ANSWER_PHONE_CALLS 2>/dev/null
 pm grant com.audiobridge android.permission.READ_PHONE_STATE 2>/dev/null
 pm grant com.audiobridge android.permission.READ_PRECISE_PHONE_STATE 2>/dev/null
+pm grant com.audiobridge android.permission.READ_CALL_LOG 2>/dev/null
 pm grant com.audiobridge android.permission.SEND_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.RECEIVE_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.READ_SMS 2>/dev/null

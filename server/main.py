@@ -35,6 +35,29 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 # Optional deps: server degrades gracefully without them.
+
+# On Windows the opuslib Python package loads fine but still fails to import
+# if the native opus.dll is not in PATH. Pre-load the DLL from common locations
+# before importing opuslib so the user only needs to drop opus.dll next to
+# main.py (or install it system-wide).
+import sys as _sys
+if _sys.platform == "win32":
+    import ctypes as _ctypes, os as _os
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    for _candidate in [
+        _os.path.join(_here, "opus.dll"),
+        _os.path.join(_here, "libopus.dll"),
+        _os.path.join(_here, "libopus-0.dll"),
+    ]:
+        if _os.path.exists(_candidate):
+            try:
+                _ctypes.CDLL(_candidate)
+                if hasattr(_os, "add_dll_directory"):
+                    _os.add_dll_directory(_here)
+            except OSError:
+                pass
+            break
+
 try:
     import opuslib
     HAS_OPUS = True
@@ -478,7 +501,11 @@ async def start_tcp() -> None:
 async def lifespan(_app: FastAPI):
     task = asyncio.create_task(start_tcp())
     if not HAS_OPUS:
-        log.warning("opuslib missing — audio bridging disabled (pip install opuslib)")
+        log.warning("opuslib or native libopus not found — audio bridging disabled")
+        log.warning("  pip install opuslib  (Python package)")
+        log.warning("  Windows: download opus.dll → place it next to server/main.py")
+        log.warning("  Linux:   sudo apt-get install libopus0")
+        log.warning("  macOS:   brew install opus")
     if not HAS_SOXR:
         log.warning("python-soxr missing — sample-rate conversion disabled (pip install soxr numpy)")
     yield
