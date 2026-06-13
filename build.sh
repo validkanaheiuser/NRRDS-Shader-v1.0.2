@@ -534,6 +534,8 @@ allow platform_app su    unix_stream_socket { connectto read write getattr }
 allow radio      ksu     unix_stream_socket { connectto read write getattr }
 allow radio      magisk  unix_stream_socket { connectto read write getattr }
 allow radio      su      unix_stream_socket { connectto read write getattr }
+# Allow the app (priv_app) to write its Java-side diag log to /data/local/tmp
+allow priv_app shell_data_file { read write create open append getattr setattr }
 EOF
 
     # Create service.sh (runs during late_start - safe, non-blocking)
@@ -560,21 +562,24 @@ appops set com.audiobridge SYSTEM_ALERT_WINDOW allow 2>/dev/null
 # domain pair we might hit.
 APP_DOMAINS="priv_app system_app platform_app radio"
 DAEMON_DOMAINS="ksu magisk su init"
-if command -v magiskpolicy >/dev/null 2>&1; then
+apply_rule() {
+    local RULE="$1"
+    if command -v magiskpolicy >/dev/null 2>&1; then
+        magiskpolicy --live "$RULE" 2>/dev/null
+    elif [ -f /data/adb/ksud ]; then
+        /data/adb/ksud apply-sepolicy "$RULE" 2>/dev/null
+    elif command -v supolicy >/dev/null 2>&1; then
+        supolicy --live "$RULE" 2>/dev/null
+    fi
+}
+if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -v supolicy >/dev/null 2>&1; then
+    # Unix socket: allow app domains to connect to daemon domains
     for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
-        magiskpolicy --live "allow $APP $D unix_stream_socket { connectto read write getattr }" 2>/dev/null
+        apply_rule "allow $APP $D unix_stream_socket { connectto read write getattr }"
     done; done
-    echo "$(date) SELinux rules applied via magiskpolicy" >> $LOG
-elif [ -f /data/adb/ksud ]; then
-    for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
-        /data/adb/ksud apply-sepolicy "allow $APP $D unix_stream_socket { connectto read write getattr }" 2>/dev/null
-    done; done
-    echo "$(date) SELinux rules applied via ksud" >> $LOG
-elif command -v supolicy >/dev/null 2>&1; then
-    for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
-        supolicy --live "allow $APP $D unix_stream_socket { connectto read write getattr }" 2>/dev/null
-    done; done
-    echo "$(date) SELinux rules applied via supolicy" >> $LOG
+    # Allow priv_app to write its Java-side diag log to /data/local/tmp
+    apply_rule "allow priv_app shell_data_file { read write create open append getattr setattr }"
+    echo "$(date) SELinux rules applied" >> $LOG
 else
     echo "$(date) WARNING: no sepolicy tool found" >> $LOG
 fi
