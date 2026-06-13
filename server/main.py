@@ -499,20 +499,23 @@ async def ws_ui(ws: WebSocket) -> None:
             if not did or did not in mgr.devices:
                 continue
             d = mgr.devices[did]
-            if cmd == "dial":
-                await d.send_control("dial", number=data.get("number"))
-            elif cmd == "hangup":
-                await d.send_control("hangup")
-            elif cmd == "answer":
-                await d.send_control("answer")
-            elif cmd == "mute":
-                await d.send_control("mute", on=bool(data.get("on", True)))
-            elif cmd == "send_sms":
-                await d.send_control(
-                    "send_sms",
-                    number=data.get("number"),
-                    message=data.get("message"),
-                )
+            try:
+                if cmd == "dial":
+                    await d.send_control("dial", number=data.get("number"))
+                elif cmd == "hangup":
+                    await d.send_control("hangup")
+                elif cmd == "answer":
+                    await d.send_control("answer")
+                elif cmd == "mute":
+                    await d.send_control("mute", on=bool(data.get("on", True)))
+                elif cmd == "send_sms":
+                    await d.send_control(
+                        "send_sms",
+                        number=data.get("number"),
+                        message=data.get("message"),
+                    )
+            except Exception as e:
+                log.warning("send_control %s → %s: %s", cmd, did, e)
     except WebSocketDisconnect:
         pass
     finally:

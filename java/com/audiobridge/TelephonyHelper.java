@@ -262,6 +262,7 @@ public class TelephonyHelper {
             } catch (SecurityException se) {
                 emitError("dial", "SECURITY", se.getMessage());
                 resetCallState();
+                emitCallState("IDLE", "unknown", "");
                 return false;
             } catch (Exception e) {
                 android.util.Log.w(TAG, "TelecomManager.placeCall failed, trying intent", e);
@@ -278,6 +279,7 @@ public class TelephonyHelper {
         } catch (Exception e) {
             emitError("dial", "INTENT_FAILED", e.getMessage());
             resetCallState();
+            emitCallState("IDLE", "unknown", "");
             return false;
         }
     }
