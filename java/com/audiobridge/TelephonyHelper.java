@@ -59,6 +59,8 @@ public class TelephonyHelper {
     private String mActiveNumber = "";
     private long   mStartedAt    = 0;      // ms since epoch
     private boolean mMuted       = false;
+    @SuppressWarnings("deprecation")
+    private android.telephony.PhoneStateListener mPhoneStateListener;
 
     // Native methods removed in favor of IPCClient
 
@@ -154,13 +156,13 @@ public class TelephonyHelper {
         // Android 16 — it provides the incoming ringing number which TelephonyCallback
         // dropped for privacy. Since we run as a privileged app with READ_PHONE_STATE
         // and READ_PRECISE_PHONE_STATE, LISTEN_CALL_STATE works correctly.
-        PhoneStateListener listener = new PhoneStateListener() {
+        mPhoneStateListener = new PhoneStateListener() {
             @Override
             public void onCallStateChanged(int state, String incomingNumber) {
                 handleCallStateChange(state, incomingNumber != null ? incomingNumber : "");
             }
         };
-        mTelephonyManager.listen(listener, PhoneStateListener.LISTEN_CALL_STATE);
+        mTelephonyManager.listen(mPhoneStateListener, PhoneStateListener.LISTEN_CALL_STATE);
         android.util.Log.i(TAG, "PhoneStateListener registered for CALL_STATE");
     }
 
