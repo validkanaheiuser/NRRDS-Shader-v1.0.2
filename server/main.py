@@ -431,8 +431,13 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             elif t == T_SMS:
                 try:
                     sms = json.loads(data.decode())
-                    sms["device_id"] = device.id
-                    await mgr.broadcast_event(sms)
+                    kind = sms.get("event", "sms_event")
+                    await mgr.broadcast_event({
+                        "type": "event",
+                        "kind": kind,
+                        "device_id": device.id,
+                        "data": sms,
+                    })
                 except Exception as e:
                     log.debug("sms parse: %s", e)
             elif t == T_PING:
