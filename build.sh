@@ -639,25 +639,30 @@ fi
     done
     sleep 3
 
-    # Detect the broken priv-app-overlay scenario (Resources null-deref
-    # during handleBindApplication on some ROMs) and force pm install when
-    # the priv-app copy is confirmed crashing.
-    # Use logcat -b crash (resets each boot) instead of dumpsys dropbox
-    # (accumulates all-time history and causes false positives on re-flash).
+    # On Android 16, the priv-app overlay triggers a Resources null-deref
+    # inside handleBindApplication BEFORE any user code runs, crashing on
+    # every FGS start attempt. The crash check used to run before the start
+    # attempts, so it always saw 0 crashes — a timing window that can never
+    # close. The fix: unconditionally prefer a data-app install over the
+    # priv-app overlay on every boot. pm install -r retains all granted
+    # permissions and the resulting package still runs in priv_app SELinux
+    # context (updated system app), but the data-app APK path avoids the
+    # Android 16 priv-app resource initialization crash entirely.
     APK_STATE=$(pm path com.audiobridge 2>/dev/null)
-    RECENT_CRASH=$(logcat -b crash -d 2>/dev/null | grep -c "Process: com.audiobridge")
 
     if [ -z "$APK_STATE" ]; then
         echo "$(date) com.audiobridge not registered; pm install from MODDIR" >> $LOG
         [ -f "$MODDIR/AudioBridge.apk" ] && \
             pm install -r -g "$MODDIR/AudioBridge.apk" >> $LOG 2>&1
-    elif echo "$APK_STATE" | grep -q "/system/priv-app/" && [ "$RECENT_CRASH" -gt 2 ]; then
-        echo "$(date) priv-app path is crashing ($RECENT_CRASH hits); pm install override" >> $LOG
+        sleep 2
+    elif echo "$APK_STATE" | grep -q "/system/priv-app/"; then
+        echo "$(date) com.audiobridge is priv-app — reinstalling as data-app (avoids Android 16 handleBindApplication crash)" >> $LOG
         if [ -f "$MODDIR/AudioBridge.apk" ]; then
             pm install -r -g "$MODDIR/AudioBridge.apk" >> $LOG 2>&1
+            sleep 2
         fi
     else
-        echo "$(date) com.audiobridge present at $APK_STATE" >> $LOG
+        echo "$(date) com.audiobridge present at $APK_STATE (data-app, ok)" >> $LOG
     fi
 
     # Start the FGS directly. Running as root (uid=0) is explicitly exempt from

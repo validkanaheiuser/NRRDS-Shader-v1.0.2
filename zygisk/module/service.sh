@@ -8,101 +8,141 @@ echo "$(date) Audio Bridge service.sh started" >> $LOG
 pm grant com.audiobridge android.permission.CALL_PHONE 2>/dev/null
 pm grant com.audiobridge android.permission.ANSWER_PHONE_CALLS 2>/dev/null
 pm grant com.audiobridge android.permission.READ_PHONE_STATE 2>/dev/null
+pm grant com.audiobridge android.permission.READ_PRECISE_PHONE_STATE 2>/dev/null
 pm grant com.audiobridge android.permission.SEND_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.RECEIVE_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.READ_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.POST_NOTIFICATIONS 2>/dev/null
 appops set com.audiobridge SYSTEM_ALERT_WINDOW allow 2>/dev/null
 
-# Apply SELinux rules at runtime. sepolicy.rule is read by Magisk/KernelSU on
-# boot, but a live push covers reinstalls and testing. The rule set covers
-# every (app_domain -> daemon_domain) pair we might encounter.
+# Apply SELinux rules. sepolicy.rule is read by Magisk/KernelSU on boot; this
+# is the belt to that file's suspenders. Rules cover every (app, daemon)
+# domain pair we might hit.
 APP_DOMAINS="priv_app system_app platform_app radio"
 DAEMON_DOMAINS="ksu magisk su init"
-if command -v magiskpolicy >/dev/null 2>&1; then
+apply_rule() {
+    local RULE="$1"
+    if command -v magiskpolicy >/dev/null 2>&1; then
+        magiskpolicy --live "$RULE" 2>/dev/null
+    elif [ -f /data/adb/ksud ]; then
+        /data/adb/ksud apply-sepolicy "$RULE" 2>/dev/null
+    elif command -v supolicy >/dev/null 2>&1; then
+        supolicy --live "$RULE" 2>/dev/null
+    fi
+}
+if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -v supolicy >/dev/null 2>&1; then
+    # Unix socket: allow app domains to connect to daemon domains
     for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
-        magiskpolicy --live "allow $APP $D unix_stream_socket { connectto read write getattr }" 2>/dev/null
+        apply_rule "allow $APP $D unix_stream_socket { connectto read write getattr }"
     done; done
-    echo "$(date) SELinux rules applied via magiskpolicy" >> $LOG
-elif [ -f /data/adb/ksud ]; then
-    # KernelSU: apply-sepolicy accepts one rule per -- invocation.
-    for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
-        /data/adb/ksud apply-sepolicy "allow $APP $D unix_stream_socket { connectto read write getattr }" 2>/dev/null
-    done; done
-    echo "$(date) SELinux rules applied via ksud" >> $LOG
-elif command -v supolicy >/dev/null 2>&1; then
-    for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
-        supolicy --live "allow $APP $D unix_stream_socket { connectto read write getattr }" 2>/dev/null
-    done; done
-    echo "$(date) SELinux rules applied via supolicy" >> $LOG
+    # Allow priv_app to write its Java-side diag log to /data/local/tmp
+    apply_rule "allow priv_app shell_data_file { read write create open append getattr setattr }"
+    echo "$(date) SELinux rules applied" >> $LOG
 else
     echo "$(date) WARNING: no sepolicy tool found" >> $LOG
 fi
 
-# Start daemon if not running
-if ! pidof audio-bridge >/dev/null 2>&1; then
-    echo "$(date) Starting audio bridge daemon" >> $LOG
-    if [ -f /system/bin/audio-bridge ]; then
-        /system/bin/audio-bridge --daemon >> $LOG 2>&1 &
-    else
-        chmod 755 $MODDIR/system/bin/audio-bridge 2>/dev/null
-        $MODDIR/system/bin/audio-bridge --daemon >> $LOG 2>&1 &
-    fi
-    sleep 3
-    if pidof audio-bridge >/dev/null 2>&1; then
-        echo "$(date) Daemon started, PID: $(pidof audio-bridge)" >> $LOG
-    else
-        echo "$(date) WARNING: Daemon failed to start" >> $LOG
-    fi
-else
-    echo "$(date) Daemon already running, PID: $(pidof audio-bridge)" >> $LOG
+# Locate daemon binary once — used in every branch below.
+# Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
+# KernelSU when service.sh runs at boot. $MODDIR is always a real directory.
+DAEMON_BIN=""
+if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
+    chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
+    DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
+elif [ -f /system/bin/audio-bridge ]; then
+    DAEMON_BIN="/system/bin/audio-bridge"
 fi
 
-# Background: wait for framework, install APK if needed, start service.
+start_daemon() {
+    echo "$(date) Launching: $DAEMON_BIN" >> $LOG
+    "$DAEMON_BIN" --daemon >> $LOG 2>&1 &
+    sleep 3
+    if pidof audio-bridge >/dev/null 2>&1; then
+        echo "$(date) Daemon started OK, PID=$(pidof audio-bridge)" >> $LOG
+    else
+        echo "$(date) WARNING: Daemon failed to start — check SELinux or binary integrity" >> $LOG
+    fi
+}
+
+if [ -z "$DAEMON_BIN" ]; then
+    echo "$(date) ERROR: audio-bridge binary not found in MODDIR or /system/bin" >> $LOG
+elif ! pidof audio-bridge >/dev/null 2>&1; then
+    echo "$(date) Starting audio bridge daemon" >> $LOG
+    start_daemon
+else
+    # At reboot the daemon may still be visible in pidof while dying from SIGTERM.
+    # Wait up to 5 s; if it exits we restart, otherwise it is genuinely healthy.
+    STALE=0
+    for _w in 1 2 3 4 5; do
+        sleep 1
+        if ! pidof audio-bridge >/dev/null 2>&1; then
+            STALE=1
+            break
+        fi
+    done
+    if [ "$STALE" = "1" ]; then
+        echo "$(date) Stale daemon was dying; restarting" >> $LOG
+        start_daemon
+    else
+        echo "$(date) Daemon already running, PID=$(pidof audio-bridge)" >> $LOG
+    fi
+fi
+
+# Background: wait for the framework, install APK if needed, start service.
 (
+    # Wait for boot_completed (cap ~2 min).
     for i in $(seq 1 60); do
         if [ "$(getprop sys.boot_completed)" = "1" ]; then break; fi
         sleep 2
     done
     sleep 3
 
-    # Decide how to install the APK.
-    # Some ROMs (Samsung One UI, certain KernelSU kernels) fail to resolve
-    # Resources when the APK is loaded from a systemless /system/priv-app
-    # overlay — the app crashes in handleBindApplication with a Resources
-    # null-deref before any component runs. We detect this by checking
-    # /data/dalvik-cache or recent crashes for com.audiobridge; if the app is
-    # advertised as priv-app but crashing, we force a real pm install.
+    # On Android 16, the priv-app overlay triggers a Resources null-deref
+    # inside handleBindApplication BEFORE any user code runs, crashing on
+    # every FGS start attempt. The crash check used to run before the start
+    # attempts, so it always saw 0 crashes — a timing window that can never
+    # close. The fix: unconditionally prefer a data-app install over the
+    # priv-app overlay on every boot. pm install -r retains all granted
+    # permissions and the resulting package still runs in priv_app SELinux
+    # context (updated system app), but the data-app APK path avoids the
+    # Android 16 priv-app resource initialization crash entirely.
     APK_STATE=$(pm path com.audiobridge 2>/dev/null)
-    RECENT_CRASH=$(dumpsys dropbox --print 2>/dev/null | grep -c "Process: com.audiobridge")
 
     if [ -z "$APK_STATE" ]; then
         echo "$(date) com.audiobridge not registered; pm install from MODDIR" >> $LOG
         [ -f "$MODDIR/AudioBridge.apk" ] && \
             pm install -r -g "$MODDIR/AudioBridge.apk" >> $LOG 2>&1
-    elif echo "$APK_STATE" | grep -q "/system/priv-app/" && [ "$RECENT_CRASH" -gt 2 ]; then
-        # priv-app path but crashing — fall back to data-app install.
-        echo "$(date) priv-app path is crashing ($RECENT_CRASH hits); pm install override" >> $LOG
+        sleep 2
+    elif echo "$APK_STATE" | grep -q "/system/priv-app/"; then
+        echo "$(date) com.audiobridge is priv-app — reinstalling as data-app (avoids Android 16 handleBindApplication crash)" >> $LOG
         if [ -f "$MODDIR/AudioBridge.apk" ]; then
             pm install -r -g "$MODDIR/AudioBridge.apk" >> $LOG 2>&1
+            sleep 2
         fi
     else
-        echo "$(date) com.audiobridge present at $APK_STATE" >> $LOG
+        echo "$(date) com.audiobridge present at $APK_STATE (data-app, ok)" >> $LOG
     fi
 
-    # Start the FGS via our headless LauncherActivity. Activities started by
-    # `am start` count as foreground, so startForegroundService() in the
-    # activity's onCreate is exempt from the Android 12+ BG-FGS restriction
-    # (ForegroundServiceStartNotAllowedException / mAllowStartForeground=false)
-    # that makes both `am startservice` and broadcast receivers fail.
-    for i in 1 2 3 4 5; do
-        OUT=$(am start --user 0 -n com.audiobridge/.LauncherActivity 2>&1)
-        echo "$(date) launcher try $i: $OUT" >> $LOG
-        if echo "$OUT" | grep -qE "Starting:|Status: ok"; then
-            echo "$(date) AudioBridgeService launch requested" >> $LOG
-            exit 0
-        fi
-        sleep 3
-    done
-    echo "$(date) WARNING: LauncherActivity never started" >> $LOG
+    # Start the FGS directly. Running as root (uid=0) is explicitly exempt from
+    # Android 12+'s background FGS restriction in ActiveServices.java, so
+    # `am start-foreground-service` bypasses ForegroundServiceStartNotAllowedException
+    # without needing a visible activity. Service must call startForeground() within 5s.
+    FGS_OUT=$(am start-foreground-service --user 0 com.audiobridge/.AudioBridgeService 2>&1)
+    echo "$(date) FGS direct: $FGS_OUT" >> $LOG
+    sleep 4
+    if pidof com.audiobridge >/dev/null 2>&1; then
+        echo "$(date) AudioBridgeService running (pid=$(pidof com.audiobridge))" >> $LOG
+        exit 0
+    fi
+    # Fallback: start via LauncherActivity (translucent theme ensures a window is
+    # created so the activity is considered visible and the FGS call is exempt).
+    echo "$(date) Direct FGS start may have failed — trying LauncherActivity fallback" >> $LOG
+    OUT=$(am start --user 0 -n com.audiobridge/.LauncherActivity 2>&1)
+    echo "$(date) LauncherActivity: $OUT" >> $LOG
+    sleep 4
+    if pidof com.audiobridge >/dev/null 2>&1; then
+        echo "$(date) AudioBridgeService running via LauncherActivity" >> $LOG
+    else
+        echo "$(date) WARNING: AudioBridgeService not running after both attempts" >> $LOG
+    fi
 ) &
