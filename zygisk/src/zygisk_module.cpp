@@ -45,7 +45,7 @@ static constexpr const char* kShadowhookPath =
 static const int SAMPLE_RATE   = 48000;
 static const int FRAME_SAMPLES = 960;       // 20ms @ 48kHz
 static const int FRAME_BYTES   = FRAME_SAMPLES * 2;
-static const int RING_SIZE     = 64;
+static const int RING_SIZE     = 8;   // must match SHM_RING_SIZE in audio_bridge.h
 
 struct AudioFrame {
     int16_t  data[FRAME_SAMPLES];
@@ -431,13 +431,22 @@ static bool install_inline_hooks() {
     if (!sh_hook_sym_name) return false;
 
     static const char* kReadSyms[] = {
-        "_ZN7android11AudioRecord4readEPvmb",  // Android 12+
-        "_ZN7android11AudioRecord4readEPvj",   // legacy
+        "_ZN7android11AudioRecord4readEPvmb",  // Android 12–16 (size_t size)
+        "_ZN7android11AudioRecord4readEPvj",   // legacy (uint32_t size)
         nullptr,
     };
     static const char* kWriteSyms[] = {
-        "_ZN7android10AudioTrack5writeEPKvmb", // Android 12+
-        "_ZN7android10AudioTrack5writeEPKvj",  // legacy
+        "_ZN7android10AudioTrack5writeEPKvmb", // Android 12–16 (size_t size)
+        "_ZN7android10AudioTrack5writeEPKvj",  // legacy (uint32_t size)
+        nullptr,
+    };
+    // getSampleRate() symbol — same across Android 12–16; resolved via symtab walk.
+    static const char* kARSampleRateSyms[] = {
+        "_ZNK7android11AudioRecord13getSampleRateEv",
+        nullptr,
+    };
+    static const char* kATSampleRateSyms[] = {
+        "_ZNK7android10AudioTrack13getSampleRateEv",
         nullptr,
     };
 
@@ -449,11 +458,16 @@ static bool install_inline_hooks() {
                       (void**)&original_audio_track_write);
 
     // getSampleRate() accessors — plain pointer, no hook.
-    g_ar_get_sample_rate = (AudioRecord_getSampleRate_t)resolve_sym(
-        "libaudioclient.so", "_ZNK7android11AudioRecord13getSampleRateEv");
-    g_at_get_sample_rate = (AudioTrack_getSampleRate_t)resolve_sym(
-        "libaudioclient.so", "_ZNK7android10AudioTrack13getSampleRateEv");
-    LOGI("getSampleRate: AR=%p AT=%p",
+    for (int i = 0; kARSampleRateSyms[i]; ++i) {
+        void* p = resolve_sym("libaudioclient.so", kARSampleRateSyms[i]);
+        if (p) { g_ar_get_sample_rate = (AudioRecord_getSampleRate_t)p; break; }
+    }
+    for (int i = 0; kATSampleRateSyms[i]; ++i) {
+        void* p = resolve_sym("libaudioclient.so", kATSampleRateSyms[i]);
+        if (p) { g_at_get_sample_rate = (AudioTrack_getSampleRate_t)p; break; }
+    }
+    LOGI("hooks: read=%s write=%s getSampleRate: AR=%p AT=%p",
+         r ? "ok" : "FAILED", w ? "ok" : "FAILED",
          (void*)g_ar_get_sample_rate, (void*)g_at_get_sample_rate);
 
     return r || w;

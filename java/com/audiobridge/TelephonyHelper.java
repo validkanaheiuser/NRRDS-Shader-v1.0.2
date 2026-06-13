@@ -80,10 +80,24 @@ public class TelephonyHelper {
         mTelephonyManager = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
         mTelecomManager = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
         mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
-        mSmsManager = SmsManager.getDefault();
+        // getSystemService(SmsManager.class) honours the default subscription on API 28+
+        // and avoids the deprecated SmsManager.getDefault() path (deprecated API 31).
+        mSmsManager = context.getSystemService(SmsManager.class);
+        if (mSmsManager == null) mSmsManager = SmsManager.getDefault();
 
-        registerCallListener();
-        registerSMSReceiver();
+        try {
+            registerCallListener();
+        } catch (SecurityException se) {
+            android.util.Log.e(TAG, "registerCallListener failed (missing READ_PHONE_STATE or READ_PRECISE_PHONE_STATE): " + se.getMessage());
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "registerCallListener unexpected error: " + e.getMessage());
+        }
+
+        try {
+            registerSMSReceiver();
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "registerSMSReceiver failed: " + e.getMessage());
+        }
 
         // Emit an initial IDLE state so the dashboard doesn't sit on stale data.
         emitCallState("IDLE", "unknown", "");
@@ -122,14 +136,32 @@ public class TelephonyHelper {
         }
     }
 
+    @SuppressWarnings("deprecation")
     private void registerCallListener() {
+        if (mTelephonyManager == null) {
+            android.util.Log.w(TAG, "TelephonyManager unavailable — call state monitoring disabled");
+            return;
+        }
+        // READ_PHONE_STATE is required for LISTEN_CALL_STATE; on apps targeting
+        // API 31+ some Android 16 builds also enforce READ_PRECISE_PHONE_STATE.
+        // Check at runtime and log clearly rather than crashing the service.
+        if (mContext.checkSelfPermission(Manifest.permission.READ_PHONE_STATE)
+                != PackageManager.PERMISSION_GRANTED) {
+            android.util.Log.w(TAG, "READ_PHONE_STATE not granted — call state monitoring disabled");
+            return;
+        }
+        // PhoneStateListener is deprecated since API 31 but still functional through
+        // Android 16 — it provides the incoming ringing number which TelephonyCallback
+        // dropped for privacy. Since we run as a privileged app with READ_PHONE_STATE
+        // and READ_PRECISE_PHONE_STATE, LISTEN_CALL_STATE works correctly.
         PhoneStateListener listener = new PhoneStateListener() {
             @Override
             public void onCallStateChanged(int state, String incomingNumber) {
-                handleCallStateChange(state, incomingNumber);
+                handleCallStateChange(state, incomingNumber != null ? incomingNumber : "");
             }
         };
         mTelephonyManager.listen(listener, PhoneStateListener.LISTEN_CALL_STATE);
+        android.util.Log.i(TAG, "PhoneStateListener registered for CALL_STATE");
     }
 
     private void handleCallStateChange(int state, String number) {
@@ -185,7 +217,13 @@ public class TelephonyHelper {
     private void registerSMSReceiver() {
         IntentFilter filter = new IntentFilter();
         filter.addAction(Telephony.Sms.Intents.SMS_RECEIVED_ACTION);
-        mContext.registerReceiver(new SMSBroadcastReceiver(), filter);
+        // API 33+ requires explicit RECEIVER_EXPORTED flag for system-broadcast receivers;
+        // omitting it throws IllegalArgumentException on Android 13+.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            mContext.registerReceiver(new SMSBroadcastReceiver(), filter, Context.RECEIVER_EXPORTED);
+        } else {
+            mContext.registerReceiver(new SMSBroadcastReceiver(), filter);
+        }
     }
 
     // Public API - Call Control
@@ -484,9 +522,19 @@ public class TelephonyHelper {
                 Bundle bundle = intent.getExtras();
                 if (bundle != null) {
                     Object[] pdus = (Object[]) bundle.get("pdus");
+                    // "format" distinguishes "3gpp" (GSM) from "3gpp2" (CDMA).
+                    // The single-arg createFromPdu() was deprecated in API 23.
+                    String format = bundle.getString("format");
                     if (pdus != null) {
                         for (Object pdu : pdus) {
-                            SmsMessage sms = SmsMessage.createFromPdu((byte[]) pdu);
+                            SmsMessage sms;
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && format != null) {
+                                sms = SmsMessage.createFromPdu((byte[]) pdu, format);
+                            } else {
+                                //noinspection deprecation
+                                sms = SmsMessage.createFromPdu((byte[]) pdu);
+                            }
+                            if (sms == null) continue;
                             String sender = sms.getDisplayOriginatingAddress();
                             String message = sms.getDisplayMessageBody();
                             long timestamp = sms.getTimestampMillis();

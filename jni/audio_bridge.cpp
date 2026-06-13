@@ -48,6 +48,7 @@
 #include <sstream>
 #include <iomanip>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 
 #ifndef memfd_create
 static inline int memfd_create(const char *name, unsigned int flags) {
@@ -685,9 +686,11 @@ Java_com_audiobridge_TelephonyHelper_nativeOnCallStateChanged(
     status.object_value["type"] = SimpleJson("call_status");
     status.object_value["state"] = SimpleJson((double)state);
     status.object_value["state_name"] = SimpleJson(
-        state == CALL_IDLE ? "IDLE" :
+        state == CALL_IDLE    ? "IDLE" :
         state == CALL_RINGING ? "RINGING" :
-        state == CALL_OFFHOOK ? "OFFHOOK" : "UNKNOWN");
+        state == CALL_OFFHOOK ? "OFFHOOK" :
+        state == CALL_DIALING ? "DIALING" :
+        state == CALL_HOLDING ? "HOLDING" : "UNKNOWN");
     status.object_value["number"] = SimpleJson(num);
     status.object_value["timestamp"] = SimpleJson((double)time(nullptr));
     
@@ -839,8 +842,13 @@ static void status_sender_thread(mbedtls_net_context* net) {
         }
         
         if(has_status && g_connected) {
-            if(send_frame(net, T_CALL_STATUS, json_str.c_str(), json_str.length())) {
-                LOGD("Status sent: %s", json_str.substr(0, 100).c_str());
+            // Route SMS events to T_SMS; everything else (call state, errors) to T_CALL_STATUS.
+            uint8_t frame_type = T_CALL_STATUS;
+            if (json_str.find("\"event\":\"sms") != std::string::npos) {
+                frame_type = T_SMS;
+            }
+            if(send_frame(net, frame_type, json_str.c_str(), json_str.length())) {
+                LOGD("Status sent (type=0x%02x): %s", frame_type, json_str.substr(0, 100).c_str());
             } else {
                 LOGE("Failed to send status, re-queueing");
                 std::lock_guard<std::mutex> lk(g_status_mutex);
@@ -854,20 +862,31 @@ static void status_sender_thread(mbedtls_net_context* net) {
 }
 
 static void capture_speaker_thread(mbedtls_net_context* net) {
+    // Real-time scheduling reduces encode jitter and sender starvation.
+    struct sched_param sp{};
+    sp.sched_priority = 2;
+    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0) {
+        setpriority(PRIO_PROCESS, 0, -10);  // fallback: nice -10
+    }
+
     auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-    
+
     int err;
-    OpusEncoder* enc = opus_encoder_create(SAMPLE_RATE, CHANNELS, 
-                                           OPUS_APPLICATION_AUDIO, &err);
+    // VOIP mode: lower algorithmic delay, speech-optimised DTX, better
+    // comfort-noise generation than AUDIO mode. Complexity 5 halves CPU
+    // use vs 10 with negligible quality difference for voice.
+    OpusEncoder* enc = opus_encoder_create(SAMPLE_RATE, CHANNELS,
+                                           OPUS_APPLICATION_VOIP, &err);
     if(!enc) {
         LOGE("Failed to create Opus encoder: %d", err);
         return;
     }
-    
+
     opus_encoder_ctl(enc, OPUS_SET_BITRATE(64000));
     opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(10));
-    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(10));
+    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(5));
+    opus_encoder_ctl(enc, OPUS_SET_DTX(1));
     
     std::vector<uint8_t> pkt(MAX_PKT);
     uint64_t frames_sent = 0;
@@ -905,8 +924,14 @@ static void capture_speaker_thread(mbedtls_net_context* net) {
 }
 
 static void receive_virtual_mic_thread(mbedtls_net_context* net) {
+    struct sched_param sp{};
+    sp.sched_priority = 2;
+    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0) {
+        setpriority(PRIO_PROCESS, 0, -10);
+    }
+
     auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-    
+
     int err;
     OpusDecoder* dec = opus_decoder_create(SAMPLE_RATE, CHANNELS, &err);
     if(!dec) {
@@ -1038,14 +1063,22 @@ static void read_java_client(int fd) {
         close(fd);
         return;
     }
-    
+
     char line[4096];
     while(g_running && fgets(line, sizeof(line), f)) {
-        SimpleJson json = SimpleJson::parse(line);
-        if (json.type == SimpleJson::OBJECT) {
-            std::lock_guard<std::mutex> lock(g_status_mutex);
-            g_status_queue.push(json.toString());
+        // Strip trailing CR/LF.
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
+
+        // Forward the raw JSON directly — re-serialising through SimpleJson would
+        // lose all fields except "command"/"number"/"message" (parser limitation).
+        {
+            std::lock_guard<std::mutex> lk(g_status_mutex);
+            g_status_queue.push(std::string(line, len));
+            g_status_pending = true;
         }
+        g_status_cv.notify_one();
     }
     
     LOGI("Java IPC Client disconnected");

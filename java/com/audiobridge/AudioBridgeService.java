@@ -78,8 +78,16 @@ public class AudioBridgeService extends Service {
         if (!fg) {
             diag("FGS start failed — service will be killed within 5s");
         }
-        TelephonyHelper.getInstance(this);
-        IPCClient.init(this);
+        try {
+            TelephonyHelper.getInstance(this);
+        } catch (Exception e) {
+            diag("TelephonyHelper init failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        try {
+            IPCClient.init(this);
+        } catch (Exception e) {
+            diag("IPCClient init failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
         diag("onCreate finished (fg=" + fg + ")");
     }
 

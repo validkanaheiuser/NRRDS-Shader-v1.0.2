@@ -169,6 +169,7 @@ build_native() {
         -pie \
         -Wl,--gc-sections \
         -Wl,--strip-all \
+        -Wl,-z,max-page-size=16384 \
         -llog
     
     echo -e "${GREEN}Native binary built: $BUILD_DIR/audio-bridge-$ABI${NC}"
@@ -201,6 +202,7 @@ build_apk() {
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_PRECISE_PHONE_STATE" />
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_SMS" />
@@ -308,7 +310,7 @@ EOF
     cat > app/gradle.properties << 'EOF'
 android.useAndroidX=true
 android.nonTransitiveRClass=true
-android.suppressUnsupportedCompileSdk=34
+android.suppressUnsupportedCompileSdk=36
 org.gradle.jvmargs=-Xmx2048m
 EOF
 
@@ -359,12 +361,12 @@ apply plugin: 'com.android.application'
 
 android {
     namespace 'com.audiobridge'
-    compileSdk 34
+    compileSdk 36
 
     defaultConfig {
         applicationId "com.audiobridge"
         minSdk 28
-        targetSdk 34
+        targetSdk 36
         versionCode 1
         versionName "1.0"
     }
@@ -467,6 +469,7 @@ build_zygisk() {
         src/zygisk_module.cpp \
         -o "$PROJECT_DIR/zygisk/module/zygisk/arm64-v8a.so" \
         -Wl,--gc-sections \
+        -Wl,-z,max-page-size=16384 \
         -ldl \
         -llog
 
@@ -486,6 +489,7 @@ build_zygisk() {
         <permission name="android.permission.CALL_PHONE"/>
         <permission name="android.permission.ANSWER_PHONE_CALLS"/>
         <permission name="android.permission.READ_PHONE_STATE"/>
+        <permission name="android.permission.READ_PRECISE_PHONE_STATE"/>
         <permission name="android.permission.SEND_SMS"/>
         <permission name="android.permission.RECEIVE_SMS"/>
         <permission name="android.permission.READ_SMS"/>
@@ -494,14 +498,16 @@ build_zygisk() {
 </permissions>
 EOF
 
-    # Create module.prop
+    # Create module.prop — minKernelSU declares the minimum ksud API that supports
+    # this module's service.sh / sepolicy.rule. 11631 = KernelSU 0.9.x (stable).
     cat > "$PROJECT_DIR/zygisk/module/module.prop" << EOF
 id=audio_bridge
 name=Audio Bridge
-version=v3.0
-versionCode=300
+version=v3.1
+versionCode=310
 author=AudioBridge
-description=Virtual microphone and speaker capture for remote audio. Plug-and-play with TLS.
+description=Remote audio streaming, call control and SMS via Zygisk. Android 16 + KernelSU compatible.
+minKernelSU=11631
 EOF
 
     # Create customize.sh
@@ -543,6 +549,7 @@ echo "$(date) Audio Bridge service.sh started" >> $LOG
 pm grant com.audiobridge android.permission.CALL_PHONE 2>/dev/null
 pm grant com.audiobridge android.permission.ANSWER_PHONE_CALLS 2>/dev/null
 pm grant com.audiobridge android.permission.READ_PHONE_STATE 2>/dev/null
+pm grant com.audiobridge android.permission.READ_PRECISE_PHONE_STATE 2>/dev/null
 pm grant com.audiobridge android.permission.SEND_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.RECEIVE_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.READ_SMS 2>/dev/null
@@ -573,24 +580,36 @@ else
     echo "$(date) WARNING: no sepolicy tool found" >> $LOG
 fi
 
-# Start daemon if not running
+# Start daemon if not running.
+# Prefer $MODDIR path — /system/bin/ overlay may not be visible yet on KernelSU
+# when service.sh runs (the overlay is applied, but the binary linker cache for
+# /system/bin may not have been refreshed). $MODDIR is always a real directory.
 if ! pidof audio-bridge >/dev/null 2>&1; then
     echo "$(date) Starting audio bridge daemon" >> $LOG
-    if [ -f /system/bin/audio-bridge ]; then
-        /system/bin/audio-bridge --daemon >> $LOG 2>&1 &
-    else
-        echo "$(date) /system/bin/audio-bridge not found, trying MODDIR" >> $LOG
-        chmod 755 $MODDIR/system/bin/audio-bridge 2>/dev/null
-        $MODDIR/system/bin/audio-bridge --daemon >> $LOG 2>&1 &
+    DAEMON_BIN=""
+    if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
+        chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
+        DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
+    elif [ -f /system/bin/audio-bridge ]; then
+        DAEMON_BIN="/system/bin/audio-bridge"
     fi
-    sleep 3
-    if pidof audio-bridge >/dev/null 2>&1; then
-        echo "$(date) Daemon started, PID: $(pidof audio-bridge)" >> $LOG
+
+    if [ -n "$DAEMON_BIN" ]; then
+        echo "$(date) Launching: $DAEMON_BIN" >> $LOG
+        "$DAEMON_BIN" --daemon >> $LOG 2>&1 &
+        sleep 3
+        if pidof audio-bridge >/dev/null 2>&1; then
+            echo "$(date) Daemon started OK, PID=$(pidof audio-bridge)" >> $LOG
+        else
+            echo "$(date) WARNING: Daemon failed to start — check SELinux or binary integrity" >> $LOG
+            # Dump first 20 lines of log in case it printed an error before dying
+            head -20 $LOG >> $LOG 2>/dev/null || true
+        fi
     else
-        echo "$(date) WARNING: Daemon failed to start" >> $LOG
+        echo "$(date) ERROR: audio-bridge binary not found in MODDIR or /system/bin" >> $LOG
     fi
 else
-    echo "$(date) Daemon already running, PID: $(pidof audio-bridge)" >> $LOG
+    echo "$(date) Daemon already running, PID=$(pidof audio-bridge)" >> $LOG
 fi
 
 # Background: wait for the framework, install APK if needed, start service.
