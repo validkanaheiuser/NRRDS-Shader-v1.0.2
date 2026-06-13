@@ -25,13 +25,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // ── Shell exec via KernelSU ───────────────────────────────────────────────
     async function runCmd(cmd) {
-        if (typeof ksu === 'undefined') {
-            return { errno: 1, stdout: '', stderr: 'KernelSU WebUI not available' };
+        if (typeof ksu === 'undefined' || typeof ksu.exec !== 'function') {
+            return { errno: 1, stdout: '', stderr: 'ksu unavailable' };
         }
         try {
-            return await ksu.exec(cmd);
+            const r = await ksu.exec(cmd);
+            // Guard null/undefined return (can happen on some KSU builds)
+            if (!r) return { errno: 1, stdout: '', stderr: 'ksu.exec returned null' };
+            // Old KernelSU used 'output' instead of 'stdout'
+            return {
+                errno:  r.errno  !== undefined ? r.errno  : 1,
+                stdout: r.stdout !== undefined ? r.stdout : (r.output || ''),
+                stderr: r.stderr !== undefined ? r.stderr : ''
+            };
         } catch (e) {
-            return { errno: 1, stdout: '', stderr: e.message };
+            return { errno: 1, stdout: '', stderr: String(e.message || e) };
         }
     }
 
@@ -70,30 +78,28 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // ── Daemon status ─────────────────────────────────────────────────────────
     async function checkStatus() {
-        // PID file + /proc check: no PATH dependency, no &&-chain in loops,
-        // short enough for ksu.exec() limits. Uses if/then/else for portability.
-        const res = await runCmd(
-            'p=$(cat /data/local/tmp/audio_bridge.pid 2>/dev/null | tr -d "\\n\\r "); ' +
-            'if [ -n "$p" ] && [ -d "/proc/$p" ]; then ' +
-            '  c=$(grep -aE "Connected to server!|Disconnected,|reconnecting|No server configured" ' +
-            '    /data/local/tmp/audio_bridge.log 2>/dev/null | tail -1); ' +
-            '  printf "OK::%s::%s" "$p" "$c"; ' +
-            'else ' +
-            '  printf "DEAD"; ' +
-            'fi'
-        );
+        // Step 1: read PID file (tiny command — avoids shell complexity limits)
+        const pidRes = await runCmd('cat /data/local/tmp/audio_bridge.pid 2>/dev/null');
+        const pid    = (pidRes.stdout || '').replace(/\s/g, '');
 
-        const out   = (res.stdout || '').trim();
-        const running = out.startsWith('OK::');
-        const segs  = running ? out.slice(4).split('::') : [];
-        const pid   = running ? (segs[0] || '') : '';
-        const conn  = running ? (segs[1] || '') : '';
+        // Step 2: check /proc/<pid> in a separate call
+        let running = false;
+        if (pid) {
+            const procRes = await runCmd('[ -d /proc/' + pid + ' ] && echo Y || echo N');
+            running = (procRes.stdout || '').trim().charAt(0) === 'Y';
+        }
 
         if (running) {
             daemonBadge.textContent = 'Running';
             daemonBadge.className   = 'badge running';
             daemonPid.textContent   = pid;
 
+            // Step 3: last connection-status line from daemon log
+            const logRes = await runCmd(
+                'grep -aE "Connected to server!|Disconnected,|No server configured" ' +
+                '/data/local/tmp/audio_bridge.log 2>/dev/null | tail -1'
+            );
+            const conn = (logRes.stdout || '').trim();
             if (conn.includes('Connected to server!')) {
                 daemonConnection.textContent = 'Connected';
                 daemonConnection.className   = 'conn-badge connected';
@@ -112,10 +118,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             daemonConnection.className   = 'conn-badge';
         }
 
-        // Zygisk hook status: look for the module's SHM-connected log in logcat
+        // Zygisk hook status
         const zyRes = await runCmd(
-            'logcat -b main -d -t 50 -s AudioBridge-Zygisk 2>/dev/null | ' +
-            'grep -c "Connected to daemon"'
+            'logcat -b main -d -t 50 -s AudioBridge-Zygisk 2>/dev/null | grep -c "Connected to daemon"'
         );
         const zyCount = parseInt(zyRes.stdout || '0', 10);
         if (zygiskStatus) {
@@ -123,11 +128,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 zygiskStatus.textContent = `Active (${zyCount} proc)`;
                 zygiskStatus.style.color = 'var(--success)';
             } else {
-                // Check if the .so exists at least
                 const soRes = await runCmd(
-                    `[ -f ${MODDIR}/zygisk/arm64-v8a.so ] && echo yes || echo no`
+                    '[ -f ' + MODDIR + '/zygisk/arm64-v8a.so ] && echo yes || echo no'
                 );
-                const soExists = soRes.stdout.includes('yes');
+                const soExists = (soRes.stdout || '').includes('yes');
                 zygiskStatus.textContent = soExists ? 'Not loaded (enable Zygisk in KSU)' : 'Missing .so — rebuild module';
                 zygiskStatus.style.color = 'var(--danger)';
             }
@@ -136,6 +140,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // ── Log fetch ─────────────────────────────────────────────────────────────
     async function fetchLogs() {
+        // ksu diagnostic line — shows whether ksu.exec works and as what user
+        const diagRes = await runCmd('echo ksu_ok && id');
+        const ksuOk   = (diagRes.stdout || '').includes('ksu_ok');
+        const diagLine = ksuOk
+            ? '── ksu-exec: ok (' + (diagRes.stdout || '').split('\n').slice(1,2).join('').trim() + ') ──\n'
+            : '── ksu-exec: FAILED — ' + (diagRes.stderr || diagRes.stdout || 'no output') + ' ──\n';
+
         const res = await runCmd(
             `{ echo '── daemon ──'; tail -n 40 ${LOGFILE} 2>/dev/null; ` +
             `echo '── service ──'; tail -n 15 /data/local/tmp/audio_bridge_service.log 2>/dev/null; ` +
@@ -143,7 +154,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             `echo '── zygisk ──'; logcat -b main -d -t 30 -s AudioBridge-Zygisk 2>/dev/null; ` +
             `echo '── java-logcat ──'; logcat -b main -d -t 50 -s AudioBridge-Service AudioBridge-Boot 2>/dev/null; } 2>/dev/null`
         );
-        logOutput.textContent = res.stdout || 'No logs available yet.';
+        logOutput.textContent = diagLine + (res.stdout || 'No logs available yet.');
         const terminal = document.querySelector('.terminal');
         if (terminal) terminal.scrollTop = terminal.scrollHeight;
     }
