@@ -146,3 +146,26 @@ fi
         echo "$(date) WARNING: AudioBridgeService not running after both attempts" >> $LOG
     fi
 ) &
+
+# Background: keep webroot status files fresh so the WebUI can read them
+# via fetch() without needing ksu.exec(). Runs every 15 s indefinitely.
+(
+    WROOT="$MODDIR/webroot"
+    while true; do
+        P=$(cat /data/local/tmp/audio_bridge.pid 2>/dev/null | tr -d ' \t\n\r')
+        if [ -n "$P" ] && [ -d "/proc/$P" ]; then
+            C=$(grep -aE "Connected to server!|Disconnected,|No server configured" \
+                /data/local/tmp/audio_bridge.log 2>/dev/null | tail -1 | sed "s/\"/'/g")
+            printf '{"running":true,"pid":"%s","conn":"%s"}\n' "$P" "$C" \
+                > "$WROOT/status.json" 2>/dev/null
+        else
+            printf '{"running":false,"pid":"","conn":""}\n' \
+                > "$WROOT/status.json" 2>/dev/null
+        fi
+        tail -n 60 /data/local/tmp/audio_bridge.log \
+            > "$WROOT/daemon.log" 2>/dev/null
+        tail -n 25 /data/local/tmp/audio_bridge_service.log \
+            > "$WROOT/service.log" 2>/dev/null
+        sleep 15
+    done
+) &
