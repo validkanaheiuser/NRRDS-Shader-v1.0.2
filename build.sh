@@ -219,8 +219,7 @@ build_apk() {
         android:allowBackup="false"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
-        android:networkSecurityConfig="@xml/network_security_config"
-        android:localeConfig="@xml/locales_config">
+        android:networkSecurityConfig="@xml/network_security_config">
 
         <activity
             android:name=".LauncherActivity"
@@ -609,7 +608,32 @@ if ! pidof audio-bridge >/dev/null 2>&1; then
         echo "$(date) ERROR: audio-bridge binary not found in MODDIR or /system/bin" >> $LOG
     fi
 else
-    echo "$(date) Daemon already running, PID=$(pidof audio-bridge)" >> $LOG
+    # At reboot the old daemon may be in the middle of dying from SIGTERM;
+    # pidof still sees it for a second or two. Wait up to 5s for it to exit
+    # before concluding it's truly healthy — if it dies, fall through and
+    # restart it; if it's still alive after 5s it really is running fine.
+    STALE=0
+    for _w in 1 2 3 4 5; do
+        sleep 1
+        if ! pidof audio-bridge >/dev/null 2>&1; then
+            STALE=1
+            break
+        fi
+    done
+    if [ "$STALE" = "1" ]; then
+        echo "$(date) Stale daemon PID was dying; restarting" >> $LOG
+        if [ -n "$DAEMON_BIN" ]; then
+            $DAEMON_BIN >> $LOG 2>&1 &
+            sleep 1
+            if pidof audio-bridge >/dev/null 2>&1; then
+                echo "$(date) Daemon restarted, PID=$(pidof audio-bridge)" >> $LOG
+            else
+                echo "$(date) WARNING: Daemon failed to restart after stale PID" >> $LOG
+            fi
+        fi
+    else
+        echo "$(date) Daemon already running, PID=$(pidof audio-bridge)" >> $LOG
+    fi
 fi
 
 # Background: wait for the framework, install APK if needed, start service.
@@ -624,8 +648,10 @@ fi
     # Detect the broken priv-app-overlay scenario (Resources null-deref
     # during handleBindApplication on some ROMs) and force pm install when
     # the priv-app copy is confirmed crashing.
+    # Use logcat -b crash (resets each boot) instead of dumpsys dropbox
+    # (accumulates all-time history and causes false positives on re-flash).
     APK_STATE=$(pm path com.audiobridge 2>/dev/null)
-    RECENT_CRASH=$(dumpsys dropbox --print 2>/dev/null | grep -c "Process: com.audiobridge")
+    RECENT_CRASH=$(logcat -b crash -d 2>/dev/null | grep -c "Process: com.audiobridge")
 
     if [ -z "$APK_STATE" ]; then
         echo "$(date) com.audiobridge not registered; pm install from MODDIR" >> $LOG
