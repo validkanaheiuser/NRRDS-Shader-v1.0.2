@@ -126,6 +126,18 @@ static std::mutex              g_call_mutex;
 static std::string             g_current_number;
 static std::map<std::string, std::string> g_active_calls;
 
+// PCM audio from the Java APK's AudioRecord(VOICE_CALL) — bypasses the SHM
+// path so that cellular call audio flows even when Zygisk hooks are not called.
+// Samples are S16LE, 8 kHz, mono.  The capture_speaker_thread drains this
+// alongside the Zygisk SHM speaker ring.
+struct JavaPcmChunk {
+    std::vector<int16_t> samples;
+};
+static std::mutex              g_java_pcm_mutex;
+static std::condition_variable g_java_pcm_cv;
+static std::queue<JavaPcmChunk> g_java_pcm_queue;
+static std::atomic<bool>       g_java_pcm_pending{false};
+
 // ──────────────────────────────────────────────────────────────────────────
 // JSON Helper (Minimal implementation without external lib)
 // ──────────────────────────────────────────────────────────────────────────
@@ -966,38 +978,79 @@ static void capture_speaker_thread(mbedtls_net_context* net) {
     opus_encoder_ctl(enc, OPUS_SET_DTX(1));
     
     std::vector<uint8_t> pkt(MAX_PKT);
-    uint64_t frames_sent = 0;
-    
+    uint64_t frames_sent   = 0;
+    uint64_t java_frames   = 0;
+
+    // Leftover PCM from java chunks that didn't fill a full FRAME_SAMPLES buffer.
+    std::vector<int16_t> pcm_leftover;
+    pcm_leftover.reserve(FRAME_SAMPLES * 2);
+
     while(g_running && g_connected) {
-        uint32_t write_idx = layout->speaker_write_idx.load(std::memory_order_acquire);
-        uint32_t read_idx = layout->speaker_read_idx.load(std::memory_order_acquire);
-        
-        if(write_idx == read_idx) {
-            usleep(5000);
-            continue;
-        }
-        
-        AudioFrame& frame = layout->speaker_frames[read_idx % SHM_RING_SIZE];
-        
-        opus_int32 len = opus_encode(enc, frame.data, FRAME_SAMPLES, 
-                                     pkt.data(), MAX_PKT);
-        if(len > 0) {
-            if(!send_frame(net, T_SPEAKER, pkt.data(), (uint32_t)len)) {
-                break;
+        bool did_work = false;
+
+        // ── Path A: Zygisk SHM ring (hooked AudioTrack.write inside app procs) ──
+        {
+            uint32_t write_idx = layout->speaker_write_idx.load(std::memory_order_acquire);
+            uint32_t read_idx  = layout->speaker_read_idx.load(std::memory_order_acquire);
+            if (write_idx != read_idx) {
+                AudioFrame& frame = layout->speaker_frames[read_idx % SHM_RING_SIZE];
+                opus_int32 len = opus_encode(enc, frame.data, FRAME_SAMPLES,
+                                             pkt.data(), MAX_PKT);
+                if (len > 0) {
+                    if (!send_frame(net, T_SPEAKER, pkt.data(), (uint32_t)len)) break;
+                    frames_sent++;
+                }
+                layout->speaker_read_idx.store((read_idx + 1) % (SHM_RING_SIZE * 2),
+                                               std::memory_order_release);
+                did_work = true;
             }
-            frames_sent++;
         }
-        
-        layout->speaker_read_idx.store((read_idx + 1) % (SHM_RING_SIZE * 2), 
-                                       std::memory_order_release);
-        
-        if(frames_sent % 50 == 0) {
-            LOGD("Speaker: %llu frames sent", (unsigned long long)frames_sent);
+
+        // ── Path B: Java APK AudioRecord(VOICE_CALL) binary stream ──
+        {
+            JavaPcmChunk chunk;
+            bool has_chunk = false;
+            {
+                std::lock_guard<std::mutex> lk(g_java_pcm_mutex);
+                if (!g_java_pcm_queue.empty()) {
+                    chunk     = std::move(g_java_pcm_queue.front());
+                    g_java_pcm_queue.pop();
+                    g_java_pcm_pending = !g_java_pcm_queue.empty();
+                    has_chunk = true;
+                }
+            }
+            if (has_chunk) {
+                // Append to leftover buffer.
+                pcm_leftover.insert(pcm_leftover.end(),
+                                    chunk.samples.begin(), chunk.samples.end());
+                // Drain complete FRAME_SAMPLES frames.
+                while ((int)pcm_leftover.size() >= FRAME_SAMPLES) {
+                    opus_int32 len = opus_encode(enc, pcm_leftover.data(),
+                                                 FRAME_SAMPLES, pkt.data(), MAX_PKT);
+                    if (len > 0) {
+                        if (!send_frame(net, T_SPEAKER, pkt.data(), (uint32_t)len)) goto speaker_exit;
+                        frames_sent++;
+                        java_frames++;
+                    }
+                    pcm_leftover.erase(pcm_leftover.begin(),
+                                       pcm_leftover.begin() + FRAME_SAMPLES);
+                }
+                did_work = true;
+            }
+        }
+
+        if (!did_work) usleep(5000);
+
+        if (frames_sent % 50 == 0 && frames_sent > 0) {
+            LOGD("Speaker: %llu frames sent (%llu from Java audio)",
+                 (unsigned long long)frames_sent, (unsigned long long)java_frames);
         }
     }
-    
+
+speaker_exit:
     opus_encoder_destroy(enc);
-    LOGI("Speaker capture exited (frames sent: %llu)", (unsigned long long)frames_sent);
+    LOGI("Speaker capture exited (total=%llu java=%llu)",
+         (unsigned long long)frames_sent, (unsigned long long)java_frames);
 }
 
 static void receive_virtual_mic_thread(mbedtls_net_context* net) {
@@ -1179,6 +1232,145 @@ static void read_java_client(int fd) {
     fclose(f);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Java binary audio stream reader
+// Protocol: repeated [4B BE length][S16LE PCM bytes, 8 kHz mono]
+// Queues decoded PCM into g_java_pcm_queue for capture_speaker_thread.
+// ──────────────────────────────────────────────────────────────────────────
+static void read_java_audio_stream(int fd) {
+    LOGI("Java audio stream connected (fd=%d)", fd);
+
+    // Real-time scheduling so PCM frames arrive promptly.
+    struct sched_param sp{};
+    sp.sched_priority = 2;
+    pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+
+    while (g_running) {
+        // Read 4-byte big-endian length header.
+        uint8_t hdr[4];
+        ssize_t got = 0;
+        while (got < 4) {
+            ssize_t r = recv(fd, hdr + got, 4 - got, 0);
+            if (r <= 0) goto done;
+            got += r;
+        }
+        uint32_t byte_len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                            ((uint32_t)hdr[2] <<  8) | (uint32_t)hdr[3];
+
+        if (byte_len == 0 || byte_len > 8192) {
+            LOGW("Audio stream: bad frame length %u", byte_len);
+            goto done;
+        }
+
+        // Read PCM payload.
+        std::vector<uint8_t> raw(byte_len);
+        got = 0;
+        while ((uint32_t)got < byte_len) {
+            ssize_t r = recv(fd, raw.data() + got, byte_len - got, 0);
+            if (r <= 0) goto done;
+            got += r;
+        }
+
+        {
+            // Convert bytes → int16 samples and enqueue.
+            size_t n_samples = byte_len / 2;
+            JavaPcmChunk chunk;
+            chunk.samples.resize(n_samples);
+            memcpy(chunk.samples.data(), raw.data(), byte_len);
+
+            std::lock_guard<std::mutex> lk(g_java_pcm_mutex);
+            // Keep queue bounded to ~200ms of audio to avoid runaway lag.
+            if (g_java_pcm_queue.size() < 10) {
+                g_java_pcm_queue.push(std::move(chunk));
+                g_java_pcm_pending = true;
+                g_java_pcm_cv.notify_one();
+            }
+        }
+    }
+done:
+    close(fd);
+    LOGI("Java audio stream disconnected");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// tinyalsa voice call mic injection
+// Scans /proc/asound/pcm for the voice call PCM device (Qualcomm VoiceMMode /
+// Voice Call), then writes virtual-mic samples from the SHM ring into the
+// ALSA uplink so the remote party hears server-injected audio.
+// This is best-effort: on Android 16 the HAL owns the device exclusively and
+// pcm_open() may return EBUSY — the thread logs the failure and exits cleanly.
+// ──────────────────────────────────────────────────────────────────────────
+static int find_voice_pcm_dev(int card) {
+    FILE* f = fopen("/proc/asound/pcm", "r");
+    if (!f) return -1;
+    char line[256];
+    int result = -1;
+    while (fgets(line, sizeof(line), f) && result < 0) {
+        if (strstr(line, "Voice") || strstr(line, "voice") ||
+            strstr(line, "Incall") || strstr(line, "incall")) {
+            int c = -1, d = -1;
+            if (sscanf(line, "%d-%d:", &c, &d) == 2 && c == card) {
+                LOGI("tinyalsa: found voice PCM card=%d dev=%d (%s)", c, d, line);
+                result = d;
+            }
+        }
+    }
+    fclose(f);
+    return result;
+}
+
+static void tinyalsa_mic_inject_thread() {
+    int voice_dev = find_voice_pcm_dev(0);
+    if (voice_dev < 0) {
+        LOGW("tinyalsa mic inject: no voice call PCM found in /proc/asound/pcm");
+        return;
+    }
+
+    struct pcm_config cfg = {};
+    cfg.channels    = 1;
+    cfg.rate        = (unsigned)SAMPLE_RATE;
+    cfg.period_size = (unsigned)FRAME_SAMPLES;
+    cfg.period_count = 4;
+    cfg.format      = PCM_FORMAT_S16_LE;
+
+    struct pcm* pcm_out = pcm_open(0, (unsigned)voice_dev, PCM_OUT, &cfg);
+    if (!pcm_out || !pcm_is_ready(pcm_out)) {
+        LOGW("tinyalsa mic inject: pcm_open(card=0 dev=%d PCM_OUT) failed: %s",
+             voice_dev, pcm_out ? pcm_get_error(pcm_out) : "null");
+        if (pcm_out) pcm_close(pcm_out);
+        return;
+    }
+    LOGI("tinyalsa mic inject: PCM open ok (card=0 dev=%d)", voice_dev);
+
+    auto* layout = (SharedMemoryLayout*)g_shm_ptr;
+    int16_t silence[FRAME_SAMPLES] = {};
+    uint64_t frames_written = 0;
+
+    while (g_running && g_connected) {
+        uint32_t write_idx = layout->write_index.load(std::memory_order_acquire);
+        uint32_t read_idx  = layout->read_index.load(std::memory_order_acquire);
+
+        const int16_t* src;
+        if (write_idx != read_idx) {
+            src = layout->mic_frames[read_idx % SHM_RING_SIZE].data;
+            layout->read_index.store((read_idx + 1) % (SHM_RING_SIZE * 2),
+                                     std::memory_order_release);
+        } else {
+            // No data yet — write silence to keep the stream alive.
+            src = silence;
+        }
+
+        if (pcm_write(pcm_out, src, FRAME_SAMPLES * 2) != 0) {
+            LOGW("tinyalsa mic inject: pcm_write failed: %s", pcm_get_error(pcm_out));
+            break;
+        }
+        frames_written++;
+    }
+
+    pcm_close(pcm_out);
+    LOGI("tinyalsa mic inject exited (frames=%llu)", (unsigned long long)frames_written);
+}
+
 static void unix_socket_server_thread() {
     unlink(g_socket_path);
     
@@ -1255,6 +1447,10 @@ static void unix_socket_server_thread() {
             } else if(strncmp(cmd, "HELO_JAVA", 9) == 0) {
                 std::thread java_client_thread(read_java_client, client_fd);
                 java_client_thread.detach();
+                // Do NOT close client_fd here
+            } else if(strncmp(cmd, "HELO_AUDIO", 10) == 0) {
+                std::thread audio_thread(read_java_audio_stream, client_fd);
+                audio_thread.detach();
                 // Do NOT close client_fd here
             } else {
                 close(client_fd);
@@ -1449,6 +1645,8 @@ int main(int argc, char** argv) {
         std::thread status_thread(status_sender_thread, &g_net);
         std::thread speaker_thread(capture_speaker_thread, &g_net);
         std::thread mic_thread(receive_virtual_mic_thread, &g_net);
+        // Try tinyalsa mic injection in parallel (no-op if HAL owns the device).
+        std::thread tinyalsa_thread(tinyalsa_mic_inject_thread);
         
         // Connection watchdog: periodically send ping to detect dead connections
         while(g_running && g_connected) {
@@ -1467,6 +1665,7 @@ int main(int argc, char** argv) {
         status_thread.join();
         speaker_thread.join();
         mic_thread.join();
+        tinyalsa_thread.join();
         
         tcp_cleanup();
         g_connected = false;

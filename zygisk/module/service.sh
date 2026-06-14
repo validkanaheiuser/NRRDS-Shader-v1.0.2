@@ -13,6 +13,11 @@ pm grant com.audiobridge android.permission.SEND_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.RECEIVE_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.READ_SMS 2>/dev/null
 pm grant com.audiobridge android.permission.POST_NOTIFICATIONS 2>/dev/null
+pm grant com.audiobridge android.permission.RECORD_AUDIO 2>/dev/null
+# CAPTURE_AUDIO_OUTPUT is a signature/system permission; pm grant cannot grant it.
+# It is allowlisted in privapp-permissions-audiobridge.xml for priv-app installs.
+# Force appops to ALLOW so system_server doesn't gate on OP_RECORD_AUDIO_OUTPUT.
+appops set com.audiobridge RECORD_AUDIO allow 2>/dev/null
 appops set com.audiobridge SYSTEM_ALERT_WINDOW allow 2>/dev/null
 
 # Apply SELinux rules. sepolicy.rule is read by Magisk/KernelSU on boot; this

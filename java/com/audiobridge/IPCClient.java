@@ -10,12 +10,13 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
-import java.io.File;
 import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
-import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -36,6 +37,11 @@ public class IPCClient {
     private LocalSocket mSocket;
     private PrintWriter mOut;
     private BufferedReader mIn;
+
+    // Dedicated binary socket for streaming PCM audio to the daemon.
+    // Kept separate from mSocket so audio writes never block the JSON IPC path.
+    private LocalSocket     mAudioSocket;
+    private OutputStream    mAudioOut;
 
     private boolean mRunning = false;
     private ExecutorService mExecutor = Executors.newSingleThreadExecutor();
@@ -117,6 +123,7 @@ public class IPCClient {
         mOut.println("HELO_JAVA");
         diag("Connected — HELO_JAVA sent");
         setStatus("Daemon connected · telephony ready");
+        connectAudioStream();
 
         String line;
         while (mRunning && (line = mIn.readLine()) != null) {
@@ -134,6 +141,11 @@ public class IPCClient {
             mOut = null;
             mIn  = null;
             mSocket = null;
+            mAudioOut = null;
+            if (mAudioSocket != null) {
+                try { mAudioSocket.close(); } catch (IOException ignored) {}
+                mAudioSocket = null;
+            }
         }
         try { sock.close(); } catch (IOException ignored) {}
         throw new IOException("Socket closed by remote");
@@ -180,6 +192,69 @@ public class IPCClient {
                 mOut.println(json.toString());
             } else {
                 Log.w(TAG, "sendEvent: IPC not connected, dropped: " + json.toString());
+            }
+        }
+    }
+
+    /**
+     * Open a second abstract socket connection dedicated to binary PCM streaming.
+     * Protocol: [b"HELO_AUDIO\n"] then repeating [4-byte BE length][PCM bytes].
+     */
+    private void connectAudioStream() {
+        new Thread(() -> {
+            try {
+                LocalSocket s = new LocalSocket();
+                s.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+                OutputStream out = s.getOutputStream();
+                out.write("HELO_AUDIO\n".getBytes("UTF-8"));
+                out.flush();
+                synchronized (IPCClient.this) {
+                    mAudioSocket = s;
+                    mAudioOut    = out;
+                }
+                diag("Audio stream connected");
+                // Keep thread alive to maintain the connection until the main socket closes.
+                InputStream in = s.getInputStream();
+                //noinspection ResultOfMethodCallIgnored
+                while (mRunning) {
+                    int r = in.read(new byte[64]);
+                    if (r < 0) break;
+                }
+            } catch (IOException e) {
+                diag("Audio stream connect failed: " + e.getMessage());
+            }
+            synchronized (IPCClient.this) {
+                if (mAudioSocket != null) {
+                    try { mAudioSocket.close(); } catch (IOException ignored) {}
+                    mAudioSocket = null;
+                }
+                mAudioOut = null;
+            }
+        }, "AudioIPC").start();
+    }
+
+    /**
+     * Send a raw PCM chunk to the daemon over the binary audio socket.
+     * Frame format: [4-byte big-endian length][PCM bytes (S16LE, 8 kHz, mono)].
+     * Non-blocking: silently drops the frame if the socket is not yet ready.
+     */
+    public void sendAudio(byte[] buf, int offset, int len) {
+        OutputStream out;
+        synchronized (this) { out = mAudioOut; }
+        if (out == null) return;
+        byte[] hdr = {
+            (byte)(len >> 24), (byte)(len >> 16), (byte)(len >> 8), (byte)len
+        };
+        try {
+            out.write(hdr);
+            out.write(buf, offset, len);
+        } catch (IOException e) {
+            synchronized (this) {
+                mAudioOut = null;
+                if (mAudioSocket != null) {
+                    try { mAudioSocket.close(); } catch (IOException ignored) {}
+                    mAudioSocket = null;
+                }
             }
         }
     }

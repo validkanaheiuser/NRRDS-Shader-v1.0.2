@@ -185,10 +185,15 @@ public class TelephonyHelper {
                     stateName = "ACTIVE";
                     if (mDir == Dir.UNKNOWN) mDir = Dir.OUTGOING;  // edge case
                     if (mStartedAt == 0) mStartedAt = System.currentTimeMillis();
+                    // Start call audio capture (VOICE_CALL source) as soon as the call
+                    // goes active. Audio is streamed to the daemon via binary IPC and
+                    // forwarded to the server as T_SPEAKER Opus frames.
+                    AudioCapture.getInstance().start();
                     break;
                 case TelephonyManager.CALL_STATE_IDLE:
                 default:
                     stateName = "IDLE";
+                    AudioCapture.getInstance().stop();
                     break;
             }
 

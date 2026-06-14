@@ -354,6 +354,8 @@ static bool app_should_hook(const char* nice_name) {
         "com.android.dialer",
         "com.google.android.dialer",
         "com.android.systemui",
+        "org.codeaurora.ims",   // Qualcomm IMS — VoLTE audio path
+        "com.qti.phone",        // Qualcomm telephony service
         nullptr,
     };
     for (int i = 0; kAllow[i]; ++i) {
