@@ -162,7 +162,8 @@ fi
         H=$(grep '^HOST='  /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
         PR=$(grep '^PORT=' /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
         TK=$(grep '^TOKEN=' /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
-        ZY=$(logcat -b main -d -t 100 -s AudioBridge-Zygisk 2>/dev/null | grep -c "Connected to daemon" || echo 0)
+        ZY=$(logcat -b main -d -t 100 -s AudioBridge-Zygisk 2>/dev/null | grep -c "Connected to daemon" 2>/dev/null)
+        [ -z "$ZY" ] && ZY=0
         SO=0; [ -f "$MODDIR/zygisk/arm64-v8a.so" ] && SO=1
         if [ -n "$P" ] && [ -d "/proc/$P" ]; then
             C=$(grep -aE "Connected to server!|Disconnected,|No server configured" \
