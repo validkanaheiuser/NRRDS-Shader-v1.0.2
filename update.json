@@ -1,6 +1,6 @@
 {
-  "version": "v3.1.1",
-  "versionCode": 1,
-  "zipUrl": "https://github.com/validkanaheiuser/audio-bridge-concept/releases/latest/download/audio-bridge-module.zip",
-  "changelog": "https://github.com/validkanaheiuser/audio-bridge-concept/releases/latest"
+  "version": "v3.1.70",
+  "versionCode": 70,
+  "zipUrl": "https://github.com/validkanaheiuser/audio-bridge-concept/releases/download/v3.1.70/audio-bridge-module.zip",
+  "changelog": "https://github.com/validkanaheiuser/audio-bridge-concept/releases/tag/v3.1.70"
 }
