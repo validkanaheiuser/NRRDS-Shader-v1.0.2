@@ -4,6 +4,23 @@ Verified against: SM6150 kernel (android_kernel_xiaomi_sm6150), LineageOS 23.2 (
 Written to be applicable across Qualcomm SoCs and Android versions. Non-Qualcomm SoCs (MediaTek, Exynos)
 have analogous mechanisms — specific control names differ but the methodology is identical.
 
+## Confirmed Device: sm6150idp (card name: sm6150idpsndcar)
+
+From live `adb shell` + `mixer_paths_idp.xml` analysis:
+
+| Function | Mixer Control | PCM Device |
+|----------|--------------|------------|
+| Capture downlink (far end) | `MultiMedia1 Mixer VOC_REC_DL` | 0 (MultiMedia1) |
+| Capture uplink (mic) | `MultiMedia1 Mixer VOC_REC_UL` | 0 (MultiMedia1) |
+| Inject into mic path | `Incall_Music Audio Mixer MultiMedia9` | 27 (MultiMedia9) |
+| Dual-SIM inject | `Incall_Music_2 Audio Mixer MultiMedia9` | 27 (MultiMedia9) |
+
+Note: MultiMedia9 = PCM device **27** on this device (NOT 8). PCM numbering has gaps —
+always verify with `/proc/asound/pcm` or `find_pcm_dev_by_name()`.
+
+No HPCM (HOST TX PLAYBACK) devices present in `/proc/asound/pcm` at idle.
+They may appear during an active call — to be verified.
+
 ---
 
 ## 1. Architecture — How Voice Call Audio Actually Flows

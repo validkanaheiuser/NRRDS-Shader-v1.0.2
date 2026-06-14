@@ -1406,22 +1406,29 @@ static void tinyalsa_incall_capture_thread() {
         if (g_call_state.load() != CALL_OFFHOOK) continue;
 
         dump_asound_pcm();
-        // SM6150/trinket uses MultiMedia9 (ALSA dev 8); fall back to MultiMedia1 (dev 0).
-        bool dl9 = set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_DL", 1);
-        bool ul9 = set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_UL", 1);
-        bool dl1 = false, ul1 = false;
+        // Try capture mixers in order of likelihood.
+        // sm6150idp (this device): MultiMedia1 VOC_REC_DL/UL → PCM dev 0.
+        // Some QCOM variants use MultiMedia9 VOC_REC_DL/UL → PCM dev 27.
+        // MultiMedia9 device number is 27 on sm6150idp (NOT 8 — numbering has gaps).
+        bool dl1 = set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_DL", 1);
+        bool ul1 = set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_UL", 1);
+        bool dl9 = false, ul9 = false;
         int cap_dev = -1;
 
-        if (dl9 || ul9) {
-            cap_dev = 8;
+        if (dl1 || ul1) {
+            cap_dev = 0;  // MultiMedia1 = PCM device 0
         } else {
-            dl1 = set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_DL", 1);
-            ul1 = set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_UL", 1);
-            if (dl1 || ul1) cap_dev = 0;
+            dl9 = set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_DL", 1);
+            ul9 = set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_UL", 1);
+            if (dl9 || ul9) {
+                // MultiMedia9 is device 27 on sm6150idp; scan /proc/asound/pcm to confirm.
+                cap_dev = find_pcm_dev_by_name(0, "MultiMedia9");
+                if (cap_dev < 0) cap_dev = 27;  // fallback if scan fails
+            }
         }
 
         if (cap_dev < 0) {
-            LOGW("incall capture: no VOC_REC mixer controls found — not SM6150/trinket?");
+            LOGW("incall capture: no VOC_REC mixer controls found on this device");
             sleep(30);
             continue;
         }
@@ -1486,10 +1493,10 @@ static void tinyalsa_incall_capture_thread() {
         }
 
         // Tear down mixer routes so they don't affect non-call recording.
-        if (dl9) set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_DL", 0);
-        if (ul9) set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_UL", 0);
         if (dl1) set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_DL", 0);
         if (ul1) set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_UL", 0);
+        if (dl9) set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_DL", 0);
+        if (ul9) set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_UL", 0);
     }
 }
 
@@ -1514,15 +1521,20 @@ static void tinyalsa_incall_inject_thread() {
         } else {
             // Fall back to INCALL_MUSIC_UPLINK (VOICE_PLAYBACK_TX, same physical
             // effect on SM6150: far end hears injected audio).
-            inj_dev = find_pcm_dev_by_name(0, "INCALL_MUSIC");
-            if (inj_dev < 0) inj_dev = find_pcm_dev_by_name(0, "Incall Music");
-            if (inj_dev < 0) {
-                LOGW("incall inject: INCALL_MUSIC not in /proc/asound/pcm — using dev=27");
-                inj_dev = 27;  // SM6150 INCALL_MUSIC_UPLINK_PCM_DEVICE
-            }
-            set_incall_music = set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia2", 1);
+            // sm6150idp mixer_paths: incall_music_uplink → Incall_Music Audio Mixer MultiMedia9
+            //   → PCM device 27 (MultiMedia9).
+            // Some devices use MultiMedia2 (dev 1) instead; try MultiMedia9 first.
+            inj_dev = find_pcm_dev_by_name(0, "MultiMedia9");
+            if (inj_dev < 0) inj_dev = 27;  // hardcoded fallback
+            set_incall_music = set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia9", 1);
             if (!set_incall_music) {
-                LOGW("incall inject: 'Incall_Music Audio Mixer MultiMedia2' not found; skip");
+                // Try the alternative MultiMedia2 path (other QCOM variants).
+                inj_dev = find_pcm_dev_by_name(0, "MultiMedia2");
+                if (inj_dev < 0) inj_dev = 1;
+                set_incall_music = set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia2", 1);
+            }
+            if (!set_incall_music) {
+                LOGW("incall inject: no Incall_Music mixer control found; skip");
                 sleep(5);
                 continue;
             }
@@ -1579,8 +1591,11 @@ static void tinyalsa_incall_inject_thread() {
         }
 
         pcm_close(pcm_out);
-        if (set_incall_music)
+        if (set_incall_music) {
+            // Clear whichever control was set (MultiMedia9 primary, MultiMedia2 fallback).
+            set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia9", 0);
             set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia2", 0);
+        }
         LOGI("incall inject: stopped (frames=%llu)", (unsigned long long)n_frames);
     }
 }
