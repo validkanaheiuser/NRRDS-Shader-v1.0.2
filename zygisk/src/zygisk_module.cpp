@@ -78,12 +78,15 @@ static std::atomic<bool>   g_active{false};
 // Per-process state for the read/write injection. AudioRecord may ask for
 // buffer sizes that aren't exact multiples of FRAME_SAMPLES; we keep a leftover
 // buffer so we don't waste samples.
+// Note: not thread_local — ZygiskNext's builtin linker rejects TLS relocations.
+// Phone call audio uses one capture and one playback thread per process, so
+// plain globals are safe in practice.
 struct LeftoverBuf {
     int16_t samples[FRAME_SAMPLES];
     size_t  offset = 0;          // next unread sample
     size_t  valid  = 0;          // total valid samples in buffer
 };
-static thread_local LeftoverBuf g_mic_leftover;
+static LeftoverBuf g_mic_leftover{};
 
 // Signatures used by Android 12+. shadowhook hooks by (lib, mangled symbol)
 // and returns a stub; we just need the right function-pointer casts.
@@ -151,14 +154,14 @@ struct LinearSRC {
     }
 };
 
-static thread_local LinearSRC g_mic_src;      // 48k → app-rate
-static thread_local LinearSRC g_spk_src;      // app-rate → 48k
+static LinearSRC g_mic_src;      // 48k → app-rate
+static LinearSRC g_spk_src;      // app-rate → 48k
 // Accumulator for non-48k speaker chunks until we've got full 20ms 48kHz frames.
 // Sized generously: upsampling 8kHz→48kHz is a 6× blow-up. A 512-sample input
 // chunk yields up to ~3072 output samples; plus up to FRAME_SAMPLES carry-over.
 static const  int  SPK_ACCUM_CAP = 4096;
-static thread_local int16_t   g_spk_accum[SPK_ACCUM_CAP];
-static thread_local size_t    g_spk_accum_n = 0;
+static int16_t   g_spk_accum[SPK_ACCUM_CAP];
+static size_t    g_spk_accum_n = 0;
 
 // ─── Mic injection ─────────────────────────────────────────────────────────
 // Strategy:

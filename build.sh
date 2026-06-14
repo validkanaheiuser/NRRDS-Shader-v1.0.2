@@ -464,11 +464,9 @@ build_zygisk() {
     #   -fno-exceptions       removes exception-handling ABI dependencies.
     #   -fno-threadsafe-statics removes __cxa_guard_acquire (compiler-rt, absent
     #                         in zygote's linker namespace).
-    #   -fno-emulated-tls     API 28 and below default to emulated TLS which
-    #                         requires __emutls_get_address (compiler-rt). Native
-    #                         TLS uses __tls_get_addr from the dynamic linker,
-    #                         which IS available to dlopen'd SOs in zygote.
     #   -fvisibility=hidden   prevents symbol conflicts between loaded modules.
+    # No thread_local anywhere — ZygiskNext's builtin linker rejects TLS
+    # relocations outright ("tls relocation is unsupported").
     $CXX \
         -std=c++17 \
         -O3 \
@@ -477,7 +475,6 @@ build_zygisk() {
         -fno-exceptions \
         -fno-rtti \
         -fno-threadsafe-statics \
-        -fno-emulated-tls \
         -fvisibility=hidden \
         -fvisibility-inlines-hidden \
         -DANDROID \
