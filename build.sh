@@ -13,7 +13,7 @@ echo -e "${GREEN}║           Audio Bridge - Full Build Script v3.0            
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
 # Configuration
-export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/25.2.9519653}"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/29.0.14206865}"
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
@@ -457,15 +457,23 @@ build_zygisk() {
     # Compile Zygisk module. We don't link against libshadowhook.so — the
     # module dlopens it at runtime from its own install dir (see src/) so we
     # don't need to arrange for the dynamic linker to find it.
-    # -static-libstdc++ is required: the module inherits from zygisk::ModuleBase
-    # which has virtual functions, so the linker needs C++ ABI vtable symbols
-    # (e.g. _ZTVN10__cxxabiv117__class_type_infoE). Without statically embedding
-    # the runtime, ZygiskNext's dlopen rejects the SO with "cannot locate symbol".
+    # Match the flags from 5ec1cff/zygisk-module-template:
+    #   -fno-rtti             eliminates _ZTVN10__cxxabiv117__class_type_infoE and
+    #                         other RTTI vtable symbols that ZygiskNext's linker
+    #                         cannot resolve inside zygote's namespace.
+    #   -fno-exceptions       removes exception-handling ABI dependencies.
+    #   -fvisibility=hidden   prevents symbol conflicts between loaded modules.
+    # No -static-libstdc++ needed; with RTTI+exceptions off there are no C++
+    # runtime ABI symbols left in the dynamic symbol table.
     $CXX \
         -std=c++17 \
         -O3 \
         -fPIC \
         -shared \
+        -fno-exceptions \
+        -fno-rtti \
+        -fvisibility=hidden \
+        -fvisibility-inlines-hidden \
         -DANDROID \
         -I"$PROJECT_DIR/zygisk" \
         -I"$LIBS_DIR/arm64-v8a/include" \
@@ -474,7 +482,6 @@ build_zygisk() {
         -o "$PROJECT_DIR/zygisk/module/zygisk/arm64-v8a.so" \
         -Wl,--gc-sections \
         -Wl,-z,max-page-size=16384 \
-        -static-libstdc++ \
         -ldl \
         -llog
 
