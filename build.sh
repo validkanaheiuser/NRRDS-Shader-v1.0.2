@@ -462,9 +462,13 @@ build_zygisk() {
     #                         other RTTI vtable symbols that ZygiskNext's linker
     #                         cannot resolve inside zygote's namespace.
     #   -fno-exceptions       removes exception-handling ABI dependencies.
+    #   -fno-threadsafe-statics removes __cxa_guard_acquire (compiler-rt, absent
+    #                         in zygote's linker namespace).
+    #   -fno-emulated-tls     API 28 and below default to emulated TLS which
+    #                         requires __emutls_get_address (compiler-rt). Native
+    #                         TLS uses __tls_get_addr from the dynamic linker,
+    #                         which IS available to dlopen'd SOs in zygote.
     #   -fvisibility=hidden   prevents symbol conflicts between loaded modules.
-    # No -static-libstdc++ needed; with RTTI+exceptions off there are no C++
-    # runtime ABI symbols left in the dynamic symbol table.
     $CXX \
         -std=c++17 \
         -O3 \
@@ -473,6 +477,7 @@ build_zygisk() {
         -fno-exceptions \
         -fno-rtti \
         -fno-threadsafe-statics \
+        -fno-emulated-tls \
         -fvisibility=hidden \
         -fvisibility-inlines-hidden \
         -DANDROID \
