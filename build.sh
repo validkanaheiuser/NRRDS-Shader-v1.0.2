@@ -568,15 +568,26 @@ allow platform_app su    unix_stream_socket { connectto read write getattr }
 allow radio      ksu     unix_stream_socket { connectto read write getattr }
 allow radio      magisk  unix_stream_socket { connectto read write getattr }
 allow radio      su      unix_stream_socket { connectto read write getattr }
-# Allow hooked app domains to use the memfd (tmpfs file) shared with the daemon
-# via SCM_RIGHTS. Without { read write map }, mmap() on the received fd is denied.
-# Note: KernelSU/magiskpolicy rule format is "source target class perms" (space-
-# separated), NOT the TE-language "target:class" colon syntax.
+# Qualcomm IMS/VoLTE processes (vendor_qtelephony domain)
+allow vendor_qtelephony ksu    unix_stream_socket { connectto read write getattr }
+allow vendor_qtelephony magisk unix_stream_socket { connectto read write getattr }
+allow vendor_qtelephony su     unix_stream_socket { connectto read write getattr }
+allow vendor_qtelephony init   unix_stream_socket { connectto read write getattr }
+# SHM via ashmem_device_file (chr_file): preferred over memfd because AOSP base
+# policy already allows app domains to map ashmem, avoiding the tmpfs neverallow.
+allow priv_app         ashmem_device_file chr_file { read write open map getattr ioctl }
+allow system_app       ashmem_device_file chr_file { read write open map getattr ioctl }
+allow platform_app     ashmem_device_file chr_file { read write open map getattr ioctl }
+allow radio            ashmem_device_file chr_file { read write open map getattr ioctl }
+allow phone            ashmem_device_file chr_file { read write open map getattr ioctl }
+allow vendor_qtelephony ashmem_device_file chr_file { read write open map getattr ioctl }
+# Fallback: tmpfs rules for memfd SHM (may be blocked by GKI neverallow on some kernels)
 allow priv_app    tmpfs file { read write open map getattr }
 allow system_app  tmpfs file { read write open map getattr }
 allow platform_app tmpfs file { read write open map getattr }
 allow radio       tmpfs file { read write open map getattr }
 allow phone       tmpfs file { read write open map getattr }
+allow vendor_qtelephony tmpfs file { read write open map getattr }
 # Allow the app (priv_app) to write its Java-side diag log to /data/local/tmp
 allow priv_app shell_data_file { read write create open append getattr setattr }
 EOF
@@ -606,14 +617,14 @@ appops set com.audiobridge SYSTEM_ALERT_WINDOW allow 2>/dev/null
 # Apply SELinux rules. sepolicy.rule is read by Magisk/KernelSU on boot; this
 # is the belt to that file's suspenders. Rules cover every (app, daemon)
 # domain pair we might hit.
-APP_DOMAINS="priv_app system_app platform_app radio"
+APP_DOMAINS="priv_app system_app platform_app radio vendor_qtelephony"
 DAEMON_DOMAINS="ksu magisk su init"
 apply_rule() {
     local RULE="$1"
     if command -v magiskpolicy >/dev/null 2>&1; then
         magiskpolicy --live "$RULE" 2>/dev/null
     elif [ -f /data/adb/ksud ]; then
-        /data/adb/ksud apply-sepolicy "$RULE" 2>/dev/null
+        /data/adb/ksud sepolicy patch "$RULE" 2>/dev/null
     elif command -v supolicy >/dev/null 2>&1; then
         supolicy --live "$RULE" 2>/dev/null
     fi
@@ -623,7 +634,11 @@ if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -
     for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
         apply_rule "allow $APP $D unix_stream_socket { connectto read write getattr }"
     done; done
-    # memfd (tmpfs file) shared via SCM_RIGHTS — needed for mmap in app processes
+    # ashmem_device_file (preferred SHM type — avoids tmpfs neverallow on GKI kernels)
+    for APP in $APP_DOMAINS phone; do
+        apply_rule "allow $APP ashmem_device_file chr_file { read write open map getattr ioctl }"
+    done
+    # tmpfs fallback (may be blocked by kernel neverallow; ashmem above is the real fix)
     for APP in $APP_DOMAINS phone; do
         apply_rule "allow $APP tmpfs file { read write open map getattr }"
     done
@@ -679,6 +694,22 @@ else
         echo "$(date) Daemon already running, PID=$(pidof audio-bridge)" >> $LOG
     fi
 fi
+
+# Background: brief SELinux permissive window after boot so Zygisk modules
+# can mmap the ashmem/SHM fd. ksud sepolicy patch is unreliable on GKI kernels
+# that enforce neverallows at policy-load time. A 4-second window covers 8
+# retry cycles (modules retry every 500 ms) — enough for all hooked processes.
+(
+    for _i in $(seq 1 60); do
+        [ "$(getprop sys.boot_completed)" = "1" ] && break
+        sleep 2
+    done
+    sleep 6
+    setenforce 0 2>/dev/null
+    sleep 4
+    setenforce 1 2>/dev/null
+    echo "$(date) SELinux permissive window closed" >> $LOG
+) &
 
 # Background: wait for the framework, install APK if needed, start service.
 (

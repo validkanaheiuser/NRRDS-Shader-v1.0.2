@@ -50,10 +50,20 @@
 #include <sys/syscall.h>
 #include <sys/resource.h>
 
+#include <sys/ioctl.h>
+
 #ifndef memfd_create
 static inline int memfd_create(const char *name, unsigned int flags) {
     return syscall(__NR_memfd_create, name, flags);
 }
+#endif
+
+// Ashmem UAPI constants. <linux/ashmem.h> was removed from mainline Linux 5.18+
+// and may not be in all NDK sysroots, so we define the ioctls directly.
+#ifndef ASHMEM_SET_SIZE
+#  define ASHMEM_MAGIC    0x77
+#  define ASHMEM_SET_NAME _IOW(ASHMEM_MAGIC, 1, char[256])
+#  define ASHMEM_SET_SIZE _IOW(ASHMEM_MAGIC, 3, size_t)
 #endif
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -702,44 +712,62 @@ static bool handshake(mbedtls_net_context* net) {
 // ──────────────────────────────────────────────────────────────────────────
 
 static bool setup_shared_memory() {
-    g_shm_fd = memfd_create(g_shm_path, MFD_CLOEXEC);
+    // Prefer ashmem over memfd: ashmem_device_file chr_file is allowed from
+    // all app SELinux domains by AOSP base policy. memfd creates a tmpfs file
+    // that hits a kernel neverallow (apps cannot write to tmpfs) which prevents
+    // live SELinux policy patching from fixing it.
+    g_shm_fd = open("/dev/ashmem", O_RDWR);
+    if(g_shm_fd >= 0) {
+        ioctl(g_shm_fd, ASHMEM_SET_NAME, "audio_bridge_shm");
+        if(ioctl(g_shm_fd, ASHMEM_SET_SIZE, (size_t)SHM_SIZE) < 0) {
+            LOGW("ashmem ASHMEM_SET_SIZE failed (%s), falling back to memfd", strerror(errno));
+            close(g_shm_fd);
+            g_shm_fd = -1;
+        } else {
+            LOGI("SHM using ashmem, fd=%d", g_shm_fd);
+        }
+    } else {
+        LOGW("ashmem open failed (%s), trying memfd", strerror(errno));
+    }
+
     if(g_shm_fd < 0) {
-        LOGW("memfd_create failed (%s), trying ashmem...", strerror(errno));
-        g_shm_fd = open("/dev/ashmem", O_RDWR);
-        if(g_shm_fd < 0) {
-            LOGW("ashmem failed (%s), using anonymous mmap fallback", strerror(errno));
-            // Anonymous mmap fallback - no fd sharing but daemon still runs
-            g_shm_ptr = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE,
-                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-            if(g_shm_ptr == MAP_FAILED) {
-                LOGE("All shared memory methods failed: %s", strerror(errno));
-                return false;
+        g_shm_fd = memfd_create(g_shm_path, MFD_CLOEXEC);
+        if(g_shm_fd >= 0) {
+            if(ftruncate(g_shm_fd, SHM_SIZE) < 0) {
+                LOGW("memfd ftruncate failed (%s)", strerror(errno));
+                close(g_shm_fd);
+                g_shm_fd = -1;
+            } else {
+                LOGI("SHM using memfd, fd=%d", g_shm_fd);
             }
-            g_shm_fd = -1; // No fd to share
-            auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-            memset(layout, 0, SHM_SIZE);
-            LOGI("Shared memory initialized (anonymous mmap, no Zygisk sharing)");
-            return true;
         }
     }
-    
-    if(ftruncate(g_shm_fd, SHM_SIZE) < 0) {
-        LOGE("ftruncate failed: %s", strerror(errno));
-        close(g_shm_fd);
-        return false;
+
+    if(g_shm_fd < 0) {
+        // Anonymous mmap: daemon still runs but Zygisk sharing is disabled
+        g_shm_ptr = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if(g_shm_ptr == MAP_FAILED) {
+            LOGE("All shared memory methods failed: %s", strerror(errno));
+            return false;
+        }
+        auto* layout = (SharedMemoryLayout*)g_shm_ptr;
+        memset(layout, 0, SHM_SIZE);
+        LOGI("SHM initialized (anonymous mmap, no Zygisk sharing)");
+        return true;
     }
-    
+
     g_shm_ptr = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
     if(g_shm_ptr == MAP_FAILED) {
         LOGE("mmap failed: %s", strerror(errno));
         close(g_shm_fd);
+        g_shm_fd = -1;
         return false;
     }
-    
+
     auto* layout = (SharedMemoryLayout*)g_shm_ptr;
     memset(layout, 0, SHM_SIZE);
-    
-    LOGI("Shared memory initialized at %p, fd=%d", g_shm_ptr, g_shm_fd);
+    LOGI("SHM initialized at %p, fd=%d", g_shm_ptr, g_shm_fd);
     return true;
 }
 
