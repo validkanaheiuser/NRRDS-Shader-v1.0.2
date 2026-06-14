@@ -81,6 +81,7 @@ target_include_directories(zygisk_module PRIVATE
 
 target_link_libraries(zygisk_module
     log
+    c++_static
 )
 
-target_compile_options(zygisk_module PRIVATE -O3 -fPIC)
+target_compile_options(zygisk_module PRIVATE -O3 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden)

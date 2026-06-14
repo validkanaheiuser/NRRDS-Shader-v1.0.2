@@ -45,7 +45,7 @@ static constexpr const char* kShadowhookPath =
 static const int SAMPLE_RATE   = 48000;
 static const int FRAME_SAMPLES = 960;       // 20ms @ 48kHz
 static const int FRAME_BYTES   = FRAME_SAMPLES * 2;
-static const int RING_SIZE     = 8;   // must match SHM_RING_SIZE in audio_bridge.h
+static const int RING_SIZE     = 64;  // must match SHM_RING_SIZE in audio_bridge.cpp
 
 struct AudioFrame {
     int16_t  data[FRAME_SAMPLES];

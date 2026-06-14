@@ -1297,11 +1297,15 @@ int main(int argc, char** argv) {
             // Daemonize
             if(fork() > 0) exit(0);
             setsid();
-            // Redirect stdin/stdout to /dev/null (don't close - avoids fd reuse bugs)
+            // Redirect stdin/stdout/stderr to /dev/null.
+            // stderr must be closed too: service.sh runs us with ">> log 2>&1",
+            // so inherited fd2 points at the log file, causing every log_write()
+            // call (which writes to both stderr AND g_log_file) to be duplicated.
             int devnull = open("/dev/null", O_RDWR);
             if(devnull >= 0) {
                 dup2(devnull, STDIN_FILENO);
                 dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
                 close(devnull);
             }
             // Write PID file immediately so service.sh can detect us
