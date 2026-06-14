@@ -338,7 +338,9 @@ class DeviceManager {
 
   connectUI(ws) {
     this.uiClients.add(ws);
-    ws.send(JSON.stringify(this._state()));
+    ws.send(JSON.stringify(this._state()), err => {
+      if (err) warn('connectUI send error:', err.message);
+    });
   }
 
   disconnectUI(ws) { this.uiClients.delete(ws); }
@@ -516,6 +518,14 @@ async function handleDevice(socket) {
 function handleUI(ws) {
   mgr.connectUI(ws);
 
+  // Cloudflare drops idle WebSocket connections after 100s. Ping every 45s.
+  const ping = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+    else clearInterval(ping);
+  }, 45_000);
+
+  ws.on('pong', () => {});
+
   ws.on('message', raw => {
     let data;
     try { data = JSON.parse(raw.toString()); } catch (_) { return; }
@@ -542,8 +552,8 @@ function handleUI(ws) {
     }
   });
 
-  ws.on('close', () => mgr.disconnectUI(ws));
-  ws.on('error', e  => warn('ui ws:', e.message));
+  ws.on('close', () => { clearInterval(ping); mgr.disconnectUI(ws); });
+  ws.on('error', e  => { clearInterval(ping); warn('ui ws:', e.message); });
 }
 
 // ── WS: /ws/audio/{device_id} ─────────────────────────────────────────────────
