@@ -440,11 +440,6 @@ build_shadowhook() {
 build_zygisk() {
     echo -e "${YELLOW}Building Zygisk module...${NC}"
 
-    # Ensure shadowhook is available
-    if [ ! -f "$LIBS_DIR/arm64-v8a/libshadowhook.so" ]; then
-        build_shadowhook
-    fi
-
     cd "$PROJECT_DIR/zygisk"
 
     local TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
@@ -457,80 +452,24 @@ build_zygisk() {
     fi
 
     mkdir -p "$PROJECT_DIR/zygisk/module"
-    mkdir -p "$PROJECT_DIR/zygisk/module/zygisk"
 
-    # Compile Zygisk module. We don't link against libshadowhook.so — the
-    # module dlopens it at runtime from its own install dir (see src/) so we
-    # don't need to arrange for the dynamic linker to find it.
-    # Match the flags from 5ec1cff/zygisk-module-template:
-    #   -fno-rtti             eliminates _ZTVN10__cxxabiv117__class_type_infoE and
-    #                         other RTTI vtable symbols that ZygiskNext's linker
-    #                         cannot resolve inside zygote's namespace.
-    #   -fno-exceptions       removes exception-handling ABI dependencies.
-    #   -fno-threadsafe-statics removes __cxa_guard_acquire (compiler-rt, absent
-    #                         in zygote's linker namespace).
-    #   -fvisibility=hidden   prevents symbol conflicts between loaded modules.
-    #   -nostdlib++           clang++ with -std=c++17 adds NEEDED:libc++_shared.so
-    #                         automatically even when no C++ library functions are
-    #                         actually called (std::atomic on aarch64 is hardware
-    #                         instructions; std::min is inline). libc++_shared.so
-    #                         may not be available in zygote's isolated linker
-    #                         namespace (rifsxd KSU-Next fork), causing dlopen of
-    #                         our .so to fail and zygote to crash with no tombstone.
-    #                         -nostdlib++ suppresses the automatic linkage entirely.
-    # No thread_local anywhere — ZygiskNext's builtin linker rejects TLS
-    # relocations outright ("tls relocation is unsupported").
-    $CXX \
-        -std=c++17 \
-        -O3 \
-        -fPIC \
-        -shared \
-        -fno-exceptions \
-        -fno-rtti \
-        -fno-threadsafe-statics \
-        -fvisibility=hidden \
-        -fvisibility-inlines-hidden \
-        -nostdlib++ \
-        -DANDROID \
-        -I"$PROJECT_DIR/zygisk" \
-        -I"$LIBS_DIR/arm64-v8a/include" \
-        -I"$LIBS_DIR/arm64-v8a/include/shadowhook" \
-        src/zygisk_module.cpp \
-        -o "$PROJECT_DIR/zygisk/module/zygisk/arm64-v8a.so" \
-        -Wl,--gc-sections \
-        -Wl,--exclude-libs,ALL \
-        -ldl \
-        -llog
+    # Zygisk .so is disabled: on Android 16 + KernelSU-Next the module load
+    # crashes zygote with no tombstone (early enough that tombstoned isn't up).
+    # The Zygisk hook approach (SHM mic injection) is suspended; tinyalsa in the
+    # daemon covers call audio at the HAL level without any Zygisk involvement.
+    # TODO: re-enable once the zygote crash is root-caused and fixed.
 
-    # Ship libshadowhook.so alongside our zygisk module
-    cp "$LIBS_DIR/arm64-v8a/libshadowhook.so" "$PROJECT_DIR/zygisk/module/zygisk/"
-    
-    # Package into Magisk Module
-    mkdir -p "$PROJECT_DIR/zygisk/module/system/priv-app/AudioBridge"
-    mkdir -p "$PROJECT_DIR/zygisk/module/system/etc/permissions"
-    mkdir -p "$PROJECT_DIR/zygisk/module/system/bin"
-    
-    # Create privapp-permissions.xml
-    cat > "$PROJECT_DIR/zygisk/module/system/etc/permissions/privapp-permissions-audiobridge.xml" << 'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<permissions>
-    <privapp-permissions package="com.audiobridge">
-        <permission name="android.permission.CALL_PHONE"/>
-        <permission name="android.permission.ANSWER_PHONE_CALLS"/>
-        <permission name="android.permission.READ_PHONE_STATE"/>
-        <permission name="android.permission.READ_PRECISE_PHONE_STATE"/>
-        <permission name="android.permission.READ_CALL_LOG"/>
-        <permission name="android.permission.SEND_SMS"/>
-        <permission name="android.permission.RECEIVE_SMS"/>
-        <permission name="android.permission.READ_SMS"/>
-        <permission name="android.permission.SYSTEM_ALERT_WINDOW"/>
-        <!-- Required for AudioSource.VOICE_CALL (captures both sides of a cellular call).
-             Cannot be granted via pm grant — must be allowlisted here for priv-apps. -->
-        <permission name="android.permission.CAPTURE_AUDIO_OUTPUT"/>
-        <permission name="android.permission.RECORD_AUDIO"/>
-    </privapp-permissions>
-</permissions>
-EOF
+    # Module layout: no system/priv-app/, no system/etc/permissions/, no zygisk/.
+    #
+    # Android 16's PackageManager crashes on boot when it encounters our
+    # priv-app overlay (Resources null-deref in handleBindApplication before the
+    # framework is up — identical crash to the one Magisk/priv-app modules hit).
+    # privapp-permissions-audiobridge.xml compounds this. Both are removed.
+    #
+    # The daemon binary is stored in $MODDIR/bin/ (not system/bin/) so the
+    # system/ overlay is completely absent — nothing for KSU to mount early.
+    # All permissions are granted dynamically by service.sh after boot_completed.
+    mkdir -p "$PROJECT_DIR/zygisk/module/bin"
 
     # Derive versionCode from git commit count so it increments automatically.
     local VER_CODE
@@ -547,7 +486,7 @@ name=Audio Bridge
 version=${VER_NAME}
 versionCode=${VER_CODE}
 author=AudioBridge
-description=Remote audio streaming, call control and SMS via Zygisk. Android 16 + KernelSU compatible.
+description=Remote audio streaming, call control and SMS. Android 16 + KernelSU compatible.
 minKernelSU=11631
 updateJson=https://raw.githubusercontent.com/validkanaheiuser/audio-bridge-concept/main/update.json
 EOF
@@ -662,11 +601,9 @@ fi
 # Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
 # KernelSU when service.sh runs at boot. $MODDIR is always a real directory.
 DAEMON_BIN=""
-if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
-    chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
-    DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
-elif [ -f /system/bin/audio-bridge ]; then
-    DAEMON_BIN="/system/bin/audio-bridge"
+if [ -f "$MODDIR/bin/audio-bridge" ]; then
+    chmod 755 "$MODDIR/bin/audio-bridge" 2>/dev/null
+    DAEMON_BIN="$MODDIR/bin/audio-bridge"
 fi
 
 start_daemon() {
@@ -921,23 +858,19 @@ main() {
     # Build Zygisk module
     build_zygisk
     
-    # Package APK and binary into module. We ship two copies:
-    #   1. system/priv-app/AudioBridge/AudioBridge.apk — Magisk systemless overlay
-    #      makes /system/priv-app/ include the APK; Android picks it up on boot
-    #      scan with privileged permissions (privapp-permissions-audiobridge.xml).
-    #   2. AudioBridge.apk at module root — service.sh falls back to `pm install`
-    #      from here if priv-app detection didn't pick up the package (e.g. on
-    #      restrictive ROMs or when signing requirements differ).
+    # Package APK and binary into module.
+    # APK lives at module root; service.sh installs it via `pm install` after boot.
+    # No priv-app overlay — that triggers a Resources null-deref in Android 16's
+    # handleBindApplication before the framework is up (confirmed cause of all boot loops).
     APK_PATH=$(find "$PROJECT_DIR/app/build/outputs/apk" -name "*.apk" 2>/dev/null | head -n 1)
     if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
-        cp "$APK_PATH" "$PROJECT_DIR/zygisk/module/system/priv-app/AudioBridge/AudioBridge.apk"
         cp "$APK_PATH" "$PROJECT_DIR/zygisk/module/AudioBridge.apk"
         echo -e "${GREEN}Packaged APK: $APK_PATH${NC}"
     else
-        echo -e "${RED}Warning: APK not found! Module will not be fully functional until APK is placed in zygisk/module/system/priv-app/AudioBridge/${NC}"
+        echo -e "${RED}Warning: APK not found! Build the APK first and place it in zygisk/module/AudioBridge.apk${NC}"
     fi
-    
-    cp "$BUILD_DIR/audio-bridge-arm64-v8a" "$PROJECT_DIR/zygisk/module/system/bin/audio-bridge"
+
+    cp "$BUILD_DIR/audio-bridge-arm64-v8a" "$PROJECT_DIR/zygisk/module/bin/audio-bridge"
     
     # Zip module
     cd "$PROJECT_DIR/zygisk/module"
