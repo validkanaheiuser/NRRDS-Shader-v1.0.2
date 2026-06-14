@@ -472,6 +472,7 @@ build_zygisk() {
         -shared \
         -fno-exceptions \
         -fno-rtti \
+        -fno-threadsafe-statics \
         -fvisibility=hidden \
         -fvisibility-inlines-hidden \
         -DANDROID \
