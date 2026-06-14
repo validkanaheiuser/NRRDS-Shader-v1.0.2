@@ -551,23 +551,26 @@ public:
             skip = true;
             return;
         }
-        // Actual hook install is deferred until postAppSpecialize — at that
-        // point libaudioclient.so is more reliably loaded into the app image.
+
+        // Load shadowhook HERE — this callback runs before specializeAppProcess
+        // so the process still has zygote's SELinux context (root access to
+        // /data/adb/). After postAppSpecialize the process is phone/priv_app
+        // which cannot read /data/adb/ files.
+        sh_loaded = load_shadowhook();
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
         if (skip) return;
 
+        if (!sh_loaded) {
+            LOGE("shadowhook load failed — audio injection disabled");
+            return;
+        }
+
         // Force-load libaudioclient.so so hook/symbol resolution can see it.
-        // Harmless — any real AudioRecord/AudioTrack use pulls it in anyway.
         void* h = dlopen("libaudioclient.so", RTLD_NOW | RTLD_GLOBAL);
         if (!h) {
             LOGW("dlopen(libaudioclient.so) failed: %s", dlerror());
-        }
-
-        if (!load_shadowhook()) {
-            LOGE("shadowhook unavailable — audio injection disabled");
-            return;
         }
 
         if (!install_inline_hooks()) {
@@ -580,9 +583,10 @@ public:
     }
 
 private:
-    zygisk::Api* api = nullptr;
-    JNIEnv*      env = nullptr;
-    bool         skip = false;
+    zygisk::Api* api      = nullptr;
+    JNIEnv*      env      = nullptr;
+    bool         skip     = false;
+    bool         sh_loaded = false;
 };
 
 REGISTER_ZYGISK_MODULE(AudioBridgeModule)
