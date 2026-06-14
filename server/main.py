@@ -44,19 +44,26 @@ import sys as _sys
 if _sys.platform == "win32":
     import ctypes as _ctypes, os as _os
     _here = _os.path.dirname(_os.path.abspath(__file__))
-    for _candidate in [
-        _os.path.join(_here, "opus.dll"),
-        _os.path.join(_here, "libopus.dll"),
-        _os.path.join(_here, "libopus-0.dll"),
-    ]:
-        if _os.path.exists(_candidate):
-            try:
-                _ctypes.CDLL(_candidate)
-                if hasattr(_os, "add_dll_directory"):
-                    _os.add_dll_directory(_here)
-            except OSError:
-                pass
+    _opus_dll = None
+    for _name in ("opus.dll", "libopus.dll", "libopus-0.dll"):
+        _p = _os.path.join(_here, _name)
+        if _os.path.exists(_p):
+            _opus_dll = _p
             break
+    if _opus_dll:
+        # Put server dir first in PATH so ctypes.util.find_library('opus') finds it.
+        _os.environ["PATH"] = _here + _os.pathsep + _os.environ.get("PATH", "")
+        # Python 3.8+: register as a trusted DLL directory.
+        if hasattr(_os, "add_dll_directory"):
+            _os.add_dll_directory(_here)
+        # Pre-load to validate the DLL is self-contained.
+        try:
+            _ctypes.CDLL(_opus_dll)
+        except OSError as _e:
+            import sys as _s
+            print(f"audio-bridge: opus.dll found but failed to load: {_e}", file=_s.stderr)
+            print("  If you copied opus.dll from FFmpeg, it depends on other FFmpeg DLLs.", file=_s.stderr)
+            print("  Download the standalone build from https://opus-codec.org/downloads/", file=_s.stderr)
 
 try:
     import opuslib
