@@ -98,9 +98,16 @@ jobs:
         }
         EOF
 
-        # Commit and push update.json back to main
+        # Commit update.json and keystore back to main.
+        # The keystore is committed on first run so all future builds reuse the same
+        # signing key. A fresh key each build causes PackageManager to see a signature
+        # conflict between the priv-app overlay (new key) and any existing data-app
+        # install (old key), crashing system_server during early boot (boot loop).
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git add update.json
+        if git status --porcelain app/audiobridge.keystore | grep -q '^??'; then
+          git add app/audiobridge.keystore
+        fi
         git diff --cached --quiet || git commit -m "chore: update update.json for ${VER_NAME} [skip ci]"
         git push
