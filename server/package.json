@@ -1,0 +1,19 @@
+{
+  "name": "audio-bridge-server",
+  "version": "4.0.0",
+  "description": "Audio Bridge server — Node.js port",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@discordjs/opus": "^0.9.0",
+    "opusscript": "^0.1.1"
+  }
+}
