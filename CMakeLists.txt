@@ -84,4 +84,4 @@ target_link_libraries(zygisk_module
     c++_static
 )
 
-target_compile_options(zygisk_module PRIVATE -O3 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden)
+target_compile_options(zygisk_module PRIVATE -O3 -fPIC)
