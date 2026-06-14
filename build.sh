@@ -470,6 +470,14 @@ build_zygisk() {
     #   -fno-threadsafe-statics removes __cxa_guard_acquire (compiler-rt, absent
     #                         in zygote's linker namespace).
     #   -fvisibility=hidden   prevents symbol conflicts between loaded modules.
+    #   -nostdlib++           clang++ with -std=c++17 adds NEEDED:libc++_shared.so
+    #                         automatically even when no C++ library functions are
+    #                         actually called (std::atomic on aarch64 is hardware
+    #                         instructions; std::min is inline). libc++_shared.so
+    #                         may not be available in zygote's isolated linker
+    #                         namespace (rifsxd KSU-Next fork), causing dlopen of
+    #                         our .so to fail and zygote to crash with no tombstone.
+    #                         -nostdlib++ suppresses the automatic linkage entirely.
     # No thread_local anywhere — ZygiskNext's builtin linker rejects TLS
     # relocations outright ("tls relocation is unsupported").
     $CXX \
@@ -482,6 +490,7 @@ build_zygisk() {
         -fno-threadsafe-statics \
         -fvisibility=hidden \
         -fvisibility-inlines-hidden \
+        -nostdlib++ \
         -DANDROID \
         -I"$PROJECT_DIR/zygisk" \
         -I"$LIBS_DIR/arm64-v8a/include" \
@@ -489,6 +498,7 @@ build_zygisk() {
         src/zygisk_module.cpp \
         -o "$PROJECT_DIR/zygisk/module/zygisk/arm64-v8a.so" \
         -Wl,--gc-sections \
+        -Wl,--exclude-libs,ALL \
         -ldl \
         -llog
 
