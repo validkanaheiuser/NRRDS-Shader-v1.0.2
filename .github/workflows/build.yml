@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,6 +17,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
@@ -44,9 +49,58 @@ jobs:
         chmod +x build.sh
         ./build.sh
 
-    - name: Upload Magisk/KernelSU Module
+    - name: Compute version info
+      id: version
+      run: |
+        VER_CODE=$(git rev-list --count HEAD)
+        VER_NAME="v3.1.${VER_CODE}"
+        echo "ver_code=${VER_CODE}" >> $GITHUB_OUTPUT
+        echo "ver_name=${VER_NAME}" >> $GITHUB_OUTPUT
+
+    - name: Rename module zip with version
+      run: |
+        cp build/audio-bridge-module.zip build/audio-bridge-module-${{ steps.version.outputs.ver_name }}.zip
+
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: audio-bridge-module
-        path: zygisk/module/
+        path: build/audio-bridge-module.zip
         if-no-files-found: error
+
+    - name: Create GitHub Release and update update.json
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        VER_NAME="${{ steps.version.outputs.ver_name }}"
+        VER_CODE="${{ steps.version.outputs.ver_code }}"
+
+        # Delete existing release with same tag if it exists (re-push to same commit count)
+        gh release delete "${VER_NAME}" --yes 2>/dev/null || true
+        git push origin --delete "refs/tags/${VER_NAME}" 2>/dev/null || true
+
+        # Create release and upload zip
+        gh release create "${VER_NAME}" \
+          --title "Audio Bridge ${VER_NAME}" \
+          --notes "Automated build from commit $(git rev-parse --short HEAD)" \
+          "build/audio-bridge-module.zip#audio-bridge-module.zip"
+
+        # Update update.json to point to this release
+        ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${VER_NAME}/audio-bridge-module.zip"
+        CHANGELOG_URL="https://github.com/${{ github.repository }}/releases/tag/${VER_NAME}"
+        cat > update.json << EOF
+        {
+          "version": "${VER_NAME}",
+          "versionCode": ${VER_CODE},
+          "zipUrl": "${ZIP_URL}",
+          "changelog": "${CHANGELOG_URL}"
+        }
+        EOF
+
+        # Commit and push update.json back to main
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add update.json
+        git diff --cached --quiet || git commit -m "chore: update update.json for ${VER_NAME} [skip ci]"
+        git push

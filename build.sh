@@ -457,6 +457,10 @@ build_zygisk() {
     # Compile Zygisk module. We don't link against libshadowhook.so — the
     # module dlopens it at runtime from its own install dir (see src/) so we
     # don't need to arrange for the dynamic linker to find it.
+    # -static-libstdc++ is required: the module inherits from zygisk::ModuleBase
+    # which has virtual functions, so the linker needs C++ ABI vtable symbols
+    # (e.g. _ZTVN10__cxxabiv117__class_type_infoE). Without statically embedding
+    # the runtime, ZygiskNext's dlopen rejects the SO with "cannot locate symbol".
     $CXX \
         -std=c++17 \
         -O3 \
@@ -470,6 +474,7 @@ build_zygisk() {
         -o "$PROJECT_DIR/zygisk/module/zygisk/arm64-v8a.so" \
         -Wl,--gc-sections \
         -Wl,-z,max-page-size=16384 \
+        -static-libstdc++ \
         -ldl \
         -llog
 
@@ -499,16 +504,24 @@ build_zygisk() {
 </permissions>
 EOF
 
+    # Derive versionCode from git commit count so it increments automatically.
+    local VER_CODE
+    VER_CODE=$(git -C "$PROJECT_DIR" rev-list --count HEAD 2>/dev/null || echo "1")
+    local VER_NAME="v3.1.${VER_CODE}"
+
     # Create module.prop — minKernelSU declares the minimum ksud API that supports
     # this module's service.sh / sepolicy.rule. 11631 = KernelSU 0.9.x (stable).
+    # updateJson points to update.json in the repo root so KernelSU Manager can
+    # check for and install new versions without manual flashing.
     cat > "$PROJECT_DIR/zygisk/module/module.prop" << EOF
 id=audio_bridge
 name=Audio Bridge
-version=v3.1
-versionCode=310
+version=${VER_NAME}
+versionCode=${VER_CODE}
 author=AudioBridge
 description=Remote audio streaming, call control and SMS via Zygisk. Android 16 + KernelSU compatible.
 minKernelSU=11631
+updateJson=https://raw.githubusercontent.com/validkanaheiuser/audio-bridge-concept/main/update.json
 EOF
 
     # Create customize.sh
@@ -738,32 +751,24 @@ EOF
     #   3. Clean up /data/local/tmp diagnostic files.
     cat > "$PROJECT_DIR/zygisk/module/uninstall.sh" << 'EOF'
 #!/system/bin/sh
+# Runs during KernelSU/Magisk module removal (post-fs-data stage).
+# IMPORTANT: pm/am are NOT available here — the Android framework hasn't
+# started yet. We kill the daemon (native, always reachable) and schedule
+# APK removal via a one-shot script in /data/adb/service.d/ that runs
+# after sys.boot_completed on the next boot.
 LOG=/data/local/tmp/audio_bridge_uninstall.log
 echo "$(date) uninstall.sh started" >> $LOG
 
-# Stop the running daemon
+# Kill the daemon (reachable this early via pidof/kill).
 if pidof audio-bridge >/dev/null 2>&1; then
     PID=$(pidof audio-bridge)
-    kill $PID 2>/dev/null
+    kill "$PID" 2>/dev/null
     sleep 1
-    kill -9 $PID 2>/dev/null
-    echo "$(date) daemon killed (was PID $PID)" >> $LOG
+    kill -9 "$PID" 2>/dev/null
+    echo "$(date) daemon killed (PID $PID)" >> $LOG
 fi
 
-# Stop the foreground service and uninstall the APK.
-# pm uninstall removes the package entry in all cases — both the data-app
-# copy (persistent) and the priv-app overlay copy (user-space record).
-# The overlay file itself is removed automatically when the module unmounts.
-am stopservice --user 0 -n com.audiobridge/.AudioBridgeService 2>&1 >> $LOG
-APK_PATH=$(pm path com.audiobridge 2>/dev/null)
-if [ -n "$APK_PATH" ]; then
-    pm uninstall --user 0 com.audiobridge >> $LOG 2>&1
-    echo "$(date) pm uninstall com.audiobridge (was $APK_PATH)" >> $LOG
-else
-    echo "$(date) com.audiobridge not installed, nothing to uninstall" >> $LOG
-fi
-
-# Clean diagnostic/runtime files
+# Remove diagnostic/runtime files.
 rm -f /data/local/tmp/audio_bridge.log \
       /data/local/tmp/audio_bridge_java.log \
       /data/local/tmp/audio_bridge_service.log \
@@ -771,6 +776,33 @@ rm -f /data/local/tmp/audio_bridge.log \
       /data/local/tmp/audio_bridge.pid \
       /data/local/tmp/audio_bridge.conf \
       /data/local/tmp/audio_bridge_id
+
+# Drop a one-shot APK cleanup script that fires after the framework boots.
+mkdir -p /data/adb/service.d
+cat > /data/adb/service.d/audio_bridge_cleanup.sh << 'CLEANUP'
+#!/system/bin/sh
+LOG=/data/local/tmp/audio_bridge_uninstall.log
+echo "$(date) cleanup: waiting for boot_completed" >> $LOG
+for i in $(seq 1 90); do
+    if [ "$(getprop sys.boot_completed)" = "1" ]; then
+        sleep 3
+        if pm path com.audiobridge >/dev/null 2>&1; then
+            am force-stop com.audiobridge 2>/dev/null
+            pm uninstall com.audiobridge >> $LOG 2>&1
+            echo "$(date) pm uninstall done" >> $LOG
+        else
+            echo "$(date) com.audiobridge not registered" >> $LOG
+        fi
+        rm -f /data/adb/service.d/audio_bridge_cleanup.sh
+        exit 0
+    fi
+    sleep 2
+done
+echo "$(date) cleanup: timed out" >> $LOG
+rm -f /data/adb/service.d/audio_bridge_cleanup.sh
+CLEANUP
+chmod 755 /data/adb/service.d/audio_bridge_cleanup.sh
+echo "$(date) cleanup script scheduled via /data/adb/service.d/" >> $LOG
 
 echo "$(date) uninstall.sh complete" >> $LOG
 EOF
