@@ -559,13 +559,15 @@ allow platform_app su    unix_stream_socket { connectto read write getattr }
 allow radio      ksu     unix_stream_socket { connectto read write getattr }
 allow radio      magisk  unix_stream_socket { connectto read write getattr }
 allow radio      su      unix_stream_socket { connectto read write getattr }
-# Allow hooked app domains to use the memfd (tmpfs:file) shared with the daemon
+# Allow hooked app domains to use the memfd (tmpfs file) shared with the daemon
 # via SCM_RIGHTS. Without { read write map }, mmap() on the received fd is denied.
-allow priv_app    tmpfs:file { read write open map getattr }
-allow system_app  tmpfs:file { read write open map getattr }
-allow platform_app tmpfs:file { read write open map getattr }
-allow radio       tmpfs:file { read write open map getattr }
-allow phone       tmpfs:file { read write open map getattr }
+# Note: KernelSU/magiskpolicy rule format is "source target class perms" (space-
+# separated), NOT the TE-language "target:class" colon syntax.
+allow priv_app    tmpfs file { read write open map getattr }
+allow system_app  tmpfs file { read write open map getattr }
+allow platform_app tmpfs file { read write open map getattr }
+allow radio       tmpfs file { read write open map getattr }
+allow phone       tmpfs file { read write open map getattr }
 # Allow the app (priv_app) to write its Java-side diag log to /data/local/tmp
 allow priv_app shell_data_file { read write create open append getattr setattr }
 EOF
@@ -610,9 +612,9 @@ if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -
     for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
         apply_rule "allow $APP $D unix_stream_socket { connectto read write getattr }"
     done; done
-    # memfd (tmpfs:file) shared via SCM_RIGHTS — needed for mmap in app processes
+    # memfd (tmpfs file) shared via SCM_RIGHTS — needed for mmap in app processes
     for APP in $APP_DOMAINS phone; do
-        apply_rule "allow $APP tmpfs:file { read write open map getattr }"
+        apply_rule "allow $APP tmpfs file { read write open map getattr }"
     done
     # Allow priv_app to write its Java-side diag log to /data/local/tmp
     apply_rule "allow priv_app shell_data_file { read write create open append getattr setattr }"
