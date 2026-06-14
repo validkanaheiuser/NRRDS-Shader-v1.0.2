@@ -489,7 +489,6 @@ build_zygisk() {
         src/zygisk_module.cpp \
         -o "$PROJECT_DIR/zygisk/module/zygisk/arm64-v8a.so" \
         -Wl,--gc-sections \
-        -Wl,-z,max-page-size=16384 \
         -ldl \
         -llog
 

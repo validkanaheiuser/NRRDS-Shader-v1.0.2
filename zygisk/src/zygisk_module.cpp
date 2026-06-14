@@ -353,7 +353,6 @@ static bool app_should_hook(const char* nice_name) {
         "com.android.phone",
         "com.android.dialer",
         "com.google.android.dialer",
-        "com.android.systemui",
         "org.codeaurora.ims",   // Qualcomm IMS — VoLTE audio path
         "com.qti.phone",        // Qualcomm telephony service
         nullptr,
@@ -374,7 +373,8 @@ static bool load_shadowhook() {
         h = dlopen("libshadowhook.so", RTLD_NOW | RTLD_GLOBAL);
     }
     if (!h) {
-        LOGE("dlopen libshadowhook.so failed: %s", dlerror());
+        const char* dl_err = dlerror();
+        LOGE("dlopen libshadowhook.so failed: %s", dl_err ? dl_err : "(null)");
         return false;
     }
     sh_init          = (shadowhook_init_t)          dlsym(h, "shadowhook_init");
@@ -389,8 +389,8 @@ static bool load_shadowhook() {
     }
     int rc = sh_init(SHADOWHOOK_MODE_SHARED, false);
     if (rc != 0) {
-        const char* msg = sh_to_errmsg ? sh_to_errmsg(rc) : "?";
-        LOGE("shadowhook_init failed: %d (%s)", rc, msg);
+        const char* msg = (sh_to_errmsg ? sh_to_errmsg(rc) : nullptr);
+        LOGE("shadowhook_init failed: %d (%s)", rc, msg ? msg : "?");
         return false;
     }
     LOGI("shadowhook loaded and initialised");
@@ -422,14 +422,14 @@ static bool try_hook(const char* lib, const char* const* syms, void* new_fn, voi
             return true;
         }
         int err = sh_get_errno ? sh_get_errno() : -1;
-        const char* msg = (sh_to_errmsg && err > 0) ? sh_to_errmsg(err) : "?";
         // PENDING (errno==1) means the hook will apply once the lib loads —
         // count that as success too.
         if (err == 1 /* SHADOWHOOK_ERRNO_PENDING */) {
             LOGI("pending hook on %s (lib not loaded yet)", syms[i]);
             return true;
         }
-        LOGW("hook %s failed: %d (%s)", syms[i], err, msg);
+        const char* msg = (sh_to_errmsg && err > 0) ? sh_to_errmsg(err) : nullptr;
+        LOGW("hook %s failed: %d (%s)", syms[i], err, msg ? msg : "?");
     }
     return false;
 }
