@@ -143,27 +143,37 @@ document.addEventListener('DOMContentLoaded', async () => {
             daemonConnection.className   = 'detail-val';
         }
 
-        // Zygisk — ksu.exec() only, no fetch() equivalent
-        const zyRes   = await runCmd(
-            'logcat -b main -d -t 50 -s AudioBridge-Zygisk 2>/dev/null | grep -c "Connected to daemon"'
-        );
-        const zyCount = parseInt(zyRes.stdout || '0', 10);
+        // Zygisk — primary: status.json (service.sh writes zygisk+so fields every 15s)
+        // fallback: ksu.exec logcat query (only available inside KSU Manager WebView)
+        let zyCount  = -1;   // -1 = unknown
+        let soExists = null; // null = unknown
+        if (status !== null && status.zygisk !== undefined) {
+            zyCount  = parseInt(status.zygisk, 10) || 0;
+            soExists = !!status.so;
+        } else {
+            const zyRes = await runCmd(
+                'logcat -b main -d -t 50 -s AudioBridge-Zygisk 2>/dev/null | grep -c "Connected to daemon"'
+            );
+            if (zyRes.errno === 0) {
+                zyCount = parseInt(zyRes.stdout || '0', 10);
+                const soRes = await runCmd(
+                    '[ -f ' + MODDIR + '/zygisk/arm64-v8a.so ] && echo yes || echo no'
+                );
+                soExists = (soRes.stdout || '').includes('yes');
+            }
+        }
         if (zygiskStatus) {
             if (zyCount > 0) {
                 zygiskStatus.textContent = `Active (${zyCount} proc)`;
                 zygiskStatus.style.color = 'var(--success)';
-            } else if (zyRes.errno === 0) {
-                // exec worked; .so present?
-                const soRes  = await runCmd(
-                    '[ -f ' + MODDIR + '/zygisk/arm64-v8a.so ] && echo yes || echo no'
-                );
-                const soExists = (soRes.stdout || '').includes('yes');
-                zygiskStatus.textContent = soExists
-                    ? 'Not loaded (enable Zygisk in KSU)'
-                    : 'Missing .so — rebuild module';
+            } else if (zyCount === 0 && soExists === true) {
+                zygiskStatus.textContent = 'Not loaded — enable Zygisk in KSU';
+                zygiskStatus.style.color = 'var(--danger)';
+            } else if (zyCount === 0 && soExists === false) {
+                zygiskStatus.textContent = 'Missing .so — rebuild module';
                 zygiskStatus.style.color = 'var(--danger)';
             } else {
-                zygiskStatus.textContent = 'ksu.exec unavailable';
+                zygiskStatus.textContent = 'Unknown (status.json not ready)';
                 zygiskStatus.style.color = '';
             }
         }

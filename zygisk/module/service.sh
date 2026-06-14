@@ -157,14 +157,16 @@ fi
         H=$(grep '^HOST='  /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
         PR=$(grep '^PORT=' /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
         TK=$(grep '^TOKEN=' /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
+        ZY=$(logcat -b main -d -t 100 -s AudioBridge-Zygisk 2>/dev/null | grep -c "Connected to daemon" || echo 0)
+        SO=0; [ -f "$MODDIR/zygisk/arm64-v8a.so" ] && SO=1
         if [ -n "$P" ] && [ -d "/proc/$P" ]; then
             C=$(grep -aE "Connected to server!|Disconnected,|No server configured" \
                 /data/local/tmp/audio_bridge.log 2>/dev/null | tail -1 | sed 's/"/'"'"'/g')
-            printf '{"running":true,"pid":"%s","conn":"%s","host":"%s","port":"%s","token":"%s"}\n' \
-                "$P" "$C" "$H" "$PR" "$TK" > "$WROOT/status.json" 2>/dev/null
+            printf '{"running":true,"pid":"%s","conn":"%s","host":"%s","port":"%s","token":"%s","zygisk":%s,"so":%s}\n' \
+                "$P" "$C" "$H" "$PR" "$TK" "$ZY" "$SO" > "$WROOT/status.json" 2>/dev/null
         else
-            printf '{"running":false,"pid":"","conn":"","host":"%s","port":"%s","token":"%s"}\n' \
-                "$H" "$PR" "$TK" > "$WROOT/status.json" 2>/dev/null
+            printf '{"running":false,"pid":"","conn":"","host":"%s","port":"%s","token":"%s","zygisk":%s,"so":%s}\n' \
+                "$H" "$PR" "$TK" "$ZY" "$SO" > "$WROOT/status.json" 2>/dev/null
         fi
         tail -n 60 /data/local/tmp/audio_bridge.log \
             > "$WROOT/daemon.log" 2>/dev/null

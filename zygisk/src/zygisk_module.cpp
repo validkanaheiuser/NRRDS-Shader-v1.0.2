@@ -1,5 +1,4 @@
 #include <jni.h>
-#include <string>
 #include <atomic>
 #include <algorithm>
 #include <sys/socket.h>
@@ -8,11 +7,17 @@
 #include <sys/stat.h>
 #include <dlfcn.h>
 #include <android/log.h>
-#include <chrono>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
-#include <thread>
+#include <pthread.h>
 #include "zygisk.hpp"
+
+static inline uint64_t steady_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 // shadowhook (bytedance/android-inline-hook) — dlopen'd at runtime from the
 // module's own install dir. We only need a couple of its symbols, so we
@@ -218,9 +223,7 @@ static ssize_t hooked_audio_record_read(void* thiz, void* buffer, size_t size, b
     // real microphone samples never land in the app's buffer. Anything we
     // don't have in the SHM ring becomes silence, not leaked HW audio.
 
-    g_shm->last_activity.store(
-        std::chrono::steady_clock::now().time_since_epoch().count(),
-        std::memory_order_relaxed);
+    g_shm->last_activity.store(steady_ns(), std::memory_order_relaxed);
     g_shm->audio_capturing.store(true, std::memory_order_relaxed);
 
     int16_t* out = static_cast<int16_t*>(buffer);
@@ -284,8 +287,7 @@ static void push_speaker_samples(const int16_t* in, size_t samples) {
             pushed = samples;
         }
 
-        frame.timestamp =
-            std::chrono::steady_clock::now().time_since_epoch().count();
+        frame.timestamp = steady_ns();
         frame.flags = 0;
         g_shm->speaker_write_idx.store((write_idx + 1) % (RING_SIZE * 2),
                                        std::memory_order_release);
@@ -569,7 +571,9 @@ public:
             LOGE("No inline hooks installed — audio injection disabled");
         }
 
-        std::thread(connect_to_daemon_loop).detach();
+        pthread_t t;
+        pthread_create(&t, nullptr, [](void*) -> void* { connect_to_daemon_loop(); return nullptr; }, nullptr);
+        pthread_detach(t);
     }
 
 private:
