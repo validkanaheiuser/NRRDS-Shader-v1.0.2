@@ -1321,24 +1321,51 @@ done:
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// tinyalsa voice call mic injection
-// Scans /proc/asound/pcm for the voice call PCM device (Qualcomm VoiceMMode /
-// Voice Call), then writes virtual-mic samples from the SHM ring into the
-// ALSA uplink so the remote party hears server-injected audio.
-// This is best-effort: on Android 16 the HAL owns the device exclusively and
-// pcm_open() may return EBUSY — the thread logs the failure and exits cleanly.
+// Voice call audio: in-call capture and mic injection via tinyalsa.
+//
+// CAPTURE: Sets "MultiMedia9 Mixer VOC_REC_DL/UL" (SM6150/trinket), opens
+//          the corresponding PCM device for capture, upsamples to 48 kHz,
+//          and feeds g_java_pcm_queue (same drain path as Java AudioCapture).
+//
+// INJECT:  Tries "VoiceMMode1 HOST TX PLAYBACK" (HPCM, true mic replacement)
+//          first; falls back to INCALL_MUSIC_UPLINK (dev 27 on SM6150) with
+//          the "Incall_Music Audio Mixer MultiMedia2" control.  Both paths
+//          replace what the far end hears on SM6150/trinket.
+//
+// Both threads gate on g_call_state == CALL_OFFHOOK and wait 500 ms for the
+// ADSP voice path to initialise before opening any PCM device.
 // ──────────────────────────────────────────────────────────────────────────
-static int find_voice_pcm_dev(int card) {
+
+// Set every element of a named ALSA mixer control to an integer value.
+// Returns true if the control was found and all elements were set successfully.
+static bool set_mixer_ctl_uint(int card, const char* ctl_name, unsigned int value) {
+    struct mixer* mix = mixer_open(card);
+    if (!mix) return false;
+    struct mixer_ctl* ctl = mixer_get_ctl_by_name(mix, ctl_name);
+    if (!ctl) { mixer_close(mix); return false; }
+    bool ok = true;
+    int n = mixer_ctl_get_num_values(ctl);
+    for (int i = 0; i < n; i++) {
+        if (mixer_ctl_set_value(ctl, i, (int)value) != 0) ok = false;
+    }
+    mixer_close(mix);
+    if (ok) LOGI("mixer: '%s' = %u", ctl_name, value);
+    else    LOGW("mixer: '%s' = %u FAILED", ctl_name, value);
+    return ok;
+}
+
+// Scan /proc/asound/pcm for the first entry on 'card' whose line contains 'substr'.
+// Returns device number or -1.
+static int find_pcm_dev_by_name(int card, const char* substr) {
     FILE* f = fopen("/proc/asound/pcm", "r");
     if (!f) return -1;
     char line[256];
     int result = -1;
     while (fgets(line, sizeof(line), f) && result < 0) {
-        if (strstr(line, "Voice") || strstr(line, "voice") ||
-            strstr(line, "Incall") || strstr(line, "incall")) {
+        if (strstr(line, substr)) {
             int c = -1, d = -1;
             if (sscanf(line, "%d-%d:", &c, &d) == 2 && c == card) {
-                LOGI("tinyalsa: found voice PCM card=%d dev=%d (%s)", c, d, line);
+                LOGI("alsa: '%s' found at card=%d dev=%d", substr, c, d);
                 result = d;
             }
         }
@@ -1347,56 +1374,215 @@ static int find_voice_pcm_dev(int card) {
     return result;
 }
 
-static void tinyalsa_mic_inject_thread() {
-    int voice_dev = find_voice_pcm_dev(0);
-    if (voice_dev < 0) {
-        LOGW("tinyalsa mic inject: no voice call PCM found in /proc/asound/pcm");
-        return;
+// Log the full contents of /proc/asound/pcm to aid debugging on unfamiliar devices.
+static void dump_asound_pcm() {
+    FILE* f = fopen("/proc/asound/pcm", "r");
+    if (!f) { LOGW("incall: /proc/asound/pcm unavailable"); return; }
+    LOGI("incall: /proc/asound/pcm contents:");
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len > 0) LOGI("  %s", line);
     }
+    fclose(f);
+}
 
-    struct pcm_config cfg = {};
-    cfg.channels    = 1;
-    cfg.rate        = (unsigned)SAMPLE_RATE;
-    cfg.period_size = (unsigned)FRAME_SAMPLES;
-    cfg.period_count = 4;
-    cfg.format      = PCM_FORMAT_S16_LE;
-
-    struct pcm* pcm_out = pcm_open(0, (unsigned)voice_dev, PCM_OUT, &cfg);
-    if (!pcm_out || !pcm_is_ready(pcm_out)) {
-        LOGW("tinyalsa mic inject: pcm_open(card=0 dev=%d PCM_OUT) failed: %s",
-             voice_dev, pcm_out ? pcm_get_error(pcm_out) : "null");
-        if (pcm_out) pcm_close(pcm_out);
-        return;
+// Spin-poll until g_call_state reaches CALL_OFFHOOK (active call) or until
+// g_running / g_connected clears.  Returns true when a call is active.
+static bool wait_for_active_call() {
+    while (g_running.load() && g_connected.load()) {
+        if (g_call_state.load(std::memory_order_acquire) == CALL_OFFHOOK) return true;
+        usleep(200000);
     }
-    LOGI("tinyalsa mic inject: PCM open ok (card=0 dev=%d)", voice_dev);
+    return false;
+}
 
-    auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-    int16_t silence[FRAME_SAMPLES] = {};
-    uint64_t frames_written = 0;
+static void tinyalsa_incall_capture_thread() {
+    while (g_running.load() && g_connected.load()) {
+        if (!wait_for_active_call()) return;
+        usleep(500000);  // 500 ms: let HAL establish the voice DSP path
+        if (!g_running.load() || !g_connected.load()) return;
+        if (g_call_state.load() != CALL_OFFHOOK) continue;
 
-    while (g_running && g_connected) {
-        uint32_t write_idx = layout->write_index.load(std::memory_order_acquire);
-        uint32_t read_idx  = layout->read_index.load(std::memory_order_acquire);
+        dump_asound_pcm();
+        // SM6150/trinket uses MultiMedia9 (ALSA dev 8); fall back to MultiMedia1 (dev 0).
+        bool dl9 = set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_DL", 1);
+        bool ul9 = set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_UL", 1);
+        bool dl1 = false, ul1 = false;
+        int cap_dev = -1;
 
-        const int16_t* src;
-        if (write_idx != read_idx) {
-            src = layout->mic_frames[read_idx % SHM_RING_SIZE].data;
-            layout->read_index.store((read_idx + 1) % (SHM_RING_SIZE * 2),
-                                     std::memory_order_release);
+        if (dl9 || ul9) {
+            cap_dev = 8;
         } else {
-            // No data yet — write silence to keep the stream alive.
-            src = silence;
+            dl1 = set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_DL", 1);
+            ul1 = set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_UL", 1);
+            if (dl1 || ul1) cap_dev = 0;
         }
 
-        if (pcm_write(pcm_out, src, FRAME_SAMPLES * 2) != 0) {
-            LOGW("tinyalsa mic inject: pcm_write failed: %s", pcm_get_error(pcm_out));
-            break;
+        if (cap_dev < 0) {
+            LOGW("incall capture: no VOC_REC mixer controls found — not SM6150/trinket?");
+            sleep(30);
+            continue;
         }
-        frames_written++;
+
+        // Try 8 kHz first (native narrowband voice rate), then 16 kHz (HD Voice).
+        struct pcm_config cfg = {};
+        cfg.channels     = 1;
+        cfg.rate         = 8000;
+        cfg.period_size  = 160;   // 20 ms at 8 kHz
+        cfg.period_count = 4;
+        cfg.format       = PCM_FORMAT_S16_LE;
+
+        struct pcm* pcm_in = pcm_open(0, (unsigned)cap_dev, PCM_IN, &cfg);
+        if (!pcm_in || !pcm_is_ready(pcm_in)) {
+            LOGW("incall capture: pcm_open(dev=%d 8kHz) failed: %s; trying 16kHz",
+                 cap_dev, pcm_in ? pcm_get_error(pcm_in) : "null");
+            if (pcm_in) { pcm_close(pcm_in); pcm_in = nullptr; }
+            cfg.rate = 16000;
+            cfg.period_size = 160;  // 10 ms at 16 kHz
+            pcm_in = pcm_open(0, (unsigned)cap_dev, PCM_IN, &cfg);
+        }
+
+        if (pcm_in && pcm_is_ready(pcm_in)) {
+            LOGI("incall capture: open ok (dev=%d rate=%u)", cap_dev, cfg.rate);
+            // Upsample ratio to reach encoder's SAMPLE_RATE (48000 Hz).
+            const int upsample = (int)(SAMPLE_RATE / (int)cfg.rate);  // 6 for 8k, 3 for 16k
+            std::vector<int16_t> raw(cfg.period_size);
+            uint64_t n_frames = 0;
+
+            while (g_running.load() && g_connected.load() &&
+                   g_call_state.load() == CALL_OFFHOOK) {
+                if (pcm_read(pcm_in, raw.data(), cfg.period_size * 2) != 0) {
+                    LOGW("incall capture: pcm_read failed: %s", pcm_get_error(pcm_in));
+                    break;
+                }
+                n_frames++;
+
+                // Nearest-neighbour upsample: repeat each sample 'upsample' times.
+                // Crude but adequate for voice intelligibility over the network.
+                JavaPcmChunk chunk;
+                chunk.samples.resize(cfg.period_size * upsample);
+                for (int i = 0; i < (int)cfg.period_size; i++) {
+                    for (int j = 0; j < upsample; j++)
+                        chunk.samples[i * upsample + j] = raw[i];
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(g_java_pcm_mutex);
+                    if (g_java_pcm_queue.size() < 10) {
+                        g_java_pcm_queue.push(std::move(chunk));
+                        g_java_pcm_pending = true;
+                        g_java_pcm_cv.notify_one();
+                    }
+                }
+            }
+            pcm_close(pcm_in);
+            LOGI("incall capture: stopped (frames=%llu)", (unsigned long long)n_frames);
+        } else {
+            LOGW("incall capture: pcm_open(dev=%d) failed at both rates: %s",
+                 cap_dev, pcm_in ? pcm_get_error(pcm_in) : "null");
+            if (pcm_in) pcm_close(pcm_in);
+        }
+
+        // Tear down mixer routes so they don't affect non-call recording.
+        if (dl9) set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_DL", 0);
+        if (ul9) set_mixer_ctl_uint(0, "MultiMedia9 Mixer VOC_REC_UL", 0);
+        if (dl1) set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_DL", 0);
+        if (ul1) set_mixer_ctl_uint(0, "MultiMedia1 Mixer VOC_REC_UL", 0);
     }
+}
 
-    pcm_close(pcm_out);
-    LOGI("tinyalsa mic inject exited (frames=%llu)", (unsigned long long)frames_written);
+static void tinyalsa_incall_inject_thread() {
+    while (g_running.load() && g_connected.load()) {
+        if (!wait_for_active_call()) return;
+        usleep(500000);
+        if (!g_running.load() || !g_connected.load()) return;
+        if (g_call_state.load() != CALL_OFFHOOK) continue;
+
+        dump_asound_pcm();
+        // Prefer HPCM TX Playback — true mic replacement (injects into uplink).
+        int inj_dev = find_pcm_dev_by_name(0, "HOST TX PLAYBACK");
+        if (inj_dev < 0) inj_dev = find_pcm_dev_by_name(0, "VoiceMMode1 HOST TX");
+        bool use_hpcm = (inj_dev >= 0);
+        bool set_incall_music = false;
+        unsigned int inj_rate, inj_period;
+
+        if (use_hpcm) {
+            inj_rate   = 16000;
+            inj_period = 160;   // 10 ms at 16 kHz
+        } else {
+            // Fall back to INCALL_MUSIC_UPLINK (VOICE_PLAYBACK_TX, same physical
+            // effect on SM6150: far end hears injected audio).
+            inj_dev = find_pcm_dev_by_name(0, "INCALL_MUSIC");
+            if (inj_dev < 0) inj_dev = find_pcm_dev_by_name(0, "Incall Music");
+            if (inj_dev < 0) {
+                LOGW("incall inject: INCALL_MUSIC not in /proc/asound/pcm — using dev=27");
+                inj_dev = 27;  // SM6150 INCALL_MUSIC_UPLINK_PCM_DEVICE
+            }
+            set_incall_music = set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia2", 1);
+            if (!set_incall_music) {
+                LOGW("incall inject: 'Incall_Music Audio Mixer MultiMedia2' not found; skip");
+                sleep(5);
+                continue;
+            }
+            inj_rate   = 8000;
+            inj_period = 160;   // 20 ms at 8 kHz
+        }
+
+        struct pcm_config cfg = {};
+        cfg.channels     = 1;
+        cfg.rate         = inj_rate;
+        cfg.period_size  = inj_period;
+        cfg.period_count = 4;
+        cfg.format       = PCM_FORMAT_S16_LE;
+
+        struct pcm* pcm_out = pcm_open(0, (unsigned)inj_dev, PCM_OUT, &cfg);
+        if (!pcm_out || !pcm_is_ready(pcm_out)) {
+            LOGW("incall inject: pcm_open(dev=%d rate=%u) failed: %s",
+                 inj_dev, inj_rate, pcm_out ? pcm_get_error(pcm_out) : "null");
+            if (pcm_out) pcm_close(pcm_out);
+            if (set_incall_music)
+                set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia2", 0);
+            sleep(5);
+            continue;
+        }
+        LOGI("incall inject: open ok (dev=%d rate=%u hpcm=%d)", inj_dev, inj_rate, use_hpcm);
+
+        auto* layout = (SharedMemoryLayout*)g_shm_ptr;
+        // SHM mic frames are at SAMPLE_RATE (48000 Hz).  Decimate to inj_rate.
+        const int ratio = (int)(SAMPLE_RATE / (int)inj_rate);  // 3 for 16k, 6 for 8k
+        std::vector<int16_t> out_buf(inj_period, 0);
+        uint64_t n_frames = 0;
+
+        while (g_running.load() && g_connected.load() &&
+               g_call_state.load() == CALL_OFFHOOK) {
+            uint32_t widx = layout->write_index.load(std::memory_order_acquire);
+            uint32_t ridx = layout->read_index.load(std::memory_order_acquire);
+
+            if (widx != ridx) {
+                const int16_t* src = layout->mic_frames[ridx % SHM_RING_SIZE].data;
+                for (int i = 0; i < (int)inj_period && i * ratio < FRAME_SAMPLES; i++)
+                    out_buf[i] = src[i * ratio];
+                layout->read_index.store((ridx + 1) % (SHM_RING_SIZE * 2),
+                                         std::memory_order_release);
+            } else {
+                // No server audio yet — write silence to keep the stream alive.
+                std::fill(out_buf.begin(), out_buf.end(), int16_t{0});
+            }
+
+            if (pcm_write(pcm_out, out_buf.data(), inj_period * 2) != 0) {
+                LOGW("incall inject: pcm_write failed: %s", pcm_get_error(pcm_out));
+                break;
+            }
+            n_frames++;
+        }
+
+        pcm_close(pcm_out);
+        if (set_incall_music)
+            set_mixer_ctl_uint(0, "Incall_Music Audio Mixer MultiMedia2", 0);
+        LOGI("incall inject: stopped (frames=%llu)", (unsigned long long)n_frames);
+    }
 }
 
 static void unix_socket_server_thread() {
@@ -1673,8 +1859,8 @@ int main(int argc, char** argv) {
         std::thread status_thread(status_sender_thread, &g_net);
         std::thread speaker_thread(capture_speaker_thread, &g_net);
         std::thread mic_thread(receive_virtual_mic_thread, &g_net);
-        // Try tinyalsa mic injection in parallel (no-op if HAL owns the device).
-        std::thread tinyalsa_thread(tinyalsa_mic_inject_thread);
+        std::thread tinyalsa_cap_thread(tinyalsa_incall_capture_thread);
+        std::thread tinyalsa_inj_thread(tinyalsa_incall_inject_thread);
         
         // Connection watchdog: periodically send ping to detect dead connections
         while(g_running && g_connected) {
@@ -1693,7 +1879,8 @@ int main(int argc, char** argv) {
         status_thread.join();
         speaker_thread.join();
         mic_thread.join();
-        tinyalsa_thread.join();
+        tinyalsa_cap_thread.join();
+        tinyalsa_inj_thread.join();
         
         tcp_cleanup();
         g_connected = false;
