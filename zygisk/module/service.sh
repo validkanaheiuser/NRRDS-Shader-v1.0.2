@@ -59,11 +59,9 @@ fi
 # Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
 # KernelSU when service.sh runs at boot. $MODDIR is always a real directory.
 DAEMON_BIN=""
-if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
-    chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
-    DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
-elif [ -f /system/bin/audio-bridge ]; then
-    DAEMON_BIN="/system/bin/audio-bridge"
+if [ -f "$MODDIR/files/audio-bridge" ]; then
+    chmod 755 "$MODDIR/files/audio-bridge" 2>/dev/null
+    DAEMON_BIN="$MODDIR/files/audio-bridge"
 fi
 
 start_daemon() {

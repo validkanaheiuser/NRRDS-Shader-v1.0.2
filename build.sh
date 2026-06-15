@@ -496,7 +496,16 @@ EOF
     # Create customize.sh
     cat > "$PROJECT_DIR/zygisk/module/customize.sh" << 'EOF'
 ui_print "- Installing Audio Bridge"
-ui_print "- Android 14 Compatible"
+ui_print "- Android 16 + KernelSU compatible"
+# Remove stale Zygisk .so from previous builds.
+# KernelSU may overlay-extract (not replace) the module directory on update,
+# leaving behind a zygisk/arm64-v8a.so from older versions. If ZygiskNext sees
+# that .so it tries to load it into zygote, which crashes before tombstoned
+# starts — silent bootloop at the logo. Wipe it unconditionally.
+rm -rf "$MODPATH/zygisk" 2>/dev/null
+# Also clean the already-installed location in case this is an update.
+rm -rf "/data/adb/modules/audio_bridge/zygisk" 2>/dev/null
+ui_print "  Cleaned up legacy Zygisk components"
 EOF
 
     # Create sepolicy.rule for every (app, daemon) domain pair we might hit.
