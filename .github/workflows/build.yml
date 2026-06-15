@@ -45,6 +45,9 @@ jobs:
         gradle-version: '8.1.1'
 
     - name: Build Module
+      env:
+        AUDIO_BRIDGE_KEYSTORE_B64: ${{ secrets.AUDIO_BRIDGE_KEYSTORE_B64 }}
+        AUDIO_BRIDGE_KEYSTORE_PASS: ${{ secrets.AUDIO_BRIDGE_KEYSTORE_PASS }}
       run: |
         chmod +x build.sh
         ./build.sh

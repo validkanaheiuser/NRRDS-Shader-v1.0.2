@@ -337,10 +337,22 @@ EOF
             echo -e "${RED}gradle wrapper bootstrap failed${NC}"
     fi
 
-    # Generate a release keystore if none exists.
+    # Resolve keystore. Priority:
+    #   1. AUDIO_BRIDGE_KEYSTORE_B64 env var (CI secret, base64-encoded) → decode it
+    #   2. AUDIO_BRIDGE_KEYSTORE path env var pointing to an existing file
+    #   3. Generate a fresh keystore (produces a NEW signature each time — only safe
+    #      for first installs; pm install -r will fail if the device already has the
+    #      APK signed with a different key from a previous fresh-generated keystore)
+    #
+    # To fix the keystore across CI runs, add AUDIO_BRIDGE_KEYSTORE_B64 as a GitHub
+    # Actions secret:  base64 -w0 audiobridge.keystore | xclip (then paste in repo settings)
     local KEYSTORE_PATH="${AUDIO_BRIDGE_KEYSTORE:-$PROJECT_DIR/app/audiobridge.keystore}"
     local KEYSTORE_PASS="${AUDIO_BRIDGE_KEYSTORE_PASS:-audiobridge}"
     local KEYSTORE_ALIAS="${AUDIO_BRIDGE_KEYSTORE_ALIAS:-audiobridge}"
+    if [ -n "${AUDIO_BRIDGE_KEYSTORE_B64:-}" ]; then
+        echo -e "${YELLOW}Decoding keystore from AUDIO_BRIDGE_KEYSTORE_B64...${NC}"
+        echo "$AUDIO_BRIDGE_KEYSTORE_B64" | base64 -d > "$KEYSTORE_PATH"
+    fi
     if [ ! -f "$KEYSTORE_PATH" ]; then
         echo -e "${YELLOW}Generating signing keystore: $KEYSTORE_PATH${NC}"
         keytool -genkeypair -noprompt \
@@ -491,37 +503,14 @@ build_zygisk() {
         -Wl,--gc-sections \
         -Wl,-z,max-page-size=16384 \
         -ldl \
-        -llog
+        -llog \
+        -static-libstdc++
 
     # Ship libshadowhook.so alongside our zygisk module
     cp "$LIBS_DIR/arm64-v8a/libshadowhook.so" "$PROJECT_DIR/zygisk/module/zygisk/"
     
-    # Package into Magisk Module
-    mkdir -p "$PROJECT_DIR/zygisk/module/system/priv-app/AudioBridge"
-    mkdir -p "$PROJECT_DIR/zygisk/module/system/etc/permissions"
-    mkdir -p "$PROJECT_DIR/zygisk/module/system/bin"
-    
-    # Create privapp-permissions.xml
-    cat > "$PROJECT_DIR/zygisk/module/system/etc/permissions/privapp-permissions-audiobridge.xml" << 'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<permissions>
-    <privapp-permissions package="com.audiobridge">
-        <permission name="android.permission.CALL_PHONE"/>
-        <permission name="android.permission.ANSWER_PHONE_CALLS"/>
-        <permission name="android.permission.READ_PHONE_STATE"/>
-        <permission name="android.permission.READ_PRECISE_PHONE_STATE"/>
-        <permission name="android.permission.READ_CALL_LOG"/>
-        <permission name="android.permission.SEND_SMS"/>
-        <permission name="android.permission.RECEIVE_SMS"/>
-        <permission name="android.permission.READ_SMS"/>
-        <permission name="android.permission.SYSTEM_ALERT_WINDOW"/>
-        <!-- Required for AudioSource.VOICE_CALL (captures both sides of a cellular call).
-             Cannot be granted via pm grant — must be allowlisted here for priv-apps. -->
-        <permission name="android.permission.CAPTURE_AUDIO_OUTPUT"/>
-        <permission name="android.permission.RECORD_AUDIO"/>
-    </privapp-permissions>
-</permissions>
-EOF
+    # Package into Magisk Module — use files/ (safe: no /files on Android root)
+    mkdir -p "$PROJECT_DIR/zygisk/module/files"
 
     # Derive versionCode from git commit count so it increments automatically.
     local VER_CODE
@@ -546,7 +535,13 @@ EOF
     # Create customize.sh
     cat > "$PROJECT_DIR/zygisk/module/customize.sh" << 'EOF'
 ui_print "- Installing Audio Bridge"
-ui_print "- Android 14 Compatible"
+ui_print "  Cleaning up stale files from previous versions..."
+# Remove directories that survive overlay-extract updates but are no longer shipped.
+rm -rf "$MODPATH/zygisk" 2>/dev/null
+rm -rf "/data/adb/modules/audio_bridge/zygisk" 2>/dev/null
+rm -rf "$MODPATH/system/priv-app" 2>/dev/null
+rm -rf "$MODPATH/system/bin" 2>/dev/null
+rm -rf "$MODPATH/system/etc" 2>/dev/null
 EOF
 
     # Create sepolicy.rule for every (app, daemon) domain pair we might hit.
@@ -613,11 +608,12 @@ apply_rule() {
     if command -v magiskpolicy >/dev/null 2>&1; then
         magiskpolicy --live "$RULE" 2>/dev/null
     elif [ -f /data/adb/ksud ]; then
-        /data/adb/ksud apply-sepolicy "$RULE" 2>/dev/null
+        /data/adb/ksud sepolicy patch "$RULE" 2>/dev/null
     elif command -v supolicy >/dev/null 2>&1; then
         supolicy --live "$RULE" 2>/dev/null
     fi
 }
+(
 if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -v supolicy >/dev/null 2>&1; then
     # Unix socket: allow app domains to connect to daemon domains
     for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
@@ -633,16 +629,13 @@ if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -
 else
     echo "$(date) WARNING: no sepolicy tool found" >> $LOG
 fi
+) &
 
-# Locate daemon binary once — used in every branch below.
-# Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
-# KernelSU when service.sh runs at boot. $MODDIR is always a real directory.
+# Locate daemon binary.
 DAEMON_BIN=""
-if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
-    chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
-    DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
-elif [ -f /system/bin/audio-bridge ]; then
-    DAEMON_BIN="/system/bin/audio-bridge"
+if [ -f "$MODDIR/files/audio-bridge" ]; then
+    chmod 755 "$MODDIR/files/audio-bridge" 2>/dev/null
+    DAEMON_BIN="$MODDIR/files/audio-bridge"
 fi
 
 start_daemon() {
@@ -890,14 +883,13 @@ main() {
     #      restrictive ROMs or when signing requirements differ).
     APK_PATH=$(find "$PROJECT_DIR/app/build/outputs/apk" -name "*.apk" 2>/dev/null | head -n 1)
     if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
-        cp "$APK_PATH" "$PROJECT_DIR/zygisk/module/system/priv-app/AudioBridge/AudioBridge.apk"
         cp "$APK_PATH" "$PROJECT_DIR/zygisk/module/AudioBridge.apk"
         echo -e "${GREEN}Packaged APK: $APK_PATH${NC}"
     else
-        echo -e "${RED}Warning: APK not found! Module will not be fully functional until APK is placed in zygisk/module/system/priv-app/AudioBridge/${NC}"
+        echo -e "${RED}Warning: APK not found! service.sh will install it on first boot via pm install.${NC}"
     fi
-    
-    cp "$BUILD_DIR/audio-bridge-arm64-v8a" "$PROJECT_DIR/zygisk/module/system/bin/audio-bridge"
+
+    cp "$BUILD_DIR/audio-bridge-arm64-v8a" "$PROJECT_DIR/zygisk/module/files/audio-bridge"
     
     # Zip module
     cd "$PROJECT_DIR/zygisk/module"
