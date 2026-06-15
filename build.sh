@@ -466,10 +466,12 @@ build_zygisk() {
     # framework is up — identical crash to the one Magisk/priv-app modules hit).
     # privapp-permissions-audiobridge.xml compounds this. Both are removed.
     #
-    # The daemon binary is stored in $MODDIR/bin/ (not system/bin/) so the
-    # system/ overlay is completely absent — nothing for KSU to mount early.
-    # All permissions are granted dynamically by service.sh after boot_completed.
-    mkdir -p "$PROJECT_DIR/zygisk/module/bin"
+    # The daemon binary is stored in $MODDIR/files/ — NOT bin/ or system/bin/.
+    # KernelSU-Next mounts ANY module directory whose name matches a path reachable
+    # from the root filesystem as a system overlay. On Android, /bin → /system/bin,
+    # so a module-level bin/ directory would replace ALL system binaries with just
+    # our audio-bridge binary, causing an immediate bootloop. Use a neutral name.
+    mkdir -p "$PROJECT_DIR/zygisk/module/files"
 
     # Derive versionCode from git commit count so it increments automatically.
     local VER_CODE
@@ -601,9 +603,9 @@ fi
 # Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
 # KernelSU when service.sh runs at boot. $MODDIR is always a real directory.
 DAEMON_BIN=""
-if [ -f "$MODDIR/bin/audio-bridge" ]; then
-    chmod 755 "$MODDIR/bin/audio-bridge" 2>/dev/null
-    DAEMON_BIN="$MODDIR/bin/audio-bridge"
+if [ -f "$MODDIR/files/audio-bridge" ]; then
+    chmod 755 "$MODDIR/files/audio-bridge" 2>/dev/null
+    DAEMON_BIN="$MODDIR/files/audio-bridge"
 fi
 
 start_daemon() {
@@ -867,10 +869,10 @@ main() {
         cp "$APK_PATH" "$PROJECT_DIR/zygisk/module/AudioBridge.apk"
         echo -e "${GREEN}Packaged APK: $APK_PATH${NC}"
     else
-        echo -e "${RED}Warning: APK not found! Build the APK first and place it in zygisk/module/AudioBridge.apk${NC}"
+        echo -e "${RED}Warning: APK not found! Build the APK first and place it at zygisk/module/AudioBridge.apk${NC}"
     fi
 
-    cp "$BUILD_DIR/audio-bridge-arm64-v8a" "$PROJECT_DIR/zygisk/module/bin/audio-bridge"
+    cp "$BUILD_DIR/audio-bridge-arm64-v8a" "$PROJECT_DIR/zygisk/module/files/audio-bridge"
     
     # Zip module
     cd "$PROJECT_DIR/zygisk/module"
