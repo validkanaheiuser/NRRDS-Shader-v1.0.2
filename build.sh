@@ -536,9 +536,8 @@ EOF
     cat > "$PROJECT_DIR/zygisk/module/customize.sh" << 'EOF'
 ui_print "- Installing Audio Bridge"
 ui_print "  Cleaning up stale files from previous versions..."
-# Remove directories that survive overlay-extract updates but are no longer shipped.
-rm -rf "$MODPATH/zygisk" 2>/dev/null
-rm -rf "/data/adb/modules/audio_bridge/zygisk" 2>/dev/null
+# Remove directories that were in old builds but are absent from this one.
+# DO NOT touch zygisk/ — that directory IS in this build and must survive.
 rm -rf "$MODPATH/system/priv-app" 2>/dev/null
 rm -rf "$MODPATH/system/bin" 2>/dev/null
 rm -rf "$MODPATH/system/etc" 2>/dev/null
