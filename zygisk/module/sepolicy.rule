@@ -1,35 +1,27 @@
-allow priv_app   ksu     unix_stream_socket { connectto read write getattr }
-allow priv_app   magisk  unix_stream_socket { connectto read write getattr }
-allow priv_app   su      unix_stream_socket { connectto read write getattr }
-allow priv_app   init    unix_stream_socket { connectto read write getattr }
-allow system_app ksu     unix_stream_socket { connectto read write getattr }
-allow system_app magisk  unix_stream_socket { connectto read write getattr }
-allow system_app su      unix_stream_socket { connectto read write getattr }
-allow platform_app ksu   unix_stream_socket { connectto read write getattr }
+# Unix socket: allow app/telephony domains to connect to root daemon socket.
+# KernelSU daemon runs in ksu domain. magisk/su included for Magisk compatibility
+# (KernelSU skips unknown domain names safely, so these are harmless on KSU).
+allow priv_app     ksu    unix_stream_socket { connectto read write getattr }
+allow priv_app     magisk unix_stream_socket { connectto read write getattr }
+allow priv_app     su     unix_stream_socket { connectto read write getattr }
+allow priv_app     init   unix_stream_socket { connectto read write getattr }
+allow system_app   ksu    unix_stream_socket { connectto read write getattr }
+allow system_app   magisk unix_stream_socket { connectto read write getattr }
+allow system_app   su     unix_stream_socket { connectto read write getattr }
+allow platform_app ksu    unix_stream_socket { connectto read write getattr }
 allow platform_app magisk unix_stream_socket { connectto read write getattr }
-allow platform_app su    unix_stream_socket { connectto read write getattr }
-allow radio      ksu     unix_stream_socket { connectto read write getattr }
-allow radio      magisk  unix_stream_socket { connectto read write getattr }
-allow radio      su      unix_stream_socket { connectto read write getattr }
-# Qualcomm IMS/VoLTE processes (vendor_qtelephony domain)
+allow platform_app su     unix_stream_socket { connectto read write getattr }
+allow radio        ksu    unix_stream_socket { connectto read write getattr }
+allow radio        magisk unix_stream_socket { connectto read write getattr }
+allow radio        su     unix_stream_socket { connectto read write getattr }
+# Qualcomm IMS/VoLTE (vendor_qtelephony exists on Snapdragon vendor partition)
 allow vendor_qtelephony ksu    unix_stream_socket { connectto read write getattr }
 allow vendor_qtelephony magisk unix_stream_socket { connectto read write getattr }
 allow vendor_qtelephony su     unix_stream_socket { connectto read write getattr }
 allow vendor_qtelephony init   unix_stream_socket { connectto read write getattr }
-# SHM via ashmem_device_file (chr_file): preferred over memfd because AOSP base
-# policy already allows app domains to map ashmem, avoiding the tmpfs neverallow.
-allow priv_app         ashmem_device_file chr_file { read write open map getattr ioctl }
-allow system_app       ashmem_device_file chr_file { read write open map getattr ioctl }
-allow platform_app     ashmem_device_file chr_file { read write open map getattr ioctl }
-allow radio            ashmem_device_file chr_file { read write open map getattr ioctl }
-allow phone            ashmem_device_file chr_file { read write open map getattr ioctl }
-allow vendor_qtelephony ashmem_device_file chr_file { read write open map getattr ioctl }
-# Fallback: tmpfs rules for memfd SHM (may be blocked by GKI neverallow on some kernels)
-allow priv_app    tmpfs file { read write open map getattr }
-allow system_app  tmpfs file { read write open map getattr }
-allow platform_app tmpfs file { read write open map getattr }
-allow radio       tmpfs file { read write open map getattr }
-allow phone       tmpfs file { read write open map getattr }
-allow vendor_qtelephony tmpfs file { read write open map getattr }
-# Allow the app (priv_app) to write its Java-side diag log to /data/local/tmp
+# Allow priv_app to write its Java-side diag log to /data/local/tmp
 allow priv_app shell_data_file { read write create open append getattr setattr }
+# NOTE: ashmem_device_file and tmpfs rules removed — ashmem_device_file type does
+# not exist in Android 12+ SELinux policy (removed with /dev/ashmem), and tmpfs
+# rules violate GKI neverallows. Either causes policy compile failure at early boot
+# on Android 14-16, producing a silent logo bootloop with no tombstone.

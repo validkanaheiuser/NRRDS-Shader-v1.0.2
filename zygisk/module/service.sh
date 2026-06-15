@@ -20,40 +20,32 @@ pm grant com.audiobridge android.permission.RECORD_AUDIO 2>/dev/null
 appops set com.audiobridge RECORD_AUDIO allow 2>/dev/null
 appops set com.audiobridge SYSTEM_ALERT_WINDOW allow 2>/dev/null
 
-# Apply SELinux rules. sepolicy.rule is read by Magisk/KernelSU on boot; this
-# is the belt to that file's suspenders. Rules cover every (app, daemon)
-# domain pair we might hit.
-APP_DOMAINS="priv_app system_app platform_app radio vendor_qtelephony"
-DAEMON_DOMAINS="ksu magisk su init"
-apply_rule() {
-    local RULE="$1"
-    if command -v magiskpolicy >/dev/null 2>&1; then
-        magiskpolicy --live "$RULE" 2>/dev/null
-    elif [ -f /data/adb/ksud ]; then
-        /data/adb/ksud sepolicy patch "$RULE" 2>/dev/null
-    elif command -v supolicy >/dev/null 2>&1; then
-        supolicy --live "$RULE" 2>/dev/null
+# Apply SELinux rules in the background. ~30 ksud sepolicy patch calls at
+# top level would block service.sh for several seconds; backgrounding them
+# avoids slowing boot.
+(
+    APP_DOMAINS="priv_app system_app platform_app radio vendor_qtelephony"
+    DAEMON_DOMAINS="ksu magisk su init"
+    apply_rule() {
+        local RULE="$1"
+        if command -v magiskpolicy >/dev/null 2>&1; then
+            magiskpolicy --live "$RULE" 2>/dev/null
+        elif [ -f /data/adb/ksud ]; then
+            /data/adb/ksud sepolicy patch "$RULE" 2>/dev/null
+        elif command -v supolicy >/dev/null 2>&1; then
+            supolicy --live "$RULE" 2>/dev/null
+        fi
+    }
+    if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -v supolicy >/dev/null 2>&1; then
+        for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
+            apply_rule "allow $APP $D unix_stream_socket { connectto read write getattr }"
+        done; done
+        apply_rule "allow priv_app shell_data_file { read write create open append getattr setattr }"
+        echo "$(date) SELinux runtime patch applied" >> $LOG
+    else
+        echo "$(date) WARNING: no sepolicy tool found" >> $LOG
     fi
-}
-if command -v magiskpolicy >/dev/null 2>&1 || [ -f /data/adb/ksud ] || command -v supolicy >/dev/null 2>&1; then
-    # Unix socket: allow app domains to connect to daemon domains
-    for APP in $APP_DOMAINS; do for D in $DAEMON_DOMAINS; do
-        apply_rule "allow $APP $D unix_stream_socket { connectto read write getattr }"
-    done; done
-    # ashmem_device_file (preferred SHM type — avoids tmpfs neverallow on GKI kernels)
-    for APP in $APP_DOMAINS phone; do
-        apply_rule "allow $APP ashmem_device_file chr_file { read write open map getattr ioctl }"
-    done
-    # tmpfs fallback
-    for APP in $APP_DOMAINS phone; do
-        apply_rule "allow $APP tmpfs file { read write open map getattr }"
-    done
-    # Allow priv_app to write its Java-side diag log to /data/local/tmp
-    apply_rule "allow priv_app shell_data_file { read write create open append getattr setattr }"
-    echo "$(date) SELinux rules applied" >> $LOG
-else
-    echo "$(date) WARNING: no sepolicy tool found" >> $LOG
-fi
+) &
 
 # Locate daemon binary once — used in every branch below.
 # Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
@@ -67,12 +59,12 @@ fi
 start_daemon() {
     echo "$(date) Launching: $DAEMON_BIN" >> $LOG
     "$DAEMON_BIN" --daemon >> $LOG 2>&1 &
-    sleep 3
-    if pidof audio-bridge >/dev/null 2>&1; then
-        echo "$(date) Daemon started OK, PID=$(pidof audio-bridge)" >> $LOG
-    else
-        echo "$(date) WARNING: Daemon failed to start — check SELinux or binary integrity" >> $LOG
-    fi
+    ( sleep 3
+      if pidof audio-bridge >/dev/null 2>&1; then
+          echo "$(date) Daemon started OK, PID=$(pidof audio-bridge)" >> $LOG
+      else
+          echo "$(date) WARNING: Daemon failed to start — check SELinux or binary integrity" >> $LOG
+      fi ) &
 }
 
 if [ -z "$DAEMON_BIN" ]; then
@@ -98,22 +90,6 @@ else
         echo "$(date) Daemon already running, PID=$(pidof audio-bridge)" >> $LOG
     fi
 fi
-
-# Background: brief SELinux permissive window after boot so Zygisk modules
-# can mmap the ashmem/SHM fd. ksud sepolicy patch is unreliable on GKI kernels
-# that enforce neverallows at policy-load time. A 4-second window covers 8
-# retry cycles (modules retry every 500 ms) — enough for all hooked processes.
-(
-    for _i in $(seq 1 60); do
-        [ "$(getprop sys.boot_completed)" = "1" ] && break
-        sleep 2
-    done
-    sleep 6
-    setenforce 0 2>/dev/null
-    sleep 4
-    setenforce 1 2>/dev/null
-    echo "$(date) SELinux permissive window closed" >> $LOG
-) &
 
 # Background: wait for the framework, install APK if needed, start service.
 (
