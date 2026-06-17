@@ -474,7 +474,20 @@ build_zygisk() {
     # Compile Zygisk module. We don't link against libshadowhook.so — the
     # module dlopens it at runtime from its own install dir (see src/) so we
     # don't need to arrange for the dynamic linker to find it.
-    # Match the flags from 5ec1cff/zygisk-module-template:
+    #
+    # CRITICAL: DO NOT use -static-libstdc++ here.
+    # NDK 29's libc++_static.a introduces TLS relocations (R_AARCH64_TLS_TPREL/
+    # R_AARCH64_TLS_IE) via its locale/locale_id startup code even when our code
+    # never references those symbols directly.  ZygiskNext's restricted linker
+    # inside zygote rejects ANY TLS relocation with "tls relocation is unsupported"
+    # → zygote crashes → init restart loop → bootloop at the Xiaomi splash screen,
+    # before surfaceflinger, with no tombstone.
+    # -nostdlib++ is the correct flag: it omits the C++ runtime library entirely
+    # while still allowing the header-only features we use (std::atomic via
+    # ARM64 inline LDXR/STXR builtins, std::min as inline template).
+    # operator new/delete used by REGISTER_ZYGISK_MODULE comes from bionic libc.so,
+    # which IS in zygote's namespace, so no runtime linkage is needed.
+    #
     #   -fno-rtti             eliminates _ZTVN10__cxxabiv117__class_type_infoE and
     #                         other RTTI vtable symbols that ZygiskNext's linker
     #                         cannot resolve inside zygote's namespace.
@@ -504,7 +517,7 @@ build_zygisk() {
         -Wl,-z,max-page-size=16384 \
         -ldl \
         -llog \
-        -static-libstdc++
+        -nostdlib++
 
     # Ship libshadowhook.so alongside our zygisk module
     cp "$LIBS_DIR/arm64-v8a/libshadowhook.so" "$PROJECT_DIR/zygisk/module/zygisk/"

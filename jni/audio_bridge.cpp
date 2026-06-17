@@ -346,6 +346,13 @@ static std::map<std::string, SimpleJson> g_sms_tracking;
 static std::mutex              g_log_mutex;
 static FILE*                   g_log_file = nullptr;
 
+// Serialises the two mic-ring consumers (tinyalsa_mic_inject_thread and
+// receive_virtual_mic_thread's Zygisk path) that both advance read_index.
+// The cross-process race with the Zygisk module itself cannot be fixed with
+// a mutex; it is accepted as best-effort (tinyalsa exits early on Android 16
+// when the HAL owns the PCM device exclusively).
+static std::mutex              g_mic_consumer_mutex;
+
 static std::atomic<int>        g_java_fd{-1};
 
 // TLS State
@@ -932,8 +939,10 @@ static void status_sender_thread(mbedtls_net_context* net) {
         
         if(has_status && g_connected) {
             // Route SMS events to T_SMS; everything else (call state, errors) to T_CALL_STATUS.
+            // JNI callbacks produce "type":"sms_received" / "type":"sms_status" — check "type",
+            // not "event" (which never appears in any callback output).
             uint8_t frame_type = T_CALL_STATUS;
-            if (json_str.find("\"event\":\"sms") != std::string::npos) {
+            if (json_str.find("\"type\":\"sms") != std::string::npos) {
                 frame_type = T_SMS;
             }
             if(send_frame(net, frame_type, json_str.c_str(), json_str.length())) {
@@ -1083,7 +1092,10 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
         // Only oversize is fatal. Zero-length is legitimate for T_PONG and
         // similar keepalive replies — treating it as fatal was disconnecting
         // the daemon 10s after connect (the watchdog ping cadence).
-        if(len > MAX_PKT) break;
+        // Use >= so that len == MAX_PKT is also rejected: the T_CONTROL handler
+        // writes pkt.data()[len] = '\0' to null-terminate, which is a one-byte
+        // out-of-bounds write when len == MAX_PKT (vector capacity is MAX_PKT).
+        if(len >= MAX_PKT) break;
         if(len > 0 && !recv_all(net, pkt.data(), len)) break;
 
         // Server-originated keepalive: daemon sends T_PING from the watchdog,
@@ -1346,18 +1358,29 @@ static void tinyalsa_mic_inject_thread() {
     int16_t silence[FRAME_SAMPLES] = {};
     uint64_t frames_written = 0;
 
+    int16_t frame_copy[FRAME_SAMPLES];
     while (g_running && g_connected) {
-        uint32_t write_idx = layout->write_index.load(std::memory_order_acquire);
-        uint32_t read_idx  = layout->read_index.load(std::memory_order_acquire);
-
         const int16_t* src;
-        if (write_idx != read_idx) {
-            src = layout->mic_frames[read_idx % SHM_RING_SIZE].data;
-            layout->read_index.store((read_idx + 1) % (SHM_RING_SIZE * 2),
-                                     std::memory_order_release);
-        } else {
-            // No data yet — write silence to keep the stream alive.
-            src = silence;
+        {
+            // g_mic_consumer_mutex serialises this thread against any other
+            // in-daemon reader that also advances read_index (currently none,
+            // but guards against future additions).  The cross-process race
+            // with the Zygisk module's pull_mic_samples() is accepted as
+            // best-effort: tinyalsa exits early on Android 16 when the HAL
+            // owns the PCM device exclusively, so both consumers are rarely
+            // active simultaneously.
+            std::lock_guard<std::mutex> lk(g_mic_consumer_mutex);
+            uint32_t write_idx = layout->write_index.load(std::memory_order_acquire);
+            uint32_t read_idx  = layout->read_index.load(std::memory_order_acquire);
+            if (write_idx != read_idx) {
+                memcpy(frame_copy, layout->mic_frames[read_idx % SHM_RING_SIZE].data,
+                       FRAME_SAMPLES * 2);
+                layout->read_index.store((read_idx + 1) % (SHM_RING_SIZE * 2),
+                                         std::memory_order_release);
+                src = frame_copy;
+            } else {
+                src = silence;
+            }
         }
 
         if (pcm_write(pcm_out, src, FRAME_SAMPLES * 2) != 0) {
@@ -1421,26 +1444,35 @@ static void unix_socket_server_thread() {
             cmd[n] = '\0';
             
             if(strcmp(cmd, "GET_SHM_FD") == 0) {
+                if (g_shm_fd < 0) {
+                    // Anonymous mmap fallback — fd is invalid, cannot share via SCM_RIGHTS.
+                    // Sending fd=-1 would cause sendmsg to silently drop the cmsg,
+                    // leaving the Zygisk module unable to mmap and spinning forever.
+                    send(client_fd, "NO_FD", 5, 0);
+                    LOGW("GET_SHM_FD: SHM is anonymous mmap (no fd) — Zygisk injection unavailable");
+                    close(client_fd);
+                } else {
                 struct msghdr msg = {};
                 char buf[CMSG_SPACE(sizeof(int))];
                 memset(buf, 0, sizeof(buf));
-                
+
                 struct iovec io = { .iov_base = (void*)"OK", .iov_len = 2 };
                 msg.msg_iov = &io;
                 msg.msg_iovlen = 1;
                 msg.msg_control = buf;
                 msg.msg_controllen = sizeof(buf);
-                
+
                 struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
                 cmsg->cmsg_level = SOL_SOCKET;
                 cmsg->cmsg_type = SCM_RIGHTS;
                 cmsg->cmsg_len = CMSG_LEN(sizeof(int));
                 *(int*)CMSG_DATA(cmsg) = g_shm_fd;
-                
+
                 sendmsg(client_fd, &msg, 0);
                 layout->module_active = true;
                 LOGI("Shared memory FD sent to Zygisk module");
                 close(client_fd);
+                }
             } else if(strcmp(cmd, "PING") == 0) {
                 send(client_fd, "PONG", 4, 0);
                 close(client_fd);
@@ -1551,6 +1583,7 @@ int main(int argc, char** argv) {
     }
     
     // Setup signal handlers
+    signal(SIGPIPE, SIG_IGN);   // prevent silent kill when server closes TCP connection mid-write
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);

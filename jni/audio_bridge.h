@@ -32,7 +32,10 @@ static const int FRAME_SAMPLES    = (SAMPLE_RATE * FRAME_MS / 1000); // 960
 static const int FRAME_BYTES      = FRAME_SAMPLES * sizeof(int16_t);
 static const int MAX_PKT          = 4000;
 static const int JITTER_FRAMES    = 3;
-static const int SHM_RING_SIZE    = 8;   // 8 × 20 ms = 160 ms max buffer (was 64 → 1280 ms)
+// Must match the SHM_RING_SIZE defined in audio_bridge.cpp (64) and RING_SIZE
+// in zygisk_module.cpp (64).  All three files define the constant independently
+// to avoid include-order coupling; keep them in sync manually.
+static const int SHM_RING_SIZE    = 64;
 static const int SHM_SIZE         = 1024 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────────

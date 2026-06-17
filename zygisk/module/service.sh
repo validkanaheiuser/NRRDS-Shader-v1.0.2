@@ -47,15 +47,12 @@ else
     echo "$(date) WARNING: no sepolicy tool found" >> $LOG
 fi
 
-# Locate daemon binary once — used in every branch below.
-# Prefer $MODDIR path: the /system/bin overlay may not be visible yet on
-# KernelSU when service.sh runs at boot. $MODDIR is always a real directory.
+# Locate daemon binary. Stored in files/ (not overlaid into /system/bin so
+# it cannot shadow a real system binary or be deleted by customize.sh cleanup).
 DAEMON_BIN=""
-if [ -f "$MODDIR/system/bin/audio-bridge" ]; then
-    chmod 755 "$MODDIR/system/bin/audio-bridge" 2>/dev/null
-    DAEMON_BIN="$MODDIR/system/bin/audio-bridge"
-elif [ -f /system/bin/audio-bridge ]; then
-    DAEMON_BIN="/system/bin/audio-bridge"
+if [ -f "$MODDIR/files/audio-bridge" ]; then
+    chmod 755 "$MODDIR/files/audio-bridge" 2>/dev/null
+    DAEMON_BIN="$MODDIR/files/audio-bridge"
 fi
 
 start_daemon() {

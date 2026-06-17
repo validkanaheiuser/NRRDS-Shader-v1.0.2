@@ -81,7 +81,15 @@ target_include_directories(zygisk_module PRIVATE
 
 target_link_libraries(zygisk_module
     log
-    c++_static
+    # Do NOT link c++_static / c++_shared here.
+    # NDK 29's libc++_static introduces TLS relocations that ZygiskNext's
+    # restricted linker inside zygote cannot handle → zygote crash → bootloop.
+    # All C++ features used by this module (std::atomic, std::min) are
+    # header-only on ARM64; operator new/delete come from bionic libc.so.
 )
 
-target_compile_options(zygisk_module PRIVATE -O3 -fPIC)
+target_compile_options(zygisk_module PRIVATE
+    -O3 -fPIC
+    -fno-exceptions -fno-rtti -fno-threadsafe-statics
+    -fvisibility=hidden -fvisibility-inlines-hidden
+)
