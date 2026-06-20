@@ -1,8 +1,5 @@
-#!/usr/bin/env node
-'use strict';
-
 /**
- * Audio Bridge Server v4.0 — Node.js
+ * Audio Bridge Server v4.0 - Node.js
  *
  * Wire protocol (port 59100):
  *   handshake: newline-terminated JSON + HMAC-SHA256
@@ -34,7 +31,8 @@ const T_SMS         = 5;
 const T_PING        = 6;
 const T_PONG        = 7;
 
-const AUTH_TOKEN = process.env.AUDIO_BRIDGE_TOKEN    || 'default_secure_token_123';
+const AUTH_TOKEN = process.env.AUDIO_BRIDGE_TOKEN;
+if (!AUTH_TOKEN) throw new Error('AUDIO_BRIDGE_TOKEN environment variable is required');
 const TCP_PORT   = parseInt(process.env.AUDIO_BRIDGE_TCP_PORT  || '59100', 10);
 const HTTP_PORT  = parseInt(process.env.AUDIO_BRIDGE_HTTP_PORT || '8000',  10);
 
@@ -56,7 +54,7 @@ try {
     _opusLib = 'opusscript';
     info('Opus: opusscript');
   } catch (_2) {
-    warn('No Opus library — audio bridging disabled');
+    warn('No Opus library - audio bridging disabled');
     warn('  npm install @discordjs/opus   (requires build tools)');
     warn('  npm install opusscript        (WebAssembly, no build needed)');
   }
@@ -174,7 +172,7 @@ class FrameReader {
   }
 }
 
-// ── UIListener — one browser audio connection (speaker → client) ──────────────
+// ── UIListener - one browser audio connection (speaker → client) ──────────────
 class UIListener {
   constructor(rate) {
     this.rate    = rate;
@@ -206,7 +204,7 @@ class UIListener {
   }
 }
 
-// ── MicUploader — accumulates browser PCM into 20ms frames for the phone ──────
+// ── MicUploader - accumulates browser PCM into 20ms frames for the phone ──────
 class MicUploader {
   constructor(hub, srcRate) {
     this.hub     = hub;
@@ -224,7 +222,7 @@ class MicUploader {
   }
 }
 
-// ── AudioHub — per-device fanout (speaker → listeners, mic → phone) ───────────
+// ── AudioHub - per-device fanout (speaker → listeners, mic → phone) ───────────
 class AudioHub {
   constructor() {
     this._down     = new OpusCodec(64000); // decode phone speaker
@@ -398,16 +396,14 @@ function handshake(socket) {
       let info;
       try { info = JSON.parse(line); } catch (e) { return reject(e); }
 
-      const devId   = info.id   || '';
-      const date    = info.date || '';
+      const devId   = info.id    || '';
+      const date    = info.date  || '';
+      const nonce   = info.nonce || '';
       const recvMac = (info.hmac || '').toLowerCase();
       const wantMac = crypto.createHmac('sha256', AUTH_TOKEN)
-        .update(`${devId}-${date}`).digest('hex');
+        .update(`${devId}-${date}-${nonce}`).digest('hex');
 
-      // timingSafeEqual requires same-length buffers
-      const a = Buffer.from(wantMac), b = Buffer.alloc(a.length, 0);
-      Buffer.from(recvMac).copy(b, 0, 0, Math.min(recvMac.length, a.length));
-      if (!crypto.timingSafeEqual(a, b) || recvMac !== wantMac) {
+      if (!crypto.timingSafeEqual(Buffer.from(recvMac), Buffer.from(wantMac))) {
         return reject(new Error('invalid hmac'));
       }
       resolve({ info, rest });
@@ -433,7 +429,7 @@ async function handleDevice(socket) {
     try {
       ({ info, rest } = await handshake(socket));
     } catch (e) {
-      warn('Handshake failed from', addr, '—', e.message);
+      warn('Handshake failed from', addr, '-', e.message);
       try { socket.write(`{"status":"error","msg":"${e.message}"}\n`); } catch (_) {}
       socket.destroy();
       return;
