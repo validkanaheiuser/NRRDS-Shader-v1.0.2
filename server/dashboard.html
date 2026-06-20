@@ -15,6 +15,7 @@
   --accent:#efefef; --accent-fg:#000;
   --chip:#181818; --chip-hi:#202020; --inp:#0c0c0c;
   --danger:#f55; --good:#4d4; --warn:#fb3;
+  --sim-badge-bg:#1e3a5f; --sim-badge-color:#93c5fd;
 }
 [data-theme="light"] {
   --bg:#f3f3f3; --card:#fff; --card2:#fafafa;
@@ -23,6 +24,7 @@
   --accent:#111; --accent-fg:#fff;
   --chip:#eee; --chip-hi:#e5e5e5; --inp:#f0f0f0;
   --danger:#d33; --good:#090; --warn:#a60;
+  --sim-badge-bg:#dbeafe; --sim-badge-color:#1d4ed8;
 }
 
 [v-cloak]{display:none;}
@@ -30,6 +32,14 @@
 html,body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
 body{min-height:100vh;padding:1.5rem 1.25rem 5rem;}
 .wrap{max-width:1340px;margin:0 auto;}
+
+/* ── Token gate ── */
+.token-gate{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem;}
+.token-box{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:2.5rem 2rem;max-width:420px;width:100%;text-align:center;}
+.token-box h2{font-size:1.25rem;font-weight:700;margin-bottom:.4rem;}
+.token-box p{font-size:.82rem;color:var(--muted);margin-bottom:1.5rem;}
+.token-box input{margin-bottom:.75rem;font-family:'JetBrains Mono',monospace;font-size:.82rem;}
+.token-err{font-size:.75rem;color:var(--danger);margin-top:.45rem;}
 
 /* ── Header ── */
 .hdr{display:flex;align-items:center;gap:.75rem;margin-bottom:1.5rem;}
@@ -42,12 +52,14 @@ body{min-height:100vh;padding:1.5rem 1.25rem 5rem;}
 .conn-pill.online .conn-dot{background:var(--good);box-shadow:0 0 5px var(--good);}
 .conn-pill.online{border-color:rgba(68,221,68,.2);}
 .conn-pill.offline .conn-dot{background:var(--danger);}
+.conn-pill.authfail .conn-dot{background:var(--warn);}
+.conn-pill.authfail{border-color:rgba(255,187,51,.3);color:var(--warn);}
 .ibtn{width:34px;height:34px;border-radius:8px;background:var(--card);border:1px solid var(--border);cursor:pointer;display:grid;place-items:center;color:var(--dim);transition:all .15s;}
 .ibtn:hover{background:var(--chip);color:var(--text);}
 .ibtn svg{width:15px;height:15px;}
 
 /* ── Layout ── */
-.grid3{display:grid;grid-template-columns:210px 1fr 270px;gap:.85rem;margin-bottom:.85rem;align-items:start;}
+.grid3{display:grid;grid-template-columns:210px 1fr 310px;gap:.85rem;margin-bottom:.85rem;align-items:start;}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.1rem;}
 .card+.card{margin-top:.75rem;}
 .card.full{grid-column:1/-1;}
@@ -91,6 +103,32 @@ body{min-height:100vh;padding:1.5rem 1.25rem 5rem;}
 .hist-item:hover{background:var(--chip-hi);}
 .hist-num{font-size:.78rem;font-weight:600;}
 .hist-meta{font-size:.65rem;color:var(--muted);margin-top:.08rem;}
+
+/* ── Device info panel ── */
+.dinfo-row{display:flex;justify-content:space-between;align-items:baseline;padding:.22rem 0;border-bottom:1px solid var(--border);font-size:.77rem;}
+.dinfo-row:last-child{border-bottom:none;}
+.dinfo-key{color:var(--muted);font-size:.68rem;min-width:80px;}
+.dinfo-val{color:var(--text);text-align:right;font-family:'JetBrains Mono',monospace;font-size:.72rem;word-break:break-all;}
+
+/* ── Battery + signal row ── */
+.status-row{display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;margin-bottom:.5rem;}
+.batt-chip{font-size:.73rem;padding:.18rem .5rem;background:var(--chip);border:1px solid var(--border);border-radius:7px;display:flex;align-items:center;gap:.28rem;}
+.batt-chip.charging{border-color:rgba(255,187,51,.28);color:var(--warn);}
+.sig-chip{font-size:.7rem;padding:.18rem .5rem;background:var(--chip);border:1px solid var(--border);border-radius:7px;display:flex;align-items:center;gap:.3rem;}
+.sig-bars{display:inline-flex;align-items:flex-end;gap:1.5px;height:12px;vertical-align:middle;}
+.sig-bar{width:3px;border-radius:1px;}
+
+/* ── SIM list ── */
+.sim-list{display:flex;flex-direction:column;gap:.3rem;margin-top:.5rem;}
+.sim-row{display:flex;align-items:center;gap:.45rem;font-size:.75rem;padding:.3rem .45rem;background:var(--chip);border-radius:7px;}
+.sim-badge{font-size:.65rem;padding:.1rem .38rem;border-radius:999px;background:var(--sim-badge-bg);color:var(--sim-badge-color);font-weight:600;flex-shrink:0;}
+.sim-carrier{font-weight:500;}
+.sim-num{color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:.68rem;margin-left:auto;}
+
+/* ── SIM filter ── */
+select{width:100%;background:var(--inp);border:1px solid transparent;border-radius:8px;padding:.52rem .72rem;color:var(--text);font-family:inherit;font-size:.83rem;outline:none;cursor:pointer;transition:border-color .15s;}
+select:focus{border-color:var(--bhi);}
+select option{background:var(--card);color:var(--text);}
 
 /* ── Call panel ── */
 .call-num-display{font-size:1.85rem;font-weight:700;letter-spacing:.02em;min-height:2.6rem;display:flex;align-items:center;justify-content:center;padding:.4rem .5rem;transition:all .2s;word-break:break-all;}
@@ -163,16 +201,14 @@ input:not([type="range"]):focus,textarea:focus{border-color:var(--bhi);}
 input::placeholder,textarea::placeholder{color:var(--muted);}
 textarea{resize:vertical;min-height:70px;font-size:.78rem;}
 
-/* ── SMS threads ── */
-.threads{display:flex;flex-direction:column;gap:.3rem;max-height:290px;overflow-y:auto;padding-right:.1rem;}
-.thread{padding:.5rem .65rem;border:1px solid var(--border);border-radius:9px;background:var(--chip);cursor:pointer;transition:all .15s;}
-.thread:hover{background:var(--chip-hi);}
-.thread.unread{border-color:rgba(255,187,51,.22);}
-.th-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:.18rem;}
-.th-from{font-size:.76rem;font-weight:600;}
-.th-ts{font-size:.63rem;color:var(--muted);}
-.th-preview{font-size:.74rem;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.th-badge{font-size:.58rem;padding:.08rem .32rem;border-radius:999px;background:rgba(255,187,51,.15);color:var(--warn);font-weight:700;margin-right:.25rem;}
+/* ── SMS feed (flat list, newest first) ── */
+.sms-feed{display:flex;flex-direction:column;gap:.4rem;max-height:340px;overflow-y:auto;padding-right:.1rem;}
+.sms-item{padding:.55rem .7rem;border:1px solid var(--border);border-radius:10px;background:var(--chip);}
+.sms-hdr{display:flex;align-items:center;gap:.4rem;margin-bottom:.25rem;flex-wrap:wrap;}
+.sms-sim{font-size:.62rem;padding:.08rem .38rem;border-radius:999px;background:var(--sim-badge-bg);color:var(--sim-badge-color);font-weight:600;flex-shrink:0;}
+.sms-from{font-size:.76rem;font-weight:600;}
+.sms-ts{font-size:.63rem;color:var(--muted);margin-left:auto;}
+.sms-body{font-size:.77rem;color:var(--dim);line-height:1.5;word-break:break-word;}
 .inbox-empty{color:var(--muted);font-size:.8rem;padding:.9rem;text-align:center;}
 
 /* ── Log ── */
@@ -204,7 +240,7 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
 
 /* ── Responsive ── */
 @media(max-width:960px){.grid3{grid-template-columns:1fr;}body{padding:1rem .75rem 4rem;}}
-@media(min-width:961px) and (max-width:1140px){.grid3{grid-template-columns:180px 1fr 240px;}}
+@media(min-width:961px) and (max-width:1180px){.grid3{grid-template-columns:180px 1fr 260px;}}
 </style>
 </head>
 <body data-theme="dark">
@@ -218,7 +254,24 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
   </div>
 </div>
 
-<div class="wrap">
+<!-- Token gate -->
+<div v-if="!token" class="token-gate">
+  <div class="token-box">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:36px;height:36px;color:#555;margin-bottom:1rem;">
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+      <line x1="12" y1="19" x2="12" y2="22"/>
+    </svg>
+    <h2>audio bridge</h2>
+    <p>Enter your access token to connect. The token will be stored in the URL hash and never sent to the server in logs.</p>
+    <input v-model="tokenInput" type="password" placeholder="paste token here" @keydown.enter="submitToken" autofocus>
+    <div class="brow"><button class="bp" @click="submitToken">connect</button></div>
+    <div v-if="tokenErr" class="token-err">{{ tokenErr }}</div>
+  </div>
+</div>
+
+<!-- Main app -->
+<div v-else class="wrap">
 
 <!-- Header -->
 <header class="hdr">
@@ -234,15 +287,18 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
     <p>{{ headerSub }}</p>
   </div>
   <div class="hdr-right">
-    <div class="conn-pill" :class="connected ? 'online' : 'offline'">
+    <div class="conn-pill" :class="connClass">
       <span class="conn-dot"></span>
-      <span>{{ connected ? 'online' : 'offline' }}</span>
+      <span>{{ connLabel }}</span>
     </div>
     <button class="ibtn" @click="toggleTheme" title="toggle theme">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <template v-if="theme === 'dark'"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></template>
         <template v-else><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></template>
       </svg>
+    </button>
+    <button class="ibtn" @click="clearToken" title="change token">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
     </button>
   </div>
 </header>
@@ -310,8 +366,8 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
       <div v-if="callPanel === 'idle'" key="idle">
         <div class="call-num-display" :class="{ph: !phoneNum}">{{ phoneNum || 'enter number' }}</div>
         <div class="brow" style="margin-bottom:.5rem;">
-          <button @click="delChar" style="flex:0;padding:.52rem .75rem;">⌫</button>
-          <button @click="phoneNum = ''" style="flex:0;padding:.52rem .75rem;">✕</button>
+          <button @click="delChar" style="flex:0;padding:.52rem .75rem;">&#x232B;</button>
+          <button @click="phoneNum = ''" style="flex:0;padding:.52rem .75rem;">&#x2715;</button>
           <button v-if="callHistory.length" @click="dialNumber(callHistory[0].number)" style="flex:0;padding:.52rem .7rem;font-size:.75rem;">redial</button>
         </div>
         <div class="dialpad">
@@ -328,7 +384,7 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
       <!-- DIALING -->
       <div v-else-if="callPanel === 'dialing'" key="dialing" class="cs-center">
         <div class="cs-tag">calling</div>
-        <div class="cs-num">{{ selectedDevice?.call?.number || '—' }}</div>
+        <div class="cs-num">{{ selectedDevice?.call?.number || '&#x2014;' }}</div>
         <div class="cs-sub" style="color:var(--warn)">ringing<span class="anim-dots"></span></div>
         <div class="brow"><button class="bd" @click="hangup">cancel call</button></div>
       </div>
@@ -347,7 +403,7 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
       <!-- RINGING outgoing -->
       <div v-else-if="callPanel === 'ringing-out'" key="ringing-out" class="cs-center">
         <div class="cs-tag">ringing</div>
-        <div class="cs-num">{{ selectedDevice?.call?.number || '—' }}</div>
+        <div class="cs-num">{{ selectedDevice?.call?.number || '&#x2014;' }}</div>
         <div class="cs-sub" style="color:var(--warn)">waiting for answer<span class="anim-dots"></span></div>
         <div class="brow"><button class="bd" @click="hangup">cancel</button></div>
       </div>
@@ -396,8 +452,79 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
     </transition>
   </div><!-- end center -->
 
-  <!-- RIGHT: SMS -->
+  <!-- RIGHT: Device info + SIM filter + SMS -->
   <div>
+
+    <!-- Device info panel -->
+    <div v-if="selectedDevice" class="card">
+      <div class="lbl">device info</div>
+
+      <!-- Battery + signal status row -->
+      <div v-if="selectedDevice.device_status && (selectedDevice.device_status.battery_pct != null || selectedDevice.device_status.sims)" class="status-row">
+        <div v-if="selectedDevice.device_status.battery_pct != null"
+             class="batt-chip"
+             :class="{charging: selectedDevice.device_status.charging}">
+          <span>&#x1F50B;</span>
+          <span>{{ selectedDevice.device_status.battery_pct }}%</span>
+          <span v-if="selectedDevice.device_status.charging">&#x26A1;</span>
+        </div>
+        <div v-for="(sim, idx) in (selectedDevice.device_status.sims || [])" :key="idx" class="sig-chip">
+          <span class="sig-bars">
+            <span v-for="b in 4" :key="b" class="sig-bar"
+              :style="{
+                height: (b * 3) + 'px',
+                background: sigBarColor(sim.signal_level, b)
+              }"></span>
+          </span>
+          <span style="font-size:.68rem;">SIM{{ sim.slot != null ? sim.slot + 1 : idx + 1 }}</span>
+          <span v-if="sim.network_type" style="font-size:.63rem;color:var(--muted);">{{ sim.network_type }}</span>
+        </div>
+      </div>
+
+      <!-- Manufacturer + model -->
+      <div class="dinfo-row" v-if="selectedDevice.device_info?.manufacturer || selectedDevice.brand || selectedDevice.device_info?.model">
+        <span class="dinfo-key">device</span>
+        <span class="dinfo-val">{{ selectedDevice.device_info?.manufacturer || selectedDevice.brand || '' }} {{ selectedDevice.device_info?.model || selectedDevice.name || '' }}</span>
+      </div>
+      <!-- Android version + SDK -->
+      <div class="dinfo-row" v-if="selectedDevice.device_info?.android_version || selectedDevice.android">
+        <span class="dinfo-key">android</span>
+        <span class="dinfo-val">{{ selectedDevice.device_info?.android_version || selectedDevice.android }}{{ selectedDevice.device_info?.sdk ? ' · SDK ' + selectedDevice.device_info.sdk : '' }}</span>
+      </div>
+      <!-- ROM (Build.DISPLAY) -->
+      <div class="dinfo-row" v-if="selectedDevice.device_info?.build_display">
+        <span class="dinfo-key">ROM</span>
+        <span class="dinfo-val">{{ selectedDevice.device_info.build_display }}</span>
+      </div>
+
+      <!-- SIM list -->
+      <div v-if="(selectedDevice.device_info?.sims || []).length" style="margin-top:.55rem;">
+        <div class="lbl" style="margin-bottom:.35rem;">SIMs</div>
+        <div class="sim-list">
+          <div v-for="(sim, idx) in (selectedDevice.device_info.sims || [])" :key="idx" class="sim-row">
+            <span class="sim-badge">SIM {{ (sim.slot != null ? sim.slot : idx) + 1 }}</span>
+            <span class="sim-carrier">{{ sim.carrier || sim.operator || 'unknown' }}</span>
+            <span class="sim-num">{{ sim.number || sim.phone_number || '' }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SIM filter -->
+    <div v-if="selectedDevice" class="card">
+      <div class="lbl">SIM filter</div>
+      <div class="fld">
+        <label>accept incoming calls on</label>
+        <select v-model="simFilter" @change="applySimFilter">
+          <option value="all">Accept all SIMs</option>
+          <option value="0">SIM 1 only</option>
+          <option value="1">SIM 2 only</option>
+          <option value="none">Reject all</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Send SMS -->
     <div class="card">
       <div class="lbl">send sms</div>
       <div class="fld">
@@ -413,25 +540,26 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
       </div>
     </div>
 
+    <!-- SMS feed -->
     <div class="card">
       <div style="display:flex;align-items:center;margin-bottom:.75rem;">
         <span class="lbl" style="margin-bottom:0;">messages</span>
-        <span v-if="threads.length" style="font-size:.67rem;color:var(--muted);margin-left:.38rem;">({{ threads.length }})</span>
-        <button v-if="threads.length" @click="clearSms" style="flex:0;padding:.2rem .42rem;font-size:.66rem;margin-left:auto;">clear</button>
+        <span v-if="smsFeed.length" style="font-size:.67rem;color:var(--muted);margin-left:.38rem;">({{ smsFeed.length }})</span>
+        <button v-if="smsFeed.length" @click="clearSms" style="flex:0;padding:.2rem .42rem;font-size:.66rem;margin-left:auto;">clear</button>
       </div>
-      <div class="threads">
-        <div v-if="!threads.length" class="inbox-empty">no messages yet</div>
-        <div v-for="t in threads" :key="t.from" class="thread" :class="{unread: t.unread}" @click="openThread(t)">
-          <div class="th-hdr">
-            <span class="th-from">
-              <span v-if="t.unread" class="th-badge">new</span>{{ t.from }}
-            </span>
-            <span class="th-ts">{{ fmtClock(t.lastTs) }}</span>
+      <div class="sms-feed">
+        <div v-if="!smsFeed.length" class="inbox-empty">no messages yet</div>
+        <div v-for="(m, i) in smsFeed" :key="i" class="sms-item">
+          <div class="sms-hdr">
+            <span class="sms-sim">{{ m.simLabel }}</span>
+            <span class="sms-from">{{ m.from }}</span>
+            <span class="sms-ts">{{ fmtClock(m.ts) }}</span>
           </div>
-          <div class="th-preview">{{ t.lastMsg }}</div>
+          <div class="sms-body" v-html="m.bodyHtml"></div>
         </div>
       </div>
     </div>
+
   </div><!-- end right -->
 
 </div><!-- end grid3 -->
@@ -452,11 +580,49 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
 <script>
 const { createApp, ref, computed, reactive, watch, nextTick, onMounted, onUnmounted } = Vue;
 
+// ── XSS escape ────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 createApp({
   setup() {
+    // ── Token handling ────────────────────────────────────────────
+    // Token stored in URL hash (#token=XXX) — not in path/query (avoids server logs).
+    const hashParams = new URLSearchParams(window.location.hash.slice(1));
+    const token      = ref(hashParams.get('token') || '');
+    const tokenInput = ref('');
+    const tokenErr   = ref('');
+
+    function submitToken() {
+      const t = tokenInput.value.trim();
+      if (!t) { tokenErr.value = 'token is required'; return; }
+      token.value = t;
+      // Store in hash so page reloads keep it without hitting server logs
+      window.location.hash = 'token=' + encodeURIComponent(t);
+      tokenErr.value = '';
+      // Start connection now that we have a token
+      nextTick(connectWS);
+    }
+
+    function clearToken() {
+      token.value = '';
+      tokenInput.value = '';
+      window.location.hash = '';
+      if (ws) { try { ws.close(); } catch(_) {} ws = null; }
+      connected.value = false;
+      authFailed.value = false;
+    }
+
     // ── Reactive state ────────────────────────────────────────────
     const theme      = ref(localStorage.getItem('ab-theme') || 'dark');
     const connected  = ref(false);
+    const authFailed = ref(false);
     const devices    = ref([]);
     const selectedId = ref(null);
     const phoneNum   = ref('');
@@ -475,7 +641,8 @@ createApp({
     const newCName   = ref('');
     const newCNum    = ref('');
     const callHistory = ref(JSON.parse(localStorage.getItem('ab-callhist') || '[]'));
-    const smsThreads = ref({});  // { [from]: { from, lastMsg, lastTs, unread } }
+    const smsFeed    = ref([]);   // flat list, newest first, max 50
+    const simFilter  = ref('all');
 
     // ── Computed ──────────────────────────────────────────────────
     const selectedDevice = computed(() =>
@@ -503,15 +670,22 @@ createApp({
     });
 
     const headerSub = computed(() => {
+      if (authFailed.value) return 'auth failed · check token';
       if (!connected.value) return 'connecting…';
       if (!devices.value.length) return 'no devices connected';
       if (devices.value.length === 1) return devices.value[0].name || devices.value[0].id;
       return devices.value.length + ' devices connected';
     });
 
-    const threads = computed(() =>
-      Object.values(smsThreads.value).sort((a, b) => b.lastTs - a.lastTs)
-    );
+    const connClass = computed(() => {
+      if (authFailed.value) return 'authfail';
+      return connected.value ? 'online' : 'offline';
+    });
+
+    const connLabel = computed(() => {
+      if (authFailed.value) return 'auth failed';
+      return connected.value ? 'online' : 'offline';
+    });
 
     // ── Dial keys ─────────────────────────────────────────────────
     const dialKeys = [
@@ -639,6 +813,28 @@ createApp({
       addLog('dtmf: ' + digit, 'ev');
     }
 
+    // ── SIM filter ───────────────────────────────────────────────
+    function applySimFilter() {
+      if (!selectedId.value) return;
+      let allowed;
+      if (simFilter.value === 'all')  allowed = [0, 1];
+      else if (simFilter.value === '0') allowed = [0];
+      else if (simFilter.value === '1') allowed = [1];
+      else allowed = [];  // 'none' → reject all
+      cmd({ command: 'set_sim_filter', device_id: selectedId.value, allowed_sims: allowed });
+      addLog('sim filter → ' + (allowed.length ? 'SIM ' + allowed.map(x => x + 1).join('+') : 'reject all'), 'ev');
+    }
+
+    // ── Signal bar helper ─────────────────────────────────────────
+    // signal_level: 0..4 (bars filled). Each bar b (1..4) is colored if b <= level.
+    function sigBarColor(level, bar) {
+      const lvl = typeof level === 'number' ? level : 0;
+      if (bar > lvl) return 'var(--muted)';
+      if (lvl >= 3) return 'var(--good)';
+      if (lvl === 2) return 'var(--warn)';
+      return 'var(--danger)';
+    }
+
     // ── SMS ──────────────────────────────────────────────────────
     function sendSms() {
       const to = smsTo.value.trim(), body = smsBody.value.trim();
@@ -647,16 +843,24 @@ createApp({
       smsBody.value = '';
       addLog('sms → ' + to + ': ' + body.slice(0, 50), 'sm');
     }
-    function addToThread(from, msg, ts) {
-      const t = smsThreads.value[from] || { from, lastMsg: '', lastTs: 0, unread: false };
-      smsThreads.value = { ...smsThreads.value, [from]: { ...t, lastMsg: msg, lastTs: ts, unread: true } };
-      if (!smsTo.value) smsTo.value = from;
+
+    function addSmsToFeed(payload) {
+      // Server sends: {"from":"...","body":"...","sim_slot":N,"sim_carrier":"...","timestamp":N}
+      const from     = escHtml(payload.from || payload.sender || 'unknown');
+      const body     = escHtml(payload.body || payload.message || '');
+      const slot     = payload.sim_slot != null ? payload.sim_slot : null;
+      const carrier  = payload.sim_carrier || '';
+      const ts       = payload.timestamp ? payload.timestamp * (payload.timestamp < 1e11 ? 1000 : 1) : Date.now();
+      const simLabel = slot != null
+        ? 'SIM ' + (slot + 1) + (carrier ? ' · ' + escHtml(carrier) : '')
+        : (carrier ? escHtml(carrier) : 'SIM ?');
+      // Prepend (newest first), cap at 50
+      smsFeed.value.unshift({ from, simLabel, bodyHtml: body, ts });
+      if (smsFeed.value.length > 50) smsFeed.value.length = 50;
+      if (!smsTo.value) smsTo.value = payload.from || payload.sender || '';
     }
-    function openThread(t) {
-      smsTo.value = t.from;
-      smsThreads.value = { ...smsThreads.value, [t.from]: { ...t, unread: false } };
-    }
-    function clearSms() { smsThreads.value = {}; }
+
+    function clearSms() { smsFeed.value = []; }
 
     // ── Event dispatch ────────────────────────────────────────────
     function handleEvent(kind, deviceId, payload) {
@@ -679,12 +883,28 @@ createApp({
           }
           break;
         }
-        case 'sms_received': {
-          const from = payload.sender || 'unknown', body = payload.message || '', ts = payload.timestamp || Date.now();
-          addToThread(from, body, ts);
+        case 'sms': {
+          // Server always broadcasts with kind="sms"; payload has 'from', 'body', 'sim_slot', 'sim_carrier', 'timestamp'
+          const from = payload.from || payload.sender || 'unknown';
+          const body = payload.body || payload.message || '';
+          addSmsToFeed(payload);
           addLog('sms · ' + from + ': ' + body.slice(0, 60), 'sm');
           showToast('sm', 'SMS from ' + from, body.length > 80 ? body.slice(0, 80) + '…' : body);
           if (Notification.permission === 'granted') new Notification('SMS from ' + from, { body: body.slice(0, 100) });
+          break;
+        }
+        case 'device_info': {
+          // Merge into the device's device_info field (state_update will overwrite on next broadcast)
+          const dev = devices.value.find(d => d.id === deviceId);
+          if (dev) dev.device_info = payload;
+          addLog('device_info · ' + deviceId + ': model=' + (payload.model || '?'), '');
+          break;
+        }
+        case 'device_status': {
+          const dev = devices.value.find(d => d.id === deviceId);
+          if (dev) dev.device_status = payload;
+          const batt = payload.battery_pct != null ? payload.battery_pct + '%' : '';
+          addLog('device_status · ' + deviceId + (batt ? ' · batt ' + batt : ''), '');
           break;
         }
         case 'sms_sent': {
@@ -705,15 +925,30 @@ createApp({
     }
 
     // ── WebSocket ────────────────────────────────────────────────
+    let reconnectTimer = null;
     function connectWS() {
+      if (!token.value) return;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      authFailed.value = false;
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(proto + '://' + location.host + '/ws/ui');
-      ws.onopen = () => { connected.value = true; addLog('control channel connected', 'ev'); };
-      ws.onclose = () => {
-        connected.value = false;
-        addLog('connection lost · retrying…', 'er');
-        setTimeout(connectWS, 3000);
+      ws = new WebSocket(proto + '://' + location.host + '/ws/ui?token=' + encodeURIComponent(token.value));
+      ws.onopen = () => {
+        connected.value = true;
+        authFailed.value = false;
+        addLog('control channel connected', 'ev');
       };
+      ws.onclose = ev => {
+        connected.value = false;
+        if (ev.code === 4401) {
+          authFailed.value = true;
+          addLog('auth failed (4401) · check token', 'er');
+          showToast('er', 'auth failed', 'invalid or missing token');
+          return;  // do not auto-reconnect on auth failure
+        }
+        addLog('connection lost · retrying…', 'er');
+        reconnectTimer = setTimeout(connectWS, 3000);
+      };
+      ws.onerror = () => {};  // onclose fires after onerror; log there
       ws.onmessage = ev => {
         let d; try { d = JSON.parse(ev.data); } catch(_) { return; }
         if (d.type === 'state_update') {
@@ -781,7 +1016,7 @@ createApp({
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const dir = withMic ? 'both' : 'listen';
       try {
-        audioWs = new WebSocket(proto + '://' + location.host + '/ws/audio/' + selectedId.value + '?rate=' + rate + '&dir=' + dir);
+        audioWs = new WebSocket(proto + '://' + location.host + '/ws/audio/' + selectedId.value + '?rate=' + rate + '&dir=' + dir + '&token=' + encodeURIComponent(token.value));
       } catch(err) {
         addLog('audio ws failed: ' + (err.message || String(err)), 'er');
         stopAudio(); return;
@@ -845,20 +1080,28 @@ createApp({
     // ── Mount ────────────────────────────────────────────────────
     onMounted(() => {
       document.body.setAttribute('data-theme', theme.value);
-      connectWS();
+      if (token.value) connectWS();
       document.addEventListener('keydown', onKey);
       if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
     });
-    onUnmounted(() => { document.removeEventListener('keydown', onKey); stopAudio(); if (ws) ws.close(); });
+    onUnmounted(() => {
+      document.removeEventListener('keydown', onKey);
+      stopAudio();
+      if (ws) ws.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+    });
 
     return {
-      theme, connected, devices, selectedId, selectedDevice, callPanel, callLbl, headerSub,
+      token, tokenInput, tokenErr,
+      theme, connected, authFailed, connClass, connLabel,
+      devices, selectedId, selectedDevice, callPanel, callLbl, headerSub,
       dialKeys, phoneNum, smsTo, smsBody, eventLog, logEl, toasts, timerDisplay,
       speakerOn, callVolume, meterRx, meterTx, audioActive,
-      contacts, newCName, newCNum, threads, callHistory,
+      contacts, newCName, newCNum, smsFeed, callHistory, simFilter,
+      submitToken, clearToken,
       toggleTheme, addContact, removeContact, dialContact, dialNumber,
       pressKey, delChar, dial, hangup, answer, toggleMute, toggleSpeaker,
-      applyVolume, sendDtmf, sendSms, openThread, clearSms,
+      applyVolume, sendDtmf, sendSms, clearSms, applySimFilter, sigBarColor,
       startAudio, stopAudio, removeToast, fmtClock, fmtDur,
     };
   }
