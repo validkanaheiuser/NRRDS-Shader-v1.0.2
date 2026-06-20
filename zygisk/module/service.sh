@@ -29,7 +29,7 @@ for APP in priv_app system_app platform_app radio; do
         apply_rule "allow $APP $D unix_stream_socket { connectto read write getattr }"
     done
 done
-apply_rule "allow priv_app shell_data_file { read write create open append getattr setattr }"
+apply_rule "allow priv_app shell_data_file file { read write create open append getattr setattr }"
 # Allow root daemon to access ALSA PCM devices
 apply_rule "allow su audio_device chr_file { open read write ioctl }"
 apply_rule "allow ksu audio_device chr_file { open read write ioctl }"
