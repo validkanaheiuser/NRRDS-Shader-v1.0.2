@@ -1,0 +1,11 @@
+{
+  "host": "",
+  "port": 59100,
+  "token": "",
+  "use_tls": false,
+  "server_cert_sha256": "",
+  "pcm_card": 0,
+  "pcm_tx_injection_device": 27,
+  "pcm_rx_capture_device": 0,
+  "pcm_rx_capture_rate": 16000
+}
