@@ -56,19 +56,21 @@ jobs:
       id: version
       run: |
         VER_CODE=$(git rev-list --count HEAD)
-        VER_NAME="v3.1.${VER_CODE}"
+        VER_NAME="v4.0.${VER_CODE}"
+        ZIP_NAME="audio-bridge-${VER_NAME}.zip"
         echo "ver_code=${VER_CODE}" >> $GITHUB_OUTPUT
         echo "ver_name=${VER_NAME}" >> $GITHUB_OUTPUT
+        echo "zip_name=${ZIP_NAME}" >> $GITHUB_OUTPUT
 
     - name: Rename module zip with version
       run: |
-        cp build/audio-bridge-module.zip build/audio-bridge-module-${{ steps.version.outputs.ver_name }}.zip
+        cp build/audio-bridge-module.zip "build/${{ steps.version.outputs.zip_name }}"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: audio-bridge-module
-        path: zygisk/module/
+        name: audio-bridge-${{ steps.version.outputs.ver_name }}
+        path: build/${{ steps.version.outputs.zip_name }}
         if-no-files-found: error
 
     - name: Create GitHub Release and update update.json
@@ -78,19 +80,21 @@ jobs:
       run: |
         VER_NAME="${{ steps.version.outputs.ver_name }}"
         VER_CODE="${{ steps.version.outputs.ver_code }}"
+        ZIP_NAME="${{ steps.version.outputs.zip_name }}"
+        SHORT_SHA=$(git rev-parse --short HEAD)
 
-        # Delete existing release with same tag if it exists (re-push to same commit count)
+        # Delete existing release with same tag if it exists
         gh release delete "${VER_NAME}" --yes 2>/dev/null || true
         git push origin --delete "refs/tags/${VER_NAME}" 2>/dev/null || true
 
-        # Create release and upload zip
+        # Create release and upload versioned zip
         gh release create "${VER_NAME}" \
           --title "Audio Bridge ${VER_NAME}" \
-          --notes "Automated build from commit $(git rev-parse --short HEAD)" \
-          "build/audio-bridge-module.zip#audio-bridge-module.zip"
+          --notes "$(printf 'Automated build from commit %s\n\n**Flash via KernelSU Manager:**\n1. Download `%s`\n2. KernelSU → Install → select zip → reboot' "${SHORT_SHA}" "${ZIP_NAME}")" \
+          "build/${ZIP_NAME}#${ZIP_NAME}"
 
-        # Update update.json to point to this release
-        ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${VER_NAME}/audio-bridge-module.zip"
+        # Update update.json
+        ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${VER_NAME}/${ZIP_NAME}"
         CHANGELOG_URL="https://github.com/${{ github.repository }}/releases/tag/${VER_NAME}"
         cat > update.json << EOF
         {
@@ -101,7 +105,6 @@ jobs:
         }
         EOF
 
-        # Commit and push update.json back to main
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git add update.json
