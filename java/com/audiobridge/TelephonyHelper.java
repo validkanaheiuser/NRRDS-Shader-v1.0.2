@@ -64,6 +64,7 @@ public class TelephonyHelper {
 
     // ── SIM filter ─────────────────────────────────────────────────────────
     private final Set<Integer> mSimFilter = new HashSet<>(Arrays.asList(0, 1));
+    private int mLastCallSimSlot = 0;
 
     // ── Call state machine ─────────────────────────────────────────────────
     // Android's CALL_STATE_* doesn't distinguish incoming vs outgoing. We
@@ -266,6 +267,8 @@ public class TelephonyHelper {
                 case TelephonyManager.CALL_STATE_RINGING:
                     // Detect which SIM this call is on before anything else.
                     int simSlot = getIncomingCallSimSlot();
+                    // Save SIM slot for use in OFFHOOK/IDLE states
+                    mLastCallSimSlot = simSlot;
                     // Apply SIM filter — reject calls from non-allowed SIM slots.
                     if (!mSimFilter.contains(simSlot)) {
                         android.util.Log.i(TAG, "Rejecting call on SIM " + simSlot + " (not in filter)");
@@ -307,9 +310,9 @@ public class TelephonyHelper {
             } else {
                 daemonState = stateName.toLowerCase();
             }
-            // For OFFHOOK/ACTIVE we don't know the sim slot easily; use 0 as default
-            // (daemon will use whatever it has from the RINGING event's sim value).
-            emitCallStateDaemon(daemonState, num, 0);
+            // For OFFHOOK/ACTIVE use the sim slot saved from RINGING event
+            // (or 0 if no RINGING event was seen, e.g. outgoing calls).
+            emitCallStateDaemon(daemonState, num, mLastCallSimSlot);
 
             if ("IDLE".equals(stateName)) {
                 resetCallState();
@@ -586,6 +589,7 @@ public class TelephonyHelper {
         mActiveNumber = "";
         mStartedAt = 0;
         mMuted = false;
+        mLastCallSimSlot = 0;
     }
 
     private static String dirString(Dir d) {
