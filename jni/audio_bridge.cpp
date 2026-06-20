@@ -13,13 +13,10 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
-#include <dlfcn.h>
-#include <jni.h>
 #include <sys/system_properties.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <signal.h>
 #include <netinet/in.h>
@@ -47,60 +44,20 @@
 #include <condition_variable>
 #include <sstream>
 #include <iomanip>
-#include <sys/syscall.h>
 #include <sys/resource.h>
-
-#ifndef memfd_create
-static inline int memfd_create(const char *name, unsigned int flags) {
-    return syscall(__NR_memfd_create, name, flags);
-}
-#endif
 
 // ──────────────────────────────────────────────────────────────────────────
 // Configuration Constants
 // ──────────────────────────────────────────────────────────────────────────
 
-#define VERSION_MAJOR 3
-#define VERSION_MINOR 0
-#define VERSION_PATCH 0
+#include "audio_bridge.h"
 
-static const char* g_host         = nullptr;
-static int         g_port         = 59100;
-static const char* g_token        = "default_secure_token_123";
-static const char* g_socket_path  = "/data/local/tmp/audio_bridge.sock";
-static const char* g_pid_file     = "/data/local/tmp/audio_bridge.pid";
-static const char* g_shm_path     = "/audio_bridge_shm";
-
-static const int SAMPLE_RATE      = 48000;
-static const int CHANNELS         = 1;
-static const int FRAME_MS         = 20;
-static const int FRAME_SAMPLES    = (SAMPLE_RATE * FRAME_MS / 1000);
-static const int FRAME_BYTES      = FRAME_SAMPLES * sizeof(int16_t);
-static const int MAX_PKT          = 4000;
-static const int JITTER_FRAMES    = 6;
-static const int SHM_RING_SIZE    = 64;
-static const int SHM_SIZE         = 1024 * 1024;
-
-// Frame Types (Multiplex Protocol)
-enum FrameType : uint8_t {
-    T_SPEAKER     = 0x01,  // Phone speaker → Server
-    T_VIRTUAL_MIC = 0x02,  // Server → Phone virtual mic
-    T_CONTROL     = 0x03,  // Control messages
-    T_CALL_STATUS = 0x04,  // Call status updates
-    T_SMS         = 0x05,  // SMS control and status
-    T_PING        = 0x06,  // Keepalive ping
-    T_PONG        = 0x07,  // Keepalive pong
-    T_ERROR       = 0xFF   // Error response
-};
-
-// Call States
-enum CallState : int {
-    CALL_IDLE     = 0,
-    CALL_RINGING  = 1,
-    CALL_OFFHOOK  = 2,
-    CALL_DIALING  = 3,
-    CALL_HOLDING  = 4
-};
+static const char* g_host        = nullptr;
+static int         g_port        = 59100;
+static const char* g_token       = nullptr;  // required: set from config.json
+static const char* g_socket_path = "/data/local/tmp/audio_bridge.sock";
+static const char* g_pid_file    = "/data/local/tmp/audio_bridge.pid";
+static const int   JITTER_FRAMES = 6;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Global State
@@ -111,12 +68,6 @@ static std::atomic<bool> g_connected{false};
 static std::atomic<bool> g_audio_active{false};
 static std::atomic<int>  g_call_state{CALL_IDLE};
 
-static int         g_shm_fd       = -1;
-static void*       g_shm_ptr      = nullptr;
-static JavaVM*     g_jvm          = nullptr;
-static jclass      g_helper_class = nullptr;
-static jobject     g_helper_obj   = nullptr;
-
 static std::mutex              g_status_mutex;
 static std::condition_variable g_status_cv;
 static std::queue<std::string> g_status_queue;
@@ -125,18 +76,6 @@ static std::atomic<bool>       g_status_pending{false};
 static std::mutex              g_call_mutex;
 static std::string             g_current_number;
 static std::map<std::string, std::string> g_active_calls;
-
-// PCM audio from the Java APK's AudioRecord(VOICE_CALL) — bypasses the SHM
-// path so that cellular call audio flows even when Zygisk hooks are not called.
-// Samples are S16LE, 8 kHz, mono.  The capture_speaker_thread drains this
-// alongside the Zygisk SHM speaker ring.
-struct JavaPcmChunk {
-    std::vector<int16_t> samples;
-};
-static std::mutex              g_java_pcm_mutex;
-static std::condition_variable g_java_pcm_cv;
-static std::queue<JavaPcmChunk> g_java_pcm_queue;
-static std::atomic<bool>       g_java_pcm_pending{false};
 
 // ──────────────────────────────────────────────────────────────────────────
 // JSON Helper (Minimal implementation without external lib)
@@ -346,13 +285,6 @@ static std::map<std::string, SimpleJson> g_sms_tracking;
 static std::mutex              g_log_mutex;
 static FILE*                   g_log_file = nullptr;
 
-// Serialises the two mic-ring consumers (tinyalsa_mic_inject_thread and
-// receive_virtual_mic_thread's Zygisk path) that both advance read_index.
-// The cross-process race with the Zygisk module itself cannot be fixed with
-// a mutex; it is accepted as best-effort (tinyalsa exits early on Android 16
-// when the HAL owns the PCM device exclusively).
-static std::mutex              g_mic_consumer_mutex;
-
 static std::atomic<int>        g_java_fd{-1};
 
 // TLS State
@@ -362,30 +294,6 @@ static mbedtls_ctr_drbg_context g_ctr_drbg;
 static mbedtls_ssl_context      g_ssl;
 static mbedtls_ssl_config       g_conf;
 static std::mutex               g_tls_write_mutex;
-
-// ──────────────────────────────────────────────────────────────────────────
-// Shared Memory Layout (Must match Zygisk module)
-// ──────────────────────────────────────────────────────────────────────────
-
-struct AudioFrame {
-    int16_t data[FRAME_SAMPLES];
-    uint64_t timestamp;
-    uint32_t flags;
-    uint32_t reserved;
-};
-
-struct SharedMemoryLayout {
-    std::atomic<uint32_t> write_index;
-    std::atomic<uint32_t> read_index;
-    std::atomic<uint32_t> speaker_write_idx;
-    std::atomic<uint32_t> speaker_read_idx;
-    std::atomic<bool> module_active;
-    std::atomic<bool> audio_capturing;
-    std::atomic<uint64_t> last_activity;
-    uint32_t padding[4];
-    AudioFrame mic_frames[SHM_RING_SIZE];
-    AudioFrame speaker_frames[SHM_RING_SIZE];
-};
 
 // ──────────────────────────────────────────────────────────────────────────
 // Logging Utilities
@@ -450,6 +358,503 @@ static void log_write(const char* level, const char* fmt, ...) {
 #define LOGW(...) log_write("WARN", __VA_ARGS__)
 #define LOGE(...) log_write("ERROR", __VA_ARGS__)
 #define LOGD(...) log_write("DEBUG", __VA_ARGS__)
+
+// Forward declarations for network utilities used by voice threads
+static bool send_frame(mbedtls_net_context* net, uint8_t type, const void* data, uint32_t len);
+static bool send_all(mbedtls_net_context* net, const void* data, size_t len);
+
+// ── Daemon Configuration ──────────────────────────────────────────────────────
+struct DaemonConfig {
+    char host[256]              = {};
+    int  port                   = 59100;
+    char token[256]             = {};
+    bool use_tls                = false;
+    char server_cert_sha256[65] = {};
+    int  pcm_card               = 0;
+    int  pcm_tx_device          = 27;
+    int  pcm_rx_device          = 0;
+    int  pcm_rx_rate            = 16000;
+};
+static DaemonConfig g_cfg;
+
+static const char* json_get_str_field(const char* json, const char* key,
+                                      char* out, size_t out_sz) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(json, needle);
+    if (!p) return nullptr;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '"') return nullptr;
+    p++;
+    const char* q = strchr(p, '"');
+    if (!q) return nullptr;
+    size_t len = (size_t)(q - p);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return out;
+}
+
+static int json_get_int_field(const char* json, const char* key, int def) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(json, needle);
+    if (!p) return def;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p == '-' || isdigit((unsigned char)*p))
+        return (int)strtol(p, nullptr, 10);
+    return def;
+}
+
+static bool json_get_bool_field(const char* json, const char* key, bool def) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(json, needle);
+    if (!p) return def;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (strncmp(p, "true", 4) == 0) return true;
+    if (strncmp(p, "false", 5) == 0) return false;
+    return def;
+}
+
+static void load_config_json(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) { LOGW("config.json not found at %s", path); return; }
+    char buf[2048] = {};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return;
+    buf[n] = '\0';
+
+    json_get_str_field(buf, "host", g_cfg.host, sizeof(g_cfg.host));
+    g_cfg.port = json_get_int_field(buf, "port", 59100);
+    json_get_str_field(buf, "token", g_cfg.token, sizeof(g_cfg.token));
+    g_cfg.use_tls = json_get_bool_field(buf, "use_tls", false);
+    json_get_str_field(buf, "server_cert_sha256", g_cfg.server_cert_sha256,
+                       sizeof(g_cfg.server_cert_sha256));
+    g_cfg.pcm_card      = json_get_int_field(buf, "pcm_card", 0);
+    g_cfg.pcm_tx_device = json_get_int_field(buf, "pcm_tx_injection_device", 27);
+    g_cfg.pcm_rx_device = json_get_int_field(buf, "pcm_rx_capture_device", 0);
+    g_cfg.pcm_rx_rate   = json_get_int_field(buf, "pcm_rx_capture_rate", 16000);
+
+    LOGI("config.json: host=%s port=%d tls=%d tx_dev=%d rx_dev=%d",
+         g_cfg.host, g_cfg.port, g_cfg.use_tls, g_cfg.pcm_tx_device, g_cfg.pcm_rx_device);
+}
+
+// ── Voice Call PCM Context ────────────────────────────────────────────────────
+static constexpr int TX_TARGET_FRAMES = 5;
+static constexpr int TX_MAX_FRAMES    = 15;
+
+struct VoiceCallContext {
+    std::atomic<bool> active{false};
+    std::atomic<bool> reconnecting{false};
+
+    struct pcm*             tx_pcm = nullptr;
+    std::mutex              pcm_mtx;
+    std::deque<std::vector<uint8_t>> tx_queue;
+    std::mutex              queue_mtx;
+    std::condition_variable queue_cv;
+
+    struct pcm*             rx_pcm = nullptr;
+
+    std::thread             tx_thread;
+    std::thread             rx_thread;
+
+    int sim_slot = -1;
+};
+
+static VoiceCallContext g_voice;
+static std::atomic<time_t> g_last_pong{0};
+
+// ── ALSA Mixer Helpers ────────────────────────────────────────────────────────
+static bool set_ctl(struct mixer* mix, const char* name, int val) {
+    struct mixer_ctl* ctl = mixer_get_ctl_by_name(mix, name);
+    if (!ctl) { LOGW("mixer: ctl not found: %s", name); return false; }
+    int r = mixer_ctl_set_value(ctl, 0, val);
+    if (r != 0) { LOGW("mixer: set %s = %d failed: %d", name, val, r); return false; }
+    return true;
+}
+
+static bool set_ctl_array(struct mixer* mix, const char* name,
+                           const int* vals, int n) {
+    struct mixer_ctl* ctl = mixer_get_ctl_by_name(mix, name);
+    if (!ctl) { LOGW("mixer: ctl not found: %s", name); return false; }
+    for (int i = 0; i < n; i++) {
+        if (mixer_ctl_set_value(ctl, i, vals[i]) != 0) {
+            LOGW("mixer: set %s[%d] = %d failed", name, i, vals[i]);
+        }
+    }
+    return true;
+}
+
+static bool setup_incall_mixer(int sim_slot) {
+    struct mixer* mix = mixer_open(g_cfg.pcm_card);
+    if (!mix) { LOGE("mixer_open(card=%d) failed", g_cfg.pcm_card); return false; }
+    set_ctl(mix, "Incall_Music Audio Mixer MultiMedia9", 1);
+    set_ctl(mix, "MultiMedia1 Mixer VOC_REC_DL", 1);
+    const int mute_vals[] = {1, -1, 20};
+    set_ctl_array(mix, "Voice Tx Device Mute", mute_vals, 3);
+    if (sim_slot == 1) {
+        set_ctl(mix, "VOICEMMODE2_Tx Mixer TX_CDC_DMA_TX_3_MMode2", 1);
+    } else {
+        set_ctl(mix, "VOICEMMODE1_Tx Mixer TX_CDC_DMA_TX_3_MMode1", 1);
+    }
+    mixer_close(mix);
+    LOGI("incall mixer setup OK (sim_slot=%d)", sim_slot);
+    return true;
+}
+
+static void reset_incall_mixer() {
+    struct mixer* mix = mixer_open(g_cfg.pcm_card);
+    if (!mix) return;
+    set_ctl(mix, "Incall_Music Audio Mixer MultiMedia9", 0);
+    set_ctl(mix, "MultiMedia1 Mixer VOC_REC_DL", 0);
+    const int unmute_vals[] = {0, -1, 0};
+    set_ctl_array(mix, "Voice Tx Device Mute", unmute_vals, 3);
+    set_ctl(mix, "VOICEMMODE1_Tx Mixer TX_CDC_DMA_TX_3_MMode1", 0);
+    set_ctl(mix, "VOICEMMODE2_Tx Mixer TX_CDC_DMA_TX_3_MMode2", 0);
+    mixer_close(mix);
+    LOGI("incall mixer reset");
+}
+
+// ── PCM Open Helpers ──────────────────────────────────────────────────────────
+static struct pcm* open_pcm_with_retry(int card, int dev, int flags,
+                                        const struct pcm_config* cfg,
+                                        int retries = 20, int delay_ms = 100) {
+    for (int i = 0; i < retries; i++) {
+        struct pcm* p = pcm_open(card, dev, flags, cfg);
+        if (p && pcm_is_ready(p)) return p;
+        if (p) pcm_close(p);
+        LOGW("pcm_open(card=%d dev=%d flags=%d) attempt %d/%d failed",
+             card, dev, flags, i + 1, retries);
+        usleep(delay_ms * 1000);
+    }
+    return nullptr;
+}
+
+static struct pcm* open_rx_pcm_with_retry() {
+    static const int kRxRates[] = {8000, 16000, 48000};
+    struct pcm_config cfg = {};
+    cfg.channels    = 1;
+    cfg.period_size = 160;
+    cfg.period_count = 4;
+    cfg.format      = PCM_FORMAT_S16_LE;
+
+    for (int rate : kRxRates) {
+        cfg.rate = (unsigned)rate;
+        struct pcm* p = pcm_open(g_cfg.pcm_card, g_cfg.pcm_rx_device, PCM_IN, &cfg);
+        if (p && pcm_is_ready(p)) {
+            LOGI("rx pcm open OK: card=%d dev=%d rate=%d",
+                 g_cfg.pcm_card, g_cfg.pcm_rx_device, rate);
+            return p;
+        }
+        if (p) pcm_close(p);
+        LOGW("rx pcm_open rate=%d failed", rate);
+    }
+    return nullptr;
+}
+
+static void enqueue_tx_opus_frame(const uint8_t* data, int len) {
+    std::vector<uint8_t> pkt(data, data + len);
+    {
+        std::unique_lock<std::mutex> lk(g_voice.queue_mtx);
+        while ((int)g_voice.tx_queue.size() >= TX_MAX_FRAMES) {
+            g_voice.tx_queue.pop_front();
+            LOGW("tx queue full, dropping oldest frame");
+        }
+        g_voice.tx_queue.push_back(std::move(pkt));
+    }
+    g_voice.queue_cv.notify_one();
+}
+
+static bool attempt_reopen_tx_pcm() {
+    struct pcm* old_pcm;
+    {
+        std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+        old_pcm = g_voice.tx_pcm;
+        g_voice.tx_pcm = nullptr;
+    }
+    if (old_pcm) pcm_close(old_pcm);
+
+    g_voice.reconnecting.store(true);
+    LOGW("tx pcm: attempting reopen (SSR/underrun recovery)");
+
+    for (int i = 0; i < 5 && g_voice.active.load(); i++) {
+        usleep(200 * 1000);
+        if (!setup_incall_mixer(g_voice.sim_slot)) continue;
+
+        struct pcm_config cfg = {};
+        cfg.channels    = 1;
+        cfg.rate        = SAMPLE_RATE;
+        cfg.period_size = FRAME_SAMPLES;
+        cfg.period_count = 4;
+        cfg.format      = PCM_FORMAT_S16_LE;
+
+        struct pcm* p = open_pcm_with_retry(g_cfg.pcm_card, g_cfg.pcm_tx_device,
+                                             PCM_OUT, &cfg, 3, 100);
+        if (p) {
+            std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+            g_voice.tx_pcm = p;
+            g_voice.reconnecting.store(false);
+            LOGI("tx pcm reopen OK (attempt %d)", i + 1);
+            return true;
+        }
+    }
+    g_voice.reconnecting.store(false);
+    LOGE("tx pcm reopen failed after 5 attempts");
+    return false;
+}
+
+static void voice_tx_thread() {
+    prctl(PR_SET_NAME, "ab-voice-tx", 0, 0, 0);
+    struct sched_param sp{}; sp.sched_priority = 3;
+    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0)
+        setpriority(PRIO_PROCESS, 0, -15);
+
+    int err;
+    OpusDecoder* dec = opus_decoder_create(SAMPLE_RATE, CHANNELS, &err);
+    if (!dec) { LOGE("voice_tx: opus_decoder_create failed: %d", err); return; }
+
+    std::vector<int16_t> pcm_buf(FRAME_SAMPLES);
+
+    {
+        std::unique_lock<std::mutex> lk(g_voice.queue_mtx);
+        g_voice.queue_cv.wait_for(lk, std::chrono::milliseconds(500),
+            [&]{ return !g_voice.active.load() ||
+                 (int)g_voice.tx_queue.size() >= TX_TARGET_FRAMES; });
+    }
+    LOGI("voice_tx: jitter buffer pre-fill done, starting PCM write");
+
+    while (g_voice.active.load()) {
+        if (g_voice.reconnecting.load()) { usleep(10000); continue; }
+
+        std::vector<uint8_t> pkt;
+        bool got_pkt = false;
+        {
+            std::unique_lock<std::mutex> lk(g_voice.queue_mtx);
+            if (g_voice.queue_cv.wait_for(lk, std::chrono::milliseconds(30),
+                    [&]{ return !g_voice.active.load() || !g_voice.tx_queue.empty(); })) {
+                if (!g_voice.tx_queue.empty()) {
+                    pkt = std::move(g_voice.tx_queue.front());
+                    g_voice.tx_queue.pop_front();
+                    got_pkt = true;
+                }
+            }
+        }
+
+        int n;
+        if (got_pkt) {
+            n = opus_decode(dec, pkt.data(), (opus_int32)pkt.size(),
+                            pcm_buf.data(), FRAME_SAMPLES, 0);
+        } else {
+            n = opus_decode(dec, nullptr, 0, pcm_buf.data(), FRAME_SAMPLES, 0);
+        }
+        if (n < 0) {
+            LOGW("voice_tx: opus_decode error %d", n);
+            memset(pcm_buf.data(), 0, FRAME_SAMPLES * 2);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+            if (!g_voice.tx_pcm) continue;
+            int r = pcm_write(g_voice.tx_pcm, pcm_buf.data(), FRAME_SAMPLES * 2);
+            if (r != 0) {
+                const char* errmsg = pcm_get_error(g_voice.tx_pcm);
+                if (errmsg && strstr(errmsg, "Broken pipe")) {
+                    pcm_prepare(g_voice.tx_pcm);
+                } else {
+                    LOGW("voice_tx: pcm_write failed: %s", errmsg ? errmsg : "?");
+                    std::thread([]{
+                        if (!attempt_reopen_tx_pcm()) {
+                            g_voice.active.store(false);
+                            g_voice.queue_cv.notify_all();
+                        }
+                    }).detach();
+                }
+            }
+        }
+    }
+
+    opus_decoder_destroy(dec);
+    LOGI("voice_tx_thread exited");
+}
+
+static void voice_rx_thread(mbedtls_net_context* net) {
+    prctl(PR_SET_NAME, "ab-voice-rx", 0, 0, 0);
+    struct sched_param sp{}; sp.sched_priority = 2;
+    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0)
+        setpriority(PRIO_PROCESS, 0, -10);
+
+    int err;
+    OpusEncoder* enc = opus_encoder_create(SAMPLE_RATE, CHANNELS,
+                                            OPUS_APPLICATION_VOIP, &err);
+    if (!enc) { LOGE("voice_rx: opus_encoder_create failed: %d", err); return; }
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(64000));
+    opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
+    opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(10));
+    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(5));
+
+    struct pcm* rx_pcm = open_rx_pcm_with_retry();
+    if (!rx_pcm) {
+        LOGE("voice_rx: failed to open rx pcm");
+        opus_encoder_destroy(enc);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+        g_voice.rx_pcm = rx_pcm;
+    }
+
+    std::vector<int16_t> pcm_buf(FRAME_SAMPLES);
+    std::vector<uint8_t> opus_buf(MAX_PKT);
+
+    while (g_voice.active.load()) {
+        int r;
+        {
+            std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+            if (!g_voice.rx_pcm) break;
+            r = pcm_read(g_voice.rx_pcm, pcm_buf.data(), FRAME_SAMPLES * 2);
+        }
+        if (r != 0) {
+            LOGW("voice_rx: pcm_read error");
+            usleep(20000);
+            continue;
+        }
+
+        opus_int32 len = opus_encode(enc, pcm_buf.data(), FRAME_SAMPLES,
+                                     opus_buf.data(), MAX_PKT);
+        if (len > 0) {
+            if (!send_frame(net, T_SPEAKER, opus_buf.data(), (uint32_t)len)) break;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+        g_voice.rx_pcm = nullptr;
+    }
+    pcm_close(rx_pcm);
+    opus_encoder_destroy(enc);
+    LOGI("voice_rx_thread exited");
+}
+
+static void voice_call_start(int sim_slot) {
+    bool expected = false;
+    if (!g_voice.active.compare_exchange_strong(expected, true)) {
+        LOGW("voice_call_start: already active (sim=%d)", g_voice.sim_slot);
+        return;
+    }
+    g_voice.sim_slot = sim_slot;
+    LOGI("voice_call_start: sim=%d", sim_slot);
+
+    if (!setup_incall_mixer(sim_slot)) {
+        LOGE("voice_call_start: mixer setup failed");
+        g_voice.active.store(false);
+        return;
+    }
+
+    struct pcm_config tx_cfg = {};
+    tx_cfg.channels    = 1;
+    tx_cfg.rate        = SAMPLE_RATE;
+    tx_cfg.period_size = FRAME_SAMPLES;
+    tx_cfg.period_count = 4;
+    tx_cfg.format      = PCM_FORMAT_S16_LE;
+
+    struct pcm* tx_pcm = open_pcm_with_retry(g_cfg.pcm_card, g_cfg.pcm_tx_device,
+                                              PCM_OUT, &tx_cfg);
+    if (!tx_pcm) {
+        LOGE("voice_call_start: failed to open tx pcm (card=%d dev=%d)",
+             g_cfg.pcm_card, g_cfg.pcm_tx_device);
+        reset_incall_mixer();
+        g_voice.active.store(false);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+        g_voice.tx_pcm = tx_pcm;
+    }
+
+    g_voice.tx_thread = std::thread(voice_tx_thread);
+    g_voice.rx_thread = std::thread(voice_rx_thread, &g_net);
+    LOGI("voice call threads started");
+}
+
+static void voice_call_stop() {
+    if (!g_voice.active.exchange(false)) return;
+    LOGI("voice_call_stop");
+
+    g_voice.queue_cv.notify_all();
+
+    if (g_voice.tx_thread.joinable()) g_voice.tx_thread.join();
+    if (g_voice.rx_thread.joinable())  g_voice.rx_thread.join();
+
+    struct pcm* tx_pcm;
+    struct pcm* rx_pcm;
+    {
+        std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
+        tx_pcm = g_voice.tx_pcm;
+        rx_pcm = g_voice.rx_pcm;
+        g_voice.tx_pcm = nullptr;
+        g_voice.rx_pcm = nullptr;
+    }
+    if (tx_pcm) pcm_close(tx_pcm);
+    if (rx_pcm) pcm_close(rx_pcm);
+
+    reset_incall_mixer();
+    g_voice.tx_queue.clear();
+    LOGI("voice_call_stop complete");
+}
+
+static void handle_java_ipc_message(const char* json_str, size_t len) {
+    if (strstr(json_str, "\"type\":\"call_state\"")) {
+        const char* state_tag = strstr(json_str, "\"state\"");
+        if (state_tag) {
+            if (strstr(state_tag, "\"active\"")) {
+                int sim = 0;
+                const char* sim_tag = strstr(json_str, "\"sim\"");
+                if (sim_tag) {
+                    const char* colon = strchr(sim_tag, ':');
+                    if (colon) sim = (int)strtol(colon + 1, nullptr, 10);
+                }
+                voice_call_start(sim);
+            } else if (strstr(state_tag, "\"idle\"") ||
+                       strstr(state_tag, "\"rejected\"")) {
+                voice_call_stop();
+            }
+        }
+        std::lock_guard<std::mutex> lk(g_status_mutex);
+        g_status_queue.push(std::string(json_str, len));
+        g_status_pending = true;
+        g_status_cv.notify_one();
+        return;
+    }
+
+    if (strstr(json_str, "\"type\":\"device_info\"") ||
+        strstr(json_str, "\"type\":\"device_status\"")) {
+        std::lock_guard<std::mutex> lk(g_status_mutex);
+        g_status_queue.push(std::string(json_str, len));
+        g_status_pending = true;
+        g_status_cv.notify_one();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_status_mutex);
+        g_status_queue.push(std::string(json_str, len));
+        g_status_pending = true;
+    }
+    g_status_cv.notify_one();
+}
+
+static void send_to_java_raw(const char* json_str) {
+    int fd = g_java_fd.load();
+    if (fd < 0) return;
+    std::string msg = std::string(json_str) + "\n";
+    ssize_t r = write(fd, msg.c_str(), msg.size());
+    (void)r;
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // System Helpers
@@ -677,7 +1082,14 @@ static bool handshake(mbedtls_net_context* net) {
     strftime(date_str, sizeof(date_str), "%d-%m-%y", gm); // Current dd-mm-yy UTC
     reg.object_value["date"] = SimpleJson(date_str); // Send date so server uses exact matching string
     
-    std::string msg = dev_id + "-" + date_str;
+    // Generate a random nonce (16 bytes → 32 hex chars)
+    char nonce_hex[33] = {};
+    for (int i = 0; i < 16; i++) {
+        snprintf(nonce_hex + i*2, 3, "%02x", (unsigned)(rand() & 0xFF));
+    }
+    reg.object_value["nonce"] = SimpleJson(nonce_hex);
+
+    std::string msg = dev_id + "-" + date_str + "-" + nonce_hex;
     unsigned char hmac[32];
     const mbedtls_md_info_t* md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     mbedtls_md_hmac(md_info, (const unsigned char*)g_token, g_token ? strlen(g_token) : 0, 
@@ -703,213 +1115,6 @@ static bool handshake(mbedtls_net_context* net) {
     LOGI("Handshake response: %s", line.c_str());
     return line.find("\"ok\"") != std::string::npos;
 }
-
-// ──────────────────────────────────────────────────────────────────────────
-// Shared Memory
-// ──────────────────────────────────────────────────────────────────────────
-
-static bool setup_shared_memory() {
-    g_shm_fd = memfd_create(g_shm_path, MFD_CLOEXEC);
-    if(g_shm_fd < 0) {
-        LOGW("memfd_create failed (%s), trying ashmem...", strerror(errno));
-        g_shm_fd = open("/dev/ashmem", O_RDWR);
-        if(g_shm_fd < 0) {
-            LOGW("ashmem failed (%s), using anonymous mmap fallback", strerror(errno));
-            // Anonymous mmap fallback - no fd sharing but daemon still runs
-            g_shm_ptr = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE,
-                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-            if(g_shm_ptr == MAP_FAILED) {
-                LOGE("All shared memory methods failed: %s", strerror(errno));
-                return false;
-            }
-            g_shm_fd = -1; // No fd to share
-            auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-            memset(layout, 0, SHM_SIZE);
-            LOGI("Shared memory initialized (anonymous mmap, no Zygisk sharing)");
-            return true;
-        }
-    }
-    
-    if(ftruncate(g_shm_fd, SHM_SIZE) < 0) {
-        LOGE("ftruncate failed: %s", strerror(errno));
-        close(g_shm_fd);
-        return false;
-    }
-    
-    g_shm_ptr = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
-    if(g_shm_ptr == MAP_FAILED) {
-        LOGE("mmap failed: %s", strerror(errno));
-        close(g_shm_fd);
-        return false;
-    }
-    
-    auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-    memset(layout, 0, SHM_SIZE);
-    
-    LOGI("Shared memory initialized at %p, fd=%d", g_shm_ptr, g_shm_fd);
-    return true;
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// JNI Bridge
-// ──────────────────────────────────────────────────────────────────────────
-
-
-
-// ──────────────────────────────────────────────────────────────────────────
-// JNI Callbacks (Called from Java)
-// ──────────────────────────────────────────────────────────────────────────
-
-extern "C" {
-
-JNIEXPORT void JNICALL
-Java_com_audiobridge_TelephonyHelper_nativeOnCallStateChanged(
-    JNIEnv* env, jobject thiz, jint state, jstring number) {
-    
-    g_call_state = state;
-    
-    const char* numStr = env->GetStringUTFChars(number, nullptr);
-    std::string num = numStr ? numStr : "";
-    env->ReleaseStringUTFChars(number, numStr);
-    
-    {
-        std::lock_guard<std::mutex> lk(g_call_mutex);
-        g_current_number = num;
-    }
-    
-    SimpleJson status;
-    status.type = SimpleJson::OBJECT;
-    status.object_value["type"] = SimpleJson("call_status");
-    status.object_value["state"] = SimpleJson((double)state);
-    status.object_value["state_name"] = SimpleJson(
-        state == CALL_IDLE    ? "IDLE" :
-        state == CALL_RINGING ? "RINGING" :
-        state == CALL_OFFHOOK ? "OFFHOOK" :
-        state == CALL_DIALING ? "DIALING" :
-        state == CALL_HOLDING ? "HOLDING" : "UNKNOWN");
-    status.object_value["number"] = SimpleJson(num);
-    status.object_value["timestamp"] = SimpleJson((double)time(nullptr));
-    
-    {
-        std::lock_guard<std::mutex> lk(g_status_mutex);
-        g_status_queue.push(status.toString());
-        g_status_pending = true;
-    }
-    g_status_cv.notify_one();
-    
-    LOGI("Call state: %d, number: %s", state, num.c_str());
-}
-
-JNIEXPORT void JNICALL
-Java_com_audiobridge_TelephonyHelper_nativeOnCallWaiting(
-    JNIEnv* env, jobject thiz, jstring incomingNumber, jstring currentNumber) {
-    
-    const char* incoming = env->GetStringUTFChars(incomingNumber, nullptr);
-    const char* current = env->GetStringUTFChars(currentNumber, nullptr);
-    
-    SimpleJson status;
-    status.type = SimpleJson::OBJECT;
-    status.object_value["type"] = SimpleJson("call_waiting");
-    status.object_value["incoming_number"] = SimpleJson(incoming ? incoming : "");
-    status.object_value["active_number"] = SimpleJson(current ? current : "");
-    status.object_value["timestamp"] = SimpleJson((double)time(nullptr));
-    status.object_value["available_actions"] = SimpleJson::ARRAY;
-    status.object_value["available_actions"].array_value.push_back(SimpleJson("hold_and_answer"));
-    status.object_value["available_actions"].array_value.push_back(SimpleJson("hangup_and_answer"));
-    status.object_value["available_actions"].array_value.push_back(SimpleJson("ignore"));
-    
-    {
-        std::lock_guard<std::mutex> lk(g_status_mutex);
-        g_status_queue.push(status.toString());
-        g_status_pending = true;
-    }
-    g_status_cv.notify_one();
-    
-    env->ReleaseStringUTFChars(incomingNumber, incoming);
-    env->ReleaseStringUTFChars(currentNumber, current);
-    
-    LOGI("Call waiting: %s (active: %s)", incoming ? incoming : "?", current ? current : "?");
-}
-
-JNIEXPORT void JNICALL
-Java_com_audiobridge_TelephonyHelper_nativeOnSMSSent(
-    JNIEnv* env, jobject thiz, jstring messageId, jint resultCode) {
-    
-    const char* id = env->GetStringUTFChars(messageId, nullptr);
-    
-    SimpleJson status;
-    status.type = SimpleJson::OBJECT;
-    status.object_value["type"] = SimpleJson("sms_status");
-    status.object_value["message_id"] = SimpleJson(id ? id : "");
-    status.object_value["result"] = SimpleJson(resultCode == -1 ? "sent" : "failed");
-    status.object_value["result_code"] = SimpleJson((double)resultCode);
-    status.object_value["timestamp"] = SimpleJson((double)time(nullptr));
-    
-    {
-        std::lock_guard<std::mutex> lk(g_status_mutex);
-        g_status_queue.push(status.toString());
-        g_status_pending = true;
-    }
-    g_status_cv.notify_one();
-    
-    env->ReleaseStringUTFChars(messageId, id);
-    
-    LOGI("SMS sent: %s, result=%d", id ? id : "?", resultCode);
-}
-
-JNIEXPORT void JNICALL
-Java_com_audiobridge_TelephonyHelper_nativeOnSMSDelivered(
-    JNIEnv* env, jobject thiz, jstring messageId) {
-    
-    const char* id = env->GetStringUTFChars(messageId, nullptr);
-    
-    SimpleJson status;
-    status.type = SimpleJson::OBJECT;
-    status.object_value["type"] = SimpleJson("sms_status");
-    status.object_value["message_id"] = SimpleJson(id ? id : "");
-    status.object_value["status"] = SimpleJson("delivered");
-    status.object_value["timestamp"] = SimpleJson((double)time(nullptr));
-    
-    {
-        std::lock_guard<std::mutex> lk(g_status_mutex);
-        g_status_queue.push(status.toString());
-        g_status_pending = true;
-    }
-    g_status_cv.notify_one();
-    
-    env->ReleaseStringUTFChars(messageId, id);
-    
-    LOGI("SMS delivered: %s", id ? id : "?");
-}
-
-JNIEXPORT void JNICALL
-Java_com_audiobridge_TelephonyHelper_nativeOnSMSReceived(
-    JNIEnv* env, jobject thiz, jstring sender, jstring message, jlong timestamp) {
-    
-    const char* from = env->GetStringUTFChars(sender, nullptr);
-    const char* msg = env->GetStringUTFChars(message, nullptr);
-    
-    SimpleJson status;
-    status.type = SimpleJson::OBJECT;
-    status.object_value["type"] = SimpleJson("sms_received");
-    status.object_value["sender"] = SimpleJson(from ? from : "");
-    status.object_value["message"] = SimpleJson(msg ? msg : "");
-    status.object_value["timestamp"] = SimpleJson((double)timestamp);
-    
-    {
-        std::lock_guard<std::mutex> lk(g_status_mutex);
-        g_status_queue.push(status.toString());
-        g_status_pending = true;
-    }
-    g_status_cv.notify_one();
-    
-    env->ReleaseStringUTFChars(sender, from);
-    env->ReleaseStringUTFChars(message, msg);
-    
-    LOGI("SMS received from %s", from ? from : "?");
-}
-
-} // extern "C"
 
 // ──────────────────────────────────────────────────────────────────────────
 // Thread Functions
@@ -944,6 +1149,10 @@ static void status_sender_thread(mbedtls_net_context* net) {
             uint8_t frame_type = T_CALL_STATUS;
             if (json_str.find("\"type\":\"sms") != std::string::npos) {
                 frame_type = T_SMS;
+            } else if (json_str.find("\"type\":\"device_info\"") != std::string::npos) {
+                frame_type = T_DEVICE_INFO;
+            } else if (json_str.find("\"type\":\"device_status\"") != std::string::npos) {
+                frame_type = T_DEVICE_STATUS;
             }
             if(send_frame(net, frame_type, json_str.c_str(), json_str.length())) {
                 LOGD("Status sent (type=0x%02x): %s", frame_type, json_str.substr(0, 100).c_str());
@@ -959,109 +1168,6 @@ static void status_sender_thread(mbedtls_net_context* net) {
     LOGI("Status sender exited");
 }
 
-static void capture_speaker_thread(mbedtls_net_context* net) {
-    // Real-time scheduling reduces encode jitter and sender starvation.
-    struct sched_param sp{};
-    sp.sched_priority = 2;
-    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0) {
-        setpriority(PRIO_PROCESS, 0, -10);  // fallback: nice -10
-    }
-
-    auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-
-    int err;
-    // VOIP mode: lower algorithmic delay, speech-optimised DTX, better
-    // comfort-noise generation than AUDIO mode. Complexity 5 halves CPU
-    // use vs 10 with negligible quality difference for voice.
-    OpusEncoder* enc = opus_encoder_create(SAMPLE_RATE, CHANNELS,
-                                           OPUS_APPLICATION_VOIP, &err);
-    if(!enc) {
-        LOGE("Failed to create Opus encoder: %d", err);
-        return;
-    }
-
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(64000));
-    opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
-    opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(10));
-    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(5));
-    opus_encoder_ctl(enc, OPUS_SET_DTX(1));
-    
-    std::vector<uint8_t> pkt(MAX_PKT);
-    uint64_t frames_sent   = 0;
-    uint64_t java_frames   = 0;
-
-    // Leftover PCM from java chunks that didn't fill a full FRAME_SAMPLES buffer.
-    std::vector<int16_t> pcm_leftover;
-    pcm_leftover.reserve(FRAME_SAMPLES * 2);
-
-    while(g_running && g_connected) {
-        bool did_work = false;
-
-        // ── Path A: Zygisk SHM ring (hooked AudioTrack.write inside app procs) ──
-        {
-            uint32_t write_idx = layout->speaker_write_idx.load(std::memory_order_acquire);
-            uint32_t read_idx  = layout->speaker_read_idx.load(std::memory_order_acquire);
-            if (write_idx != read_idx) {
-                AudioFrame& frame = layout->speaker_frames[read_idx % SHM_RING_SIZE];
-                opus_int32 len = opus_encode(enc, frame.data, FRAME_SAMPLES,
-                                             pkt.data(), MAX_PKT);
-                if (len > 0) {
-                    if (!send_frame(net, T_SPEAKER, pkt.data(), (uint32_t)len)) break;
-                    frames_sent++;
-                }
-                layout->speaker_read_idx.store((read_idx + 1) % (SHM_RING_SIZE * 2),
-                                               std::memory_order_release);
-                did_work = true;
-            }
-        }
-
-        // ── Path B: Java APK AudioRecord(VOICE_CALL) binary stream ──
-        {
-            JavaPcmChunk chunk;
-            bool has_chunk = false;
-            {
-                std::lock_guard<std::mutex> lk(g_java_pcm_mutex);
-                if (!g_java_pcm_queue.empty()) {
-                    chunk     = std::move(g_java_pcm_queue.front());
-                    g_java_pcm_queue.pop();
-                    g_java_pcm_pending = !g_java_pcm_queue.empty();
-                    has_chunk = true;
-                }
-            }
-            if (has_chunk) {
-                // Append to leftover buffer.
-                pcm_leftover.insert(pcm_leftover.end(),
-                                    chunk.samples.begin(), chunk.samples.end());
-                // Drain complete FRAME_SAMPLES frames.
-                while ((int)pcm_leftover.size() >= FRAME_SAMPLES) {
-                    opus_int32 len = opus_encode(enc, pcm_leftover.data(),
-                                                 FRAME_SAMPLES, pkt.data(), MAX_PKT);
-                    if (len > 0) {
-                        if (!send_frame(net, T_SPEAKER, pkt.data(), (uint32_t)len)) goto speaker_exit;
-                        frames_sent++;
-                        java_frames++;
-                    }
-                    pcm_leftover.erase(pcm_leftover.begin(),
-                                       pcm_leftover.begin() + FRAME_SAMPLES);
-                }
-                did_work = true;
-            }
-        }
-
-        if (!did_work) usleep(5000);
-
-        if (frames_sent % 50 == 0 && frames_sent > 0) {
-            LOGD("Speaker: %llu frames sent (%llu from Java audio)",
-                 (unsigned long long)frames_sent, (unsigned long long)java_frames);
-        }
-    }
-
-speaker_exit:
-    opus_encoder_destroy(enc);
-    LOGI("Speaker capture exited (total=%llu java=%llu)",
-         (unsigned long long)frames_sent, (unsigned long long)java_frames);
-}
-
 static void receive_virtual_mic_thread(mbedtls_net_context* net) {
     struct sched_param sp{};
     sp.sched_priority = 2;
@@ -1069,19 +1175,10 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
         setpriority(PRIO_PROCESS, 0, -10);
     }
 
-    auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-
-    int err;
-    OpusDecoder* dec = opus_decoder_create(SAMPLE_RATE, CHANNELS, &err);
-    if(!dec) {
-        LOGE("Failed to create Opus decoder: %d", err);
-        return;
-    }
-    
     std::vector<uint8_t> pkt(MAX_PKT);
     uint8_t hdr[5];
     uint64_t frames_received = 0;
-    
+
     while(g_running && g_connected) {
         if(!recv_all(net, hdr, 5)) break;
 
@@ -1089,29 +1186,23 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
         uint32_t len = ((uint32_t)hdr[1] << 24) | ((uint32_t)hdr[2] << 16) |
                        ((uint32_t)hdr[3] <<  8) | ((uint32_t)hdr[4]);
 
-        // Only oversize is fatal. Zero-length is legitimate for T_PONG and
-        // similar keepalive replies — treating it as fatal was disconnecting
-        // the daemon 10s after connect (the watchdog ping cadence).
-        // Use >= so that len == MAX_PKT is also rejected: the T_CONTROL handler
-        // writes pkt.data()[len] = '\0' to null-terminate, which is a one-byte
-        // out-of-bounds write when len == MAX_PKT (vector capacity is MAX_PKT).
         if(len >= MAX_PKT) break;
         if(len > 0 && !recv_all(net, pkt.data(), len)) break;
 
-        // Server-originated keepalive: daemon sends T_PING from the watchdog,
-        // server replies with T_PONG (empty). Nothing to do.
-        if(type == T_PONG) continue;
+        if(type == T_PONG) {
+            g_last_pong.store(time(nullptr));
+            continue;
+        }
 
-        // Handle Control Messages
         if(type == T_CONTROL) {
             pkt.data()[len] = '\0';
             std::string json_str((char*)pkt.data(), len);
-            
+
             SimpleJson root = SimpleJson::parse(json_str);
             std::string cmd = root.getString("command");
-            
+
             LOGI("Control command: %s", cmd.c_str());
-            
+
             if(cmd == "dial") {
                 std::string number = root.getString("number");
                 if(!number.empty()) {
@@ -1122,7 +1213,6 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
             } else if(cmd == "answer") {
                 jni_answer_call();
             } else if(cmd == "mute") {
-                // Forward mute on/off to the Java side
                 SimpleJson m;
                 m.type = SimpleJson::OBJECT;
                 m.object_value["command"] = SimpleJson("mute");
@@ -1149,6 +1239,11 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
                 int level = (int)root.getNumber("level", 7.0);
                 jni_set_volume(level);
                 LOGI("Volume: %d", level);
+            } else if(cmd == "set_sim_filter") {
+                send_to_java_raw(json_str.c_str());
+                LOGI("Forwarded set_sim_filter to APK");
+            } else if(cmd == "get_device_info") {
+                send_to_java_raw("{\"command\":\"get_device_info\"}");
             } else if(cmd == "ping") {
                 SimpleJson pong;
                 pong.type = SimpleJson::OBJECT;
@@ -1156,39 +1251,19 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
                 pong.object_value["timestamp"] = SimpleJson((double)time(nullptr));
                 send_json(net, T_PONG, pong);
             }
-            
+
             continue;
         }
-        
-        // Handle Audio (Virtual Mic)
-        if(type != T_VIRTUAL_MIC) continue;
-        
-        uint32_t write_idx = layout->write_index.load(std::memory_order_acquire);
-        uint32_t read_idx = layout->read_index.load(std::memory_order_acquire);
-        
-        if((write_idx - read_idx) >= SHM_RING_SIZE) {
-            LOGW("Mic buffer full, dropping frame");
-            continue;
-        }
-        
-        AudioFrame& frame = layout->mic_frames[write_idx % SHM_RING_SIZE];
-        
-        int n = opus_decode(dec, pkt.data(), (opus_int32)len,
-                           frame.data, FRAME_SAMPLES, 0);
-        if(n < 0) {
-            n = opus_decode(dec, nullptr, 0, frame.data, FRAME_SAMPLES, 0);
-        }
-        
-        if(n > 0) {
-            frame.timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
-            frame.flags = 0;
-            layout->write_index.store((write_idx + 1) % (SHM_RING_SIZE * 2),
-                                      std::memory_order_release);
+
+        if(type == T_VIRTUAL_MIC) {
+            if (len > 0 && g_voice.active.load()) {
+                enqueue_tx_opus_frame(pkt.data(), (int)len);
+            }
             frames_received++;
+            continue;
         }
     }
-    
-    opus_decoder_destroy(dec);
+
     LOGI("Virtual mic receiver exited (frames: %llu)", (unsigned long long)frames_received);
 }
 
@@ -1227,14 +1302,7 @@ static void read_java_client(int fd) {
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
         if (len == 0) continue;
 
-        // Forward the raw JSON directly — re-serialising through SimpleJson would
-        // lose all fields except "command"/"number"/"message" (parser limitation).
-        {
-            std::lock_guard<std::mutex> lk(g_status_mutex);
-            g_status_queue.push(std::string(line, len));
-            g_status_pending = true;
-        }
-        g_status_cv.notify_one();
+        handle_java_ipc_message(line, len);
     }
     
     LOGI("Java IPC Client disconnected");
@@ -1242,156 +1310,6 @@ static void read_java_client(int fd) {
         g_java_fd.store(-1);
     }
     fclose(f);
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Java binary audio stream reader
-// Protocol: repeated [4B BE length][S16LE PCM bytes, 8 kHz mono]
-// Queues decoded PCM into g_java_pcm_queue for capture_speaker_thread.
-// ──────────────────────────────────────────────────────────────────────────
-static void read_java_audio_stream(int fd) {
-    LOGI("Java audio stream connected (fd=%d)", fd);
-
-    // Real-time scheduling so PCM frames arrive promptly.
-    struct sched_param sp{};
-    sp.sched_priority = 2;
-    pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
-
-    while (g_running) {
-        // Read 4-byte big-endian length header.
-        uint8_t hdr[4];
-        ssize_t got = 0;
-        while (got < 4) {
-            ssize_t r = recv(fd, hdr + got, 4 - got, 0);
-            if (r <= 0) goto done;
-            got += r;
-        }
-        uint32_t byte_len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
-                            ((uint32_t)hdr[2] <<  8) | (uint32_t)hdr[3];
-
-        if (byte_len == 0 || byte_len > 8192) {
-            LOGW("Audio stream: bad frame length %u", byte_len);
-            goto done;
-        }
-
-        // Read PCM payload.
-        std::vector<uint8_t> raw(byte_len);
-        got = 0;
-        while ((uint32_t)got < byte_len) {
-            ssize_t r = recv(fd, raw.data() + got, byte_len - got, 0);
-            if (r <= 0) goto done;
-            got += r;
-        }
-
-        {
-            // Convert bytes → int16 samples and enqueue.
-            size_t n_samples = byte_len / 2;
-            JavaPcmChunk chunk;
-            chunk.samples.resize(n_samples);
-            memcpy(chunk.samples.data(), raw.data(), byte_len);
-
-            std::lock_guard<std::mutex> lk(g_java_pcm_mutex);
-            // Keep queue bounded to ~200ms of audio to avoid runaway lag.
-            if (g_java_pcm_queue.size() < 10) {
-                g_java_pcm_queue.push(std::move(chunk));
-                g_java_pcm_pending = true;
-                g_java_pcm_cv.notify_one();
-            }
-        }
-    }
-done:
-    close(fd);
-    LOGI("Java audio stream disconnected");
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// tinyalsa voice call mic injection
-// Scans /proc/asound/pcm for the voice call PCM device (Qualcomm VoiceMMode /
-// Voice Call), then writes virtual-mic samples from the SHM ring into the
-// ALSA uplink so the remote party hears server-injected audio.
-// This is best-effort: on Android 16 the HAL owns the device exclusively and
-// pcm_open() may return EBUSY — the thread logs the failure and exits cleanly.
-// ──────────────────────────────────────────────────────────────────────────
-static int find_voice_pcm_dev(int card) {
-    FILE* f = fopen("/proc/asound/pcm", "r");
-    if (!f) return -1;
-    char line[256];
-    int result = -1;
-    while (fgets(line, sizeof(line), f) && result < 0) {
-        if (strstr(line, "Voice") || strstr(line, "voice") ||
-            strstr(line, "Incall") || strstr(line, "incall")) {
-            int c = -1, d = -1;
-            if (sscanf(line, "%d-%d:", &c, &d) == 2 && c == card) {
-                LOGI("tinyalsa: found voice PCM card=%d dev=%d (%s)", c, d, line);
-                result = d;
-            }
-        }
-    }
-    fclose(f);
-    return result;
-}
-
-static void tinyalsa_mic_inject_thread() {
-    int voice_dev = find_voice_pcm_dev(0);
-    if (voice_dev < 0) {
-        LOGW("tinyalsa mic inject: no voice call PCM found in /proc/asound/pcm");
-        return;
-    }
-
-    struct pcm_config cfg = {};
-    cfg.channels    = 1;
-    cfg.rate        = (unsigned)SAMPLE_RATE;
-    cfg.period_size = (unsigned)FRAME_SAMPLES;
-    cfg.period_count = 4;
-    cfg.format      = PCM_FORMAT_S16_LE;
-
-    struct pcm* pcm_out = pcm_open(0, (unsigned)voice_dev, PCM_OUT, &cfg);
-    if (!pcm_out || !pcm_is_ready(pcm_out)) {
-        LOGW("tinyalsa mic inject: pcm_open(card=0 dev=%d PCM_OUT) failed: %s",
-             voice_dev, pcm_out ? pcm_get_error(pcm_out) : "null");
-        if (pcm_out) pcm_close(pcm_out);
-        return;
-    }
-    LOGI("tinyalsa mic inject: PCM open ok (card=0 dev=%d)", voice_dev);
-
-    auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-    int16_t silence[FRAME_SAMPLES] = {};
-    uint64_t frames_written = 0;
-
-    int16_t frame_copy[FRAME_SAMPLES];
-    while (g_running && g_connected) {
-        const int16_t* src;
-        {
-            // g_mic_consumer_mutex serialises this thread against any other
-            // in-daemon reader that also advances read_index (currently none,
-            // but guards against future additions).  The cross-process race
-            // with the Zygisk module's pull_mic_samples() is accepted as
-            // best-effort: tinyalsa exits early on Android 16 when the HAL
-            // owns the PCM device exclusively, so both consumers are rarely
-            // active simultaneously.
-            std::lock_guard<std::mutex> lk(g_mic_consumer_mutex);
-            uint32_t write_idx = layout->write_index.load(std::memory_order_acquire);
-            uint32_t read_idx  = layout->read_index.load(std::memory_order_acquire);
-            if (write_idx != read_idx) {
-                memcpy(frame_copy, layout->mic_frames[read_idx % SHM_RING_SIZE].data,
-                       FRAME_SAMPLES * 2);
-                layout->read_index.store((read_idx + 1) % (SHM_RING_SIZE * 2),
-                                         std::memory_order_release);
-                src = frame_copy;
-            } else {
-                src = silence;
-            }
-        }
-
-        if (pcm_write(pcm_out, src, FRAME_SAMPLES * 2) != 0) {
-            LOGW("tinyalsa mic inject: pcm_write failed: %s", pcm_get_error(pcm_out));
-            break;
-        }
-        frames_written++;
-    }
-
-    pcm_close(pcm_out);
-    LOGI("tinyalsa mic inject exited (frames=%llu)", (unsigned long long)frames_written);
 }
 
 static void unix_socket_server_thread() {
@@ -1422,9 +1340,7 @@ static void unix_socket_server_thread() {
     }
     
     LOGI("Unix socket listening on %s", g_socket_path);
-    
-    auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-    
+
     while(g_running) {
         fd_set fds;
         FD_ZERO(&fds);
@@ -1443,46 +1359,12 @@ static void unix_socket_server_thread() {
         if(n > 0) {
             cmd[n] = '\0';
             
-            if(strcmp(cmd, "GET_SHM_FD") == 0) {
-                if (g_shm_fd < 0) {
-                    // Anonymous mmap fallback — fd is invalid, cannot share via SCM_RIGHTS.
-                    // Sending fd=-1 would cause sendmsg to silently drop the cmsg,
-                    // leaving the Zygisk module unable to mmap and spinning forever.
-                    send(client_fd, "NO_FD", 5, 0);
-                    LOGW("GET_SHM_FD: SHM is anonymous mmap (no fd) — Zygisk injection unavailable");
-                    close(client_fd);
-                } else {
-                struct msghdr msg = {};
-                char buf[CMSG_SPACE(sizeof(int))];
-                memset(buf, 0, sizeof(buf));
-
-                struct iovec io = { .iov_base = (void*)"OK", .iov_len = 2 };
-                msg.msg_iov = &io;
-                msg.msg_iovlen = 1;
-                msg.msg_control = buf;
-                msg.msg_controllen = sizeof(buf);
-
-                struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-                cmsg->cmsg_level = SOL_SOCKET;
-                cmsg->cmsg_type = SCM_RIGHTS;
-                cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-                *(int*)CMSG_DATA(cmsg) = g_shm_fd;
-
-                sendmsg(client_fd, &msg, 0);
-                layout->module_active = true;
-                LOGI("Shared memory FD sent to Zygisk module");
-                close(client_fd);
-                }
-            } else if(strcmp(cmd, "PING") == 0) {
+            if(strcmp(cmd, "PING") == 0) {
                 send(client_fd, "PONG", 4, 0);
                 close(client_fd);
             } else if(strncmp(cmd, "HELO_JAVA", 9) == 0) {
                 std::thread java_client_thread(read_java_client, client_fd);
                 java_client_thread.detach();
-                // Do NOT close client_fd here
-            } else if(strncmp(cmd, "HELO_AUDIO", 10) == 0) {
-                std::thread audio_thread(read_java_audio_stream, client_fd);
-                audio_thread.detach();
                 // Do NOT close client_fd here
             } else {
                 close(client_fd);
@@ -1541,26 +1423,17 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Load config from file if not provided via args
-    FILE* f = fopen("/data/local/tmp/audio_bridge.conf", "r");
-    if(f) {
-        char line[256];
-        while(fgets(line, sizeof(line), f)) {
-            char key[64] = {0}, val[192] = {0};
-            if(sscanf(line, "%63[^=]=%191[^\n]", key, val) >= 1) {
-                // Strip trailing \r or spaces
-                char* p = val + strlen(val) - 1;
-                while(p >= val && (*p == '\r' || *p == '\n' || *p == ' ')) {
-                    *p = '\0';
-                    p--;
-                }
-                if(!g_host && !strcmp(key, "HOST") && strlen(val) > 0) g_host = strdup(val);
-                if(!strcmp(key, "PORT")) g_port = atoi(val);
-                if(!g_token && !strcmp(key, "TOKEN")) g_token = strdup(val);
-            }
+    // Load config from config.json
+    static char config_path[512] = "/data/adb/modules/audio_bridge/files/config.json";
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--config") && i + 1 < argc) {
+            strncpy(config_path, argv[++i], sizeof(config_path) - 1);
         }
-        fclose(f);
     }
+    load_config_json(config_path);
+    if (g_cfg.host[0]) g_host = g_cfg.host;
+    if (g_cfg.port)    g_port = g_cfg.port;
+    if (g_cfg.token[0]) g_token = g_cfg.token;
     
     if(check_server) {
         if(!g_host) {
@@ -1605,42 +1478,21 @@ int main(int argc, char** argv) {
     }
     LOGI("Device ID: %s", get_device_id().c_str());
     
-    // Setup shared memory
-    if(!setup_shared_memory()) {
-        LOGE("Failed to setup shared memory");
-        return 1;
-    }
-    
     // Start Unix socket server
     std::thread unix_thread(unix_socket_server_thread);
     
     // Main connection loop - wait for config if no host set
     while(g_running) {
-        // Re-read config if host not set
-        if(!g_host) {
-            FILE* cf = fopen("/data/local/tmp/audio_bridge.conf", "r");
-            if(cf) {
-                char line[256];
-                while(fgets(line, sizeof(line), cf)) {
-                    char key[64] = {0}, val[192] = {0};
-                    if(sscanf(line, "%63[^=]=%191[^\n]", key, val) >= 1) {
-                        char* p = val + strlen(val) - 1;
-                        while(p >= val && (*p == '\r' || *p == '\n' || *p == ' ')) {
-                            *p = '\0';
-                            p--;
-                        }
-                        if(!strcmp(key, "HOST") && strlen(val) > 0) g_host = strdup(val);
-                        if(!strcmp(key, "PORT")) g_port = atoi(val);
-                        if(!strcmp(key, "TOKEN")) g_token = strdup(val);
-                    }
-                }
-                fclose(cf);
-            }
-            if(!g_host) {
+        if(!g_host || !g_host[0]) {
+            load_config_json(config_path);
+            if (!g_cfg.host[0]) {
                 sleep(5);
                 continue;
             }
-            LOGI("Config loaded! Target: %s:%d", g_host, g_port);
+            g_host = g_cfg.host;
+            g_port = g_cfg.port;
+            if (g_cfg.token[0]) g_token = g_cfg.token;
+            LOGI("Config loaded: host=%s port=%d", g_host, g_port);
         }
         
         g_connected = false;
@@ -1661,44 +1513,39 @@ int main(int argc, char** argv) {
         
         g_connected = true;
         LOGI("Connected to server!");
-        
-        // Peripheral state is logged only on actual transitions now:
-        //   - Zygisk: the zygisk module sets layout->module_active when it
-        //             mmap's our SHM (see zygisk_module.cpp).
-        //   - Java:   read_java_client() logs on HELO_JAVA.
-        // A point-in-time check here was racy — it ran before either side
-        // had a chance to connect, and then sat in the log misleadingly.
-        auto* layout = (SharedMemoryLayout*)g_shm_ptr;
-        LOGI("Peripherals (snapshot): zygisk=%s java=%s "
-             "(both are wired lazily; watch for their own connect logs)",
-             layout->module_active.load() ? "ACTIVE" : "pending",
-             g_java_fd.load() >= 0        ? "ACTIVE" : "pending");
-        
+
+        // Initialize pong tracker at connect time
+        g_last_pong.store(time(nullptr));
+
         // Start worker threads
         std::thread status_thread(status_sender_thread, &g_net);
-        std::thread speaker_thread(capture_speaker_thread, &g_net);
         std::thread mic_thread(receive_virtual_mic_thread, &g_net);
-        // Try tinyalsa mic injection in parallel (no-op if HAL owns the device).
-        std::thread tinyalsa_thread(tinyalsa_mic_inject_thread);
         
-        // Connection watchdog: periodically send ping to detect dead connections
+        // Connection watchdog: 15s ping, 90s pong timeout
         while(g_running && g_connected) {
-            sleep(10);
+            sleep(15);
             if(!g_connected) break;
-            
-            // Send a ping frame to check if connection is alive
-            if(!send_frame(&g_net, T_PING, nullptr, 0)) {
-                LOGW("Connection watchdog: ping failed, server appears to be down");
+
+            time_t now = time(nullptr);
+            if (now - g_last_pong.load() > 90) {
+                LOGW("Heartbeat timeout (90s without pong), disconnecting");
                 g_connected = false;
                 g_status_cv.notify_all();
                 break;
             }
+
+            if(!send_frame(&g_net, T_PING, nullptr, 0)) {
+                LOGW("Ping send failed, disconnecting");
+                g_connected = false;
+                g_status_cv.notify_all();
+                break;
+            }
+            send_to_java_raw("{\"command\":\"get_device_status\"}");
         }
-        
+
+        voice_call_stop();
         status_thread.join();
-        speaker_thread.join();
         mic_thread.join();
-        tinyalsa_thread.join();
         
         tcp_cleanup();
         g_connected = false;
@@ -1709,8 +1556,6 @@ int main(int argc, char** argv) {
     unix_thread.join();
     
     // Cleanup
-    if(g_shm_ptr) munmap(g_shm_ptr, SHM_SIZE);
-    if(g_shm_fd >= 0) close(g_shm_fd);
     if(g_log_file) fclose(g_log_file);
     
     remove_pid_file();
