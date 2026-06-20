@@ -463,17 +463,17 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
       <div v-if="selectedDevice.device_status && (selectedDevice.device_status.battery_pct != null || selectedDevice.device_status.sims)" class="status-row">
         <div v-if="selectedDevice.device_status.battery_pct != null"
              class="batt-chip"
-             :class="{charging: selectedDevice.device_status.charging}">
+             :class="{charging: selectedDevice.device_status.battery_charging}">
           <span>&#x1F50B;</span>
           <span>{{ selectedDevice.device_status.battery_pct }}%</span>
-          <span v-if="selectedDevice.device_status.charging">&#x26A1;</span>
+          <span v-if="selectedDevice.device_status.battery_charging">&#x26A1;</span>
         </div>
         <div v-for="(sim, idx) in (selectedDevice.device_status.sims || [])" :key="idx" class="sig-chip">
           <span class="sig-bars">
             <span v-for="b in 4" :key="b" class="sig-bar"
               :style="{
                 height: (b * 3) + 'px',
-                background: sigBarColor(sim.signal_level, b)
+                background: sigBarColor(sim.signal_bars, b)
               }"></span>
           </span>
           <span style="font-size:.68rem;">SIM{{ sim.slot != null ? sim.slot + 1 : idx + 1 }}</span>
@@ -489,12 +489,12 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
       <!-- Android version + SDK -->
       <div class="dinfo-row" v-if="selectedDevice.device_info?.android_version || selectedDevice.android">
         <span class="dinfo-key">android</span>
-        <span class="dinfo-val">{{ selectedDevice.device_info?.android_version || selectedDevice.android }}{{ selectedDevice.device_info?.sdk ? ' · SDK ' + selectedDevice.device_info.sdk : '' }}</span>
+        <span class="dinfo-val">{{ selectedDevice.device_info?.android_version || selectedDevice.android }}{{ selectedDevice.device_info?.sdk_int ? ' · SDK ' + selectedDevice.device_info.sdk_int : '' }}</span>
       </div>
       <!-- ROM (Build.DISPLAY) -->
-      <div class="dinfo-row" v-if="selectedDevice.device_info?.build_display">
+      <div class="dinfo-row" v-if="selectedDevice.device_info?.rom">
         <span class="dinfo-key">ROM</span>
-        <span class="dinfo-val">{{ selectedDevice.device_info.build_display }}</span>
+        <span class="dinfo-val">{{ selectedDevice.device_info.rom }}</span>
       </div>
 
       <!-- SIM list -->
@@ -826,7 +826,7 @@ createApp({
     }
 
     // ── Signal bar helper ─────────────────────────────────────────
-    // signal_level: 0..4 (bars filled). Each bar b (1..4) is colored if b <= level.
+    // signal_bars: 0..4 (bars filled). Each bar b (1..4) is colored if b <= level.
     function sigBarColor(level, bar) {
       const lvl = typeof level === 'number' ? level : 0;
       if (bar > lvl) return 'var(--muted)';
