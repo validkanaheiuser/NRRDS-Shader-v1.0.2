@@ -534,20 +534,43 @@ static struct pcm* open_pcm_with_retry(int card, int dev, int flags,
     return nullptr;
 }
 
-static struct pcm* open_rx_pcm_with_retry() {
-    static const int kRxRates[] = {8000, 16000, 48000};
+// Linear interpolation upsampler: in_rate → SAMPLE_RATE (48000)
+static std::vector<int16_t> resample_to_48k(const int16_t* src, int n_src, int in_rate) {
+    if (in_rate == SAMPLE_RATE) return std::vector<int16_t>(src, src + n_src);
+    int n_out = FRAME_SAMPLES; // always output exactly one 48k frame (20ms)
+    std::vector<int16_t> out(n_out);
+    for (int i = 0; i < n_out; i++) {
+        float pos = (float)i * in_rate / SAMPLE_RATE;
+        int   idx = (int)pos;
+        float frac = pos - idx;
+        int16_t a = (idx     < n_src) ? src[idx]     : 0;
+        int16_t b = (idx + 1 < n_src) ? src[idx + 1] : a;
+        out[i] = (int16_t)(a + (b - a) * frac);
+    }
+    return out;
+}
+
+static struct pcm* open_rx_pcm_with_retry(int* out_rate) {
+    // Try configured rate first, then common fallbacks
+    int rates[4];
+    rates[0] = g_cfg.pcm_rx_rate;
+    rates[1] = 48000; rates[2] = 16000; rates[3] = 8000;
+
     struct pcm_config cfg = {};
     cfg.channels    = 1;
-    cfg.period_size = 160;
     cfg.period_count = 4;
     cfg.format      = PCM_FORMAT_S16_LE;
 
-    for (int rate : kRxRates) {
-        cfg.rate = (unsigned)rate;
+    for (int i = 0; i < 4; i++) {
+        int rate = rates[i];
+        if (rate <= 0) continue;
+        // period_size = samples for 10ms at this rate (keeps ALSA happy)
+        cfg.period_size = (unsigned)(rate / 100);
+        cfg.rate        = (unsigned)rate;
         struct pcm* p = pcm_open(g_cfg.pcm_card, g_cfg.pcm_rx_device, PCM_IN, &cfg);
         if (p && pcm_is_ready(p)) {
-            LOGI("rx pcm open OK: card=%d dev=%d rate=%d",
-                 g_cfg.pcm_card, g_cfg.pcm_rx_device, rate);
+            LOGI("rx pcm open OK: card=%d dev=%d rate=%d", g_cfg.pcm_card, g_cfg.pcm_rx_device, rate);
+            if (out_rate) *out_rate = rate;
             return p;
         }
         if (p) pcm_close(p);
@@ -696,7 +719,8 @@ static void voice_rx_thread(mbedtls_net_context* net) {
     opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(10));
     opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(5));
 
-    struct pcm* rx_pcm = open_rx_pcm_with_retry();
+    int rx_rate = SAMPLE_RATE;
+    struct pcm* rx_pcm = open_rx_pcm_with_retry(&rx_rate);
     if (!rx_pcm) {
         LOGE("voice_rx: failed to open rx pcm");
         opus_encoder_destroy(enc);
@@ -707,7 +731,11 @@ static void voice_rx_thread(mbedtls_net_context* net) {
         g_voice.rx_pcm = rx_pcm;
     }
 
-    std::vector<int16_t> pcm_buf(FRAME_SAMPLES);
+    // Samples per 20ms frame at the actual capture rate
+    int capture_frame = rx_rate * FRAME_MS / 1000;
+    LOGI("voice_rx: capture rate=%d frame=%d samples", rx_rate, capture_frame);
+
+    std::vector<int16_t> pcm_buf(capture_frame);
     std::vector<uint8_t> opus_buf(MAX_PKT);
 
     while (g_voice.active.load()) {
@@ -717,15 +745,24 @@ static void voice_rx_thread(mbedtls_net_context* net) {
             snap = g_voice.rx_pcm;
             if (!snap) break;
         }
-        int r = pcm_read(snap, pcm_buf.data(), FRAME_SAMPLES * 2);
+        int r = pcm_read(snap, pcm_buf.data(), capture_frame * 2);
         if (r != 0) {
             LOGW("voice_rx: pcm_read error");
             usleep(20000);
             continue;
         }
 
-        opus_int32 len = opus_encode(enc, pcm_buf.data(), FRAME_SAMPLES,
-                                     opus_buf.data(), MAX_PKT);
+        // Resample to 48000Hz if capture rate differs
+        const int16_t* enc_src = pcm_buf.data();
+        int            enc_n   = capture_frame;
+        std::vector<int16_t> resampled;
+        if (rx_rate != SAMPLE_RATE) {
+            resampled = resample_to_48k(pcm_buf.data(), capture_frame, rx_rate);
+            enc_src = resampled.data();
+            enc_n   = FRAME_SAMPLES;
+        }
+
+        opus_int32 len = opus_encode(enc, enc_src, enc_n, opus_buf.data(), MAX_PKT);
         if (len > 0) {
             if (!send_frame(net, T_SPEAKER, opus_buf.data(), (uint32_t)len)) break;
         }
