@@ -58,6 +58,27 @@ fi
     done
 ) &
 
+# ── Write status.json for webroot read-only mode ─────────────────────────────
+WEBROOT="$MODDIR/webroot"
+write_status_json() {
+    PID=$(pidof audio-bridge 2>/dev/null | awk '{print $1}')
+    RUNNING=false; [ -n "$PID" ] && RUNNING=true
+    CONN=$(grep -aoE "Connected to [0-9.:]+|Disconnected|No config" "$LOG" 2>/dev/null | tail -1 || echo "")
+    CFG_JSON=""
+    [ -f "$CONFIG" ] && CFG_JSON=$(cat "$CONFIG" 2>/dev/null)
+    LOG_TAIL=$(tail -n 60 "$LOG" 2>/dev/null | sed 's/\\/\\\\/g;s/"/\\"/g' | awk '{printf "%s\\n",$0}')
+    printf '{"running":%s,"pid":"%s","conn":"%s","log":"%s","config":%s}\n' \
+        "$RUNNING" "${PID:-}" "$CONN" "$LOG_TAIL" "${CFG_JSON:-null}" \
+        > "$WEBROOT/status.json" 2>/dev/null
+}
+(
+    sleep 15  # wait for daemon to connect before first write
+    while true; do
+        write_status_json
+        sleep 30
+    done
+) &
+
 # ── Wait for boot and start APK ──────────────────────────────────────────────
 (
     for i in $(seq 1 60); do
