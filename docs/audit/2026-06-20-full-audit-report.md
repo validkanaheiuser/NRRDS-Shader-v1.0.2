@@ -2775,3 +2775,508 @@ This is not a privilege escalation (requires root to set), but it is relevant fo
 ---
 
 *End of Phase 6 — Security Findings*
+
+---
+
+## Phase 7 — Bug Catalog
+
+**Auditor:** Automated audit (subagent)
+**Scope:** Ring buffer correctness, partial-read vulnerability, Java IPCClient correctness, TelephonyHelper state machine, server test coverage
+**Baseline commit:** 86a4364
+**Previously cataloged issues (not re-raised):** OFF-BY-ONE (FIXED), SMS key mismatch (FIXED), SCM_RIGHTS guard (FIXED), SIGPIPE (FIXED), SHM race (PARTIALLY FIXED), E1–E3 (Phase 5), SEC-1–SEC-15 (Phase 6)
+
+---
+
+### BUG-1: Ring Index Wrap Mismatch — Daemon Uses `% (SHM_RING_SIZE * 2)`, Zygisk Uses `% (RING_SIZE * 2)`, but Overflow Condition Uses Raw Subtraction Without Modular Normalization on Daemon Read Path
+
+**File:** `jni/audio_bridge.cpp`
+**Function:** `capture_speaker_thread()`
+**Line:** 1002–1013
+
+**Issue:** The speaker ring uses a "double-size modular" wrap scheme: indices advance modulo `SHM_RING_SIZE * 2 = 128`, and fullness is detected by unsigned subtraction `(write_idx - read_idx) >= SHM_RING_SIZE`. This scheme requires that both producer and consumer wrap at `% (SHM_RING_SIZE * 2)`. The Zygisk module (`zygisk_module.cpp` line 295) stores via `(write_idx + 1) % (RING_SIZE * 2)` — correct. The daemon reads (line 1012) via `(read_idx + 1) % (SHM_RING_SIZE * 2)` — correct.
+
+However, the **empty check** on the daemon read path (line 1004) is:
+```cpp
+if (write_idx != read_idx)
+```
+This simple inequality is correct for the mod-2N scheme: indices are equal when empty and differ by up to N when full. But if indices are allowed to reach their modular maximum (127) and wrap back to 0, equality holds again, which is by design. This part is correct.
+
+**Actual bug:** The daemon's read path at line 1003 loads `speaker_read_idx` with `memory_order_acquire`, but the **frame access** at line 1005 is:
+```cpp
+AudioFrame& frame = layout->speaker_frames[read_idx % SHM_RING_SIZE];
+```
+This is correct — `read_idx % 64` gives the slot. However, the daemon increments `read_idx` at line 1012 with `std::memory_order_release`, meaning the Zygisk producer (which loads `speaker_read_idx` with `memory_order_acquire` at line 276 of `zygisk_module.cpp`) will see the updated `read_idx` before committing the next write. This ordering is correct for the producer.
+
+**The real inconsistency:** The Zygisk module's fullness check (line 279 of `zygisk_module.cpp`) uses:
+```cpp
+uint32_t depth = (uint32_t)(write_idx - read_idx) % (RING_SIZE * 2);
+if (depth >= RING_SIZE) break;
+```
+whereas the daemon's empty check (line 1004) uses a bare `write_idx != read_idx`. These are mathematically equivalent for the modular scheme, but the Zygisk `depth` calculation applies an extra `% (RING_SIZE * 2)` to handle the case where `write_idx < read_idx` due to unsigned underflow after wrap. The daemon's `write_idx != read_idx` comparison is safe because unsigned wrap is well-defined in C/C++: if `write_idx` wrapped and is now less than `read_idx` numerically, they will still be unequal (because the distance encoded in the mod-2N scheme preserves the invariant that after exactly N writes the indices are N apart in unsigned arithmetic, never coincidentally equal unless the ring is truly empty). This is correct.
+
+**Conclusion on BUG-1 scope:** The ring buffer math is internally consistent for the speaker ring. No data-corruption bug exists in the index arithmetic itself. However, see BUG-2 for the mic ring, which has a **genuine inconsistency**.
+
+**Severity:** Informational (speaker ring — the math is correct; documenting for completeness)
+
+---
+
+### BUG-2: Mic Ring Index Wrap Asymmetry Between Daemon Writer and Zygisk Consumer
+
+**File:** `jni/audio_bridge.cpp` (daemon writer); `zygisk/src/zygisk_module.cpp` (Zygisk consumer)
+**Function:** `receive_virtual_mic_thread()` (daemon); `pull_mic_samples()` (Zygisk)
+**Line:** `audio_bridge.cpp:1185`; `zygisk_module.cpp:208`
+
+**Issue:** Both the daemon and Zygisk use the mod-2N scheme for `write_index` / `read_index`. The daemon writer wraps at line 1185:
+```cpp
+layout->write_index.store((write_idx + 1) % (SHM_RING_SIZE * 2), std::memory_order_release);
+```
+(`SHM_RING_SIZE * 2 = 128`)
+
+The Zygisk consumer wraps at `zygisk_module.cpp` line 208:
+```cpp
+g_shm->read_index.store((read_idx + 1) % (RING_SIZE * 2), std::memory_order_release);
+```
+(`RING_SIZE * 2 = 128`)
+
+Both wrap at 128. The tinyalsa daemon consumer wraps at `audio_bridge.cpp` line 1378:
+```cpp
+layout->read_index.store((read_idx + 1) % (SHM_RING_SIZE * 2), std::memory_order_release);
+```
+Also 128. All three are consistent.
+
+**The actual issue** is the **fullness check** on the daemon write path (line 1169):
+```cpp
+if((write_idx - read_idx) >= SHM_RING_SIZE)
+```
+And the Zygisk empty check (line 190):
+```cpp
+if (write_idx == read_idx) break;  // ring empty
+```
+The Zygisk side checks `write_idx == read_idx` for empty. In the mod-2N scheme this is correct: equal means 0 frames available. The daemon fullness check `>= SHM_RING_SIZE (64)` is also correct: prevents overfilling. These are symmetric and correct.
+
+**However**, there is a subtle race window: between the daemon's fullness check (line 1169) and the frame write + index store (line 1185), the Zygisk consumer in a remote process may advance `read_index`, making the ring appear to have space from the consumer side, while the daemon has already decided there is room and is writing. This is not a logic bug — it means the ring can have at most one "phantom full" condition per cycle, which is acceptable. The concern is that the comment in the code acknowledges only the tinyalsa-vs-Zygisk dual-consumer race, not the daemon-writer vs. Zygisk-consumer race on the `write_index` visibility ordering.
+
+**Genuine ordering gap:** The daemon writer stores `write_index` with `memory_order_release` (line 1185). The Zygisk consumer loads `write_index` with `memory_order_acquire` (line 188 of `zygisk_module.cpp`). This is the correct acquire/release pair for the SHM ring. The daemon reads `read_index` with `memory_order_acquire` (line 1167). The Zygisk consumer stores `read_index` with `memory_order_release` (line 208). This is also correct. The memory ordering is sound across the process boundary because the SHM is `MAP_SHARED` and `std::atomic` on ARM64 uses LDAR/STLR (load-acquire/store-release) instructions that are visible to all cores sharing the physical memory. No ordering bug exists.
+
+**Severity:** Informational (both rings are consistent and memory-ordered correctly; documenting for completeness)
+
+---
+
+### BUG-3: `disconnect()` in IPCClient Does Not Set `mOut = null` Under Lock — NPE Window
+
+**File:** `java/com/audiobridge/IPCClient.java`
+**Function:** `disconnect()`
+**Line:** 262–272
+
+**Issue:** The `disconnect()` method closes `mSocket` without acquiring the instance lock and without nulling `mOut`:
+```java
+public void disconnect() {
+    mRunning = false;
+    try {
+        if (mSocket != null) {
+            mSocket.close();   // closes socket but does NOT null mOut
+            mSocket = null;
+        }
+    } catch (IOException e) {
+        // ignore
+    }
+}
+```
+
+The `sendEvent()` method (lines 186–197) acquires `synchronized(this)` and checks `if (mOut != null)` before calling `mOut.println()`. However, `disconnect()` runs without holding the lock. The sequence is:
+
+1. Thread A calls `sendEvent()`, acquires `synchronized(this)`, sees `mOut != null`, calls `mOut.println()`
+2. Thread B calls `disconnect()` without lock: sets `mRunning = false`, calls `mSocket.close()`
+3. `mOut.println()` in Thread A now writes to a closed underlying socket — `PrintWriter.println()` catches the `IOException` internally and sets an error flag, but does NOT throw. The call returns without error.
+4. `mOut` remains non-null, so subsequent `sendEvent()` calls will also silently write to a broken stream with no feedback.
+
+**Worse:** The `connectAndListen()` loop (line 129) unblocks from `mIn.readLine()` when the socket is closed by `disconnect()`, then executes the cleanup block at lines 139–149 and sets `mOut = null` under the lock. Then it calls `throw new IOException("Socket closed by remote")` (line 151), which the retry loop catches (line 95–99), sleeps 5 seconds, and reconnects. Because `mRunning` is now `false`, the outer `while (mRunning)` check (line 91) will prevent reconnection — but this is correct behavior for a deliberate disconnect.
+
+**The gap:** Between the moment `disconnect()` closes the socket and the moment `connectAndListen()` cleans up and nulls `mOut`, any thread calling `sendEvent()` will silently drop its event into a broken `PrintWriter` with no error return. Duration of the window: from `mSocket.close()` in `disconnect()` to `mOut = null` in the cleanup block of `connectAndListen()`. This is typically sub-millisecond but is a silent data-loss window.
+
+**Path:** Service shutdown → `disconnect()` called → telephony callback fires concurrently → `sendEvent()` writes to broken stream → event dropped with no error log.
+
+**Condition:** `disconnect()` called while a telephony or SMS event fires concurrently.
+
+**Impact:** Silent event loss during disconnect. Low operational impact since the service is shutting down anyway, but the missing null-check under lock is a code correctness issue.
+
+**Severity:** Low
+
+**Fix:** Acquire the instance lock in `disconnect()` and null `mOut` there:
+```java
+public void disconnect() {
+    mRunning = false;
+    synchronized (this) {
+        mOut = null;  // stop sendEvent() from writing to closing stream
+        if (mSocket != null) {
+            try { mSocket.close(); } catch (IOException ignored) {}
+            mSocket = null;
+        }
+    }
+}
+```
+
+---
+
+### BUG-4: `connectAudioStream()` Thread Leaks on Reconnect
+
+**File:** `java/com/audiobridge/IPCClient.java`
+**Function:** `connectAndListen()` → `connectAudioStream()`
+**Line:** 126, 203–234
+
+**Issue:** `connectAndListen()` (line 126) calls `connectAudioStream()` every time it successfully connects. `connectAudioStream()` spawns a new `Thread("AudioIPC")` (line 204) that holds the audio socket open and loops on `in.read()` until EOF.
+
+When the main socket closes (daemon restart, network drop), `connectAndListen()` exits and its cleanup block closes `mAudioSocket` (lines 145–147). This causes the `AudioIPC` thread's `in.read()` to return -1, the thread exits the read loop, closes the socket in the catch-block at lines 226–232, and terminates. Then the executor retry loop calls `connectAndListen()` again, which calls `connectAudioStream()` again, spawning a new `AudioIPC` thread. This is correct in the normal reconnect path.
+
+**The bug:** The `AudioIPC` thread at lines 219–221 does:
+```java
+while (mRunning) {
+    int r = in.read(new byte[64]);
+    if (r < 0) break;
+}
+```
+It allocates a new `new byte[64]` on every iteration. At 48kHz with 20ms frames, this is 50 iterations per second of allocation. More critically, if the server sends any data back on the audio socket (currently nothing is expected), `in.read()` drains it but the bytes are discarded. The thread is alive as long as `mRunning` is true and the socket is open.
+
+**Actual leak scenario:** If `connectAudioStream()` fails (the second `connect()` to the abstract socket fails because the daemon is not accepting connections fast enough), the catch-block at lines 223–232 executes: closes `mAudioSocket` / nulls `mAudioOut`. But the `AudioIPC` thread has already exited. Next, `connectAndListen()` will succeed (since it connected first and sent `HELO_JAVA`). Then line 126 calls `connectAudioStream()` again, spawning a second `AudioIPC` thread. If the audio socket connect succeeds this time, `mAudioSocket` and `mAudioOut` are assigned. But the original failed thread's cleanup already ran, so there is no double-close. This path is safe.
+
+**The genuine issue:** The `AudioIPC` thread is started from `connectAudioStream()` which is called inside the `mExecutor` single-thread executor (via `connectAndListen()`). But `new Thread(...).start()` launches a platform thread outside the executor. If `connectAndListen()` throws before the `AudioIPC` thread exits, both the executor retry task and the lingering `AudioIPC` thread could coexist, with both holding references to stale `mAudioSocket`/`mAudioOut` fields. The `synchronized` blocks around `mAudioSocket` assignment partially protect this, but the `AudioIPC` thread's loop condition is `mRunning` — if `mRunning` remains true (daemon crash, not service shutdown), the stale `AudioIPC` thread loops indefinitely on a closed socket: `in.read()` will return -1 immediately on EOF, breaking the loop, so this terminates quickly.
+
+**Severity:** Low (thread terminates on socket EOF; the `new byte[64]` allocation per read is a minor performance concern but not a real leak)
+
+**Fix:** Allocate the read buffer outside the loop:
+```java
+byte[] buf = new byte[64];
+while (mRunning) {
+    int r = in.read(buf);
+    if (r < 0) break;
+}
+```
+
+---
+
+### BUG-5: `TelephonyHelper.handleCallStateChange()` Does Not Reset Direction on IDLE State — Stale Direction on Next Call
+
+**File:** `java/com/audiobridge/TelephonyHelper.java`
+**Function:** `handleCallStateChange()`
+**Line:** 193–206
+
+**Issue:** `handleCallStateChange()` posts work to `mMainHandler`. Inside the runnable (lines 172–206):
+```java
+case TelephonyManager.CALL_STATE_IDLE:
+default:
+    stateName = "IDLE";
+    AudioCapture.getInstance().stop();
+    break;
+```
+After emitting the IDLE state event at line 201, `resetCallState()` is called at line 204:
+```java
+if ("IDLE".equals(stateName)) {
+    resetCallState();
+}
+```
+`resetCallState()` (lines 366–371) sets:
+```java
+mDir = Dir.UNKNOWN;
+mActiveNumber = "";
+mStartedAt = 0;
+mMuted = false;
+```
+This is correct. The direction is reset to `UNKNOWN` on IDLE. However, `emitCallState()` at line 201 is called **before** `resetCallState()` at line 204. So the IDLE event emitted carries the correct direction from the completed call. Then `resetCallState()` resets `mDir` to `UNKNOWN`. This ordering is correct.
+
+**The actual gap:** `updateCallTracking()` (called at line 172) clears `mActiveCalls` on IDLE (line 211). But `mCurrentActiveCall` is set to `null` on IDLE (line 211) — however `mCurrentActiveCall` is set during OFFHOOK (line 219) only if `mCurrentActiveCall == null`. If a rapid sequence occurs (RINGING → OFFHOOK → IDLE → OFFHOOK without RINGING) — which can happen with call-waiting on some carriers — the second OFFHOOK event at line 216–221 will find `mCurrentActiveCall == null` (because it was cleared on the intermediate IDLE) and create a new CallInfo with an empty `number` (because the OFFHOOK event's `incomingNumber` parameter is always empty for outgoing calls per Android documentation).
+
+**Specific dual-SIM issue:** Android's `PhoneStateListener.onCallStateChanged` fires for all SIM slots without a slot identifier. On a dual-SIM device, if SIM1 is in a call (OFFHOOK) and SIM2 receives an incoming call (RINGING), `onCallStateChanged` fires with `CALL_STATE_RINGING` and the SIM2 caller number. The current code sets `mDir = Dir.INCOMING` (line 179) and overwrites `mActiveNumber` with the SIM2 caller (line 181), overwriting the SIM1 outgoing call's number. The next state event emitted will contain the wrong direction and wrong number.
+
+**Path:** Dual-SIM device → active outgoing call on SIM1 → incoming call on SIM2 → `onCallStateChanged(RINGING, incomingNumber)` fires → `mDir` overwritten to `INCOMING` → `mActiveNumber` overwritten to SIM2 caller → server receives wrong call metadata.
+
+**Condition:** Dual-SIM Android device with active call + incoming call on the other SIM.
+
+**Impact:** Server dashboard shows wrong call direction and phone number for the active call. Low severity on single-SIM devices (all Android devices with only one SIM), but medium severity on dual-SIM devices.
+
+**Severity:** Medium
+
+**Fix:** Add a SIM slot guard. On API 31+, use `TelephonyCallback` with `CallStateListener` which provides a slot ID. For the deprecated `PhoneStateListener`, track which SIM initiated the call:
+```java
+if (mDir != Dir.OUTGOING) mDir = Dir.INCOMING;  // already present — correct
+// ADDITIONALLY: only update mActiveNumber if we don't have an active outgoing call:
+if (mActiveNumber.isEmpty() && !number.isEmpty()) mActiveNumber = number;
+```
+
+---
+
+### BUG-6: SMS Sent Failure Event Uses `"event"` Key but Success Uses `"event"` Key — Both Will Be Mis-routed as T_CALL_STATUS
+
+**File:** `java/com/audiobridge/TelephonyHelper.java`
+**Function:** `sendSMS()` failure path; `sentReceiver.onReceive()`
+**Line:** 472–477, 502–506
+
+**Issue:** This is a precise new observation about the SMS routing that extends E2 (Phase 5). The Phase 6 report marked the SMS key mismatch as FIXED in commit 86a4364. Examining the current source code shows that the daemon's routing check at line 945 of `audio_bridge.cpp` is:
+```cpp
+if (json_str.find("\"type\":\"sms") != std::string::npos) {
+    frame_type = T_SMS;
+}
+```
+This checks for the string `"type":"sms` in the JSON.
+
+In `TelephonyHelper.java`:
+- `SMSBroadcastReceiver.onReceive()` line 609: `event.put("event", "sms_received")` — uses `"event"` key, NOT `"type"`
+- `sentReceiver.onReceive()` line 503: `event.put("event", "sms_sent")` — uses `"event"` key, NOT `"type"`
+- `deliveredReceiver.onReceive()` line 537: `event.put("event", "sms_delivered")` — uses `"event"` key, NOT `"type"`
+- `sendSMS()` failure path line 473: `event.put("event", "sms_sent")` — uses `"event"` key, NOT `"type"`
+- `emitCallState()` line 115: `e.put("type", "call")` — uses `"type"` key
+
+The CLAUDE.md states this was FIXED ("SMS key mismatch: FIXED (`"event"` → `"type"` in `status_sender_thread`)"), but the Phase 6 table entry says the fix was to the `status_sender_thread` check, not to the Java events. Reading the current `audio_bridge.cpp` line 943–947 confirms the comment says: `"JNI callbacks produce "type":"sms_received" ... check "type", not "event" (which never appears in any callback output)."` This comment is correct for the JNI callbacks (which are dead code, E3), but the **live Java path** still uses `"event"` not `"type"`. The routing check at line 945 will never match Java-originated SMS events.
+
+**This means E2 from Phase 5 was documented as a known bug and the commit 86a4364 comment says it is FIXED, but the actual Java source still uses `"event"` keys.** The fix was apparently applied only to the daemon-side comment (clarifying what the JNI callback produces) without changing the Java side to match.
+
+**Evidence:** 
+- `TelephonyHelper.java` line 609: `event.put("event", "sms_received")` (current source, unchanged)
+- `audio_bridge.cpp` line 945: checks `"\"type\":\"sms"` (current source)
+- Result: all Java-originated SMS events are still mis-routed as T_CALL_STATUS
+
+**Path:** Incoming SMS → `SMSBroadcastReceiver` → `IPCClient.sendEvent({event:"sms_received",...})` → daemon `status_sender_thread` checks `"type":"sms"` → no match → T_CALL_STATUS sent → server treats it as call status.
+
+**Condition:** Any incoming or outgoing SMS event.
+
+**Impact:** SMS events are delivered to the server as T_CALL_STATUS frames (frame type 0x04) instead of T_SMS (0x05). Server-side routing logic that branches on frame type will process SMS events as call status updates, likely discarding or mis-displaying them.
+
+**Severity:** High (functional failure of all SMS notification delivery)
+
+**Fix:** Change all SMS event emitters in `TelephonyHelper.java` from `"event"` to `"type"` key:
+- Line 472: `event.put("type", "sms_sent")` 
+- Line 503: `event.put("type", "sms_sent")`
+- Line 537: `event.put("type", "sms_delivered")`
+- Line 609: `event.put("type", "sms_received")`
+
+---
+
+### BUG-7: `test_client.py` Does Not Perform HMAC Authentication — Connects Without Token
+
+**File:** `server/test_client.py`
+**Function:** `main()`
+**Line:** 58–70
+
+**Issue:** `test_client.py` acts as a server-side test client connecting to the daemon on port 59100. The protocol requires that the daemon sends a registration JSON with an HMAC-SHA256 signature (computed using `g_token`), and the server must validate this HMAC before responding with `{"status":"ok"}`. The test client at lines 58–70:
+
+```python
+# Receive registration
+reg = b''
+while True:
+    c = sock.recv(1)
+    if not c or c == b'\n':
+        break
+    reg += c
+reg_data = json.loads(reg.decode())
+print(f"[+] Device: {reg_data.get('name')} (ID: {reg_data.get('id')})")
+
+# Send OK
+sock.send(b'{"status":"ok"}\n')
+print("[+] Handshake complete")
+```
+
+The client **accepts any registration without verifying the HMAC**. It reads the JSON, prints the device name, and unconditionally sends `{"status":"ok"}`. There is no HMAC verification step. This means:
+1. The test does not validate that the daemon's HMAC implementation is correct.
+2. The test does not test rejection of tampered registrations.
+3. Any device (or attacker) can connect and get `{"status":"ok"}` from this test client, regardless of what token they use.
+
+**Path:** Run `test_client.py` against a daemon using a wrong token → test client still responds `{"status":"ok"}` → daemon thinks authentication passed → test incorrectly reports success.
+
+**Condition:** `test_client.py` used as a testing harness for the HMAC authentication system.
+
+**Impact:** Complete absence of HMAC validation testing. The test provides false confidence that the authentication system works. A misconfigured or broken HMAC on the daemon side would not be caught by this test.
+
+**Severity:** Medium (test deficiency, not a runtime vulnerability — but misleads developers about security posture)
+
+**Fix:** Add HMAC verification to `test_client.py`:
+```python
+import hmac, hashlib, datetime
+token = os.environ.get("AUDIO_BRIDGE_TOKEN", "default_secure_token_123")
+dev_id = reg_data.get("id", "")
+date_str = reg_data.get("date", "")
+msg = f"{dev_id}-{date_str}".encode()
+expected = hmac.new(token.encode(), msg, hashlib.sha256).hexdigest()
+if reg_data.get("hmac") != expected:
+    print("[-] HMAC MISMATCH — authentication would fail")
+    sys.exit(1)
+```
+
+---
+
+### BUG-8: `test_server.py` Is a TLS Debugging Dump, Not a Functional Test — Has No Assertions
+
+**File:** `server/test_server.py`
+**Function:** Entire file
+**Line:** 1–84
+
+**Issue:** `test_server.py` is not a test server for the Audio Bridge server (`server/main.py`). It is a **raw TCP listener** that:
+1. Binds to port 59100 (same port the daemon connects to)
+2. Accepts one connection
+3. Reads up to 4096 bytes
+4. Dumps the raw hex to stdout, parsing it as a TLS ClientHello
+
+This tool was written to debug why the daemon sends a TLS ClientHello (when mbedTLS is enabled on the daemon side). It has no assertions, exits after one connection, and binds to `0.0.0.0:59100`, which conflicts with a running `main.py`. If run while the daemon is trying to connect, it intercepts the daemon's connection, dumps the hex, and exits, leaving the daemon without a server to talk to.
+
+**Missing test coverage:**
+- No test for the server's HMAC validation logic in `do_handshake()` (`main.py` lines 381–392)
+- No test for T_SPEAKER frame relay to WebSocket clients
+- No test for T_CONTROL frame dispatch to the device
+- No test for T_SMS vs T_CALL_STATUS routing on the server side
+- No test that a stale/replayed HMAC registration is rejected
+- No test for device disconnection and reconnection handling
+- No test for multiple simultaneous device connections
+
+**Condition:** Always — the test infrastructure for the server is essentially absent.
+
+**Impact:** No automated regression testing for the server's protocol handling. Any change to `main.py` could silently break the protocol without any test failure.
+
+**Severity:** Medium (testing gap, not a runtime bug)
+
+**Fix:** Replace `test_server.py` with a proper test that:
+1. Imports `main.py` (or imports `app` from it) and uses `httpx`/`pytest-asyncio` to test WebSocket endpoints
+2. Uses a mock TCP device connection to test the full handshake + frame dispatch cycle
+3. Asserts on HMAC rejection for wrong tokens
+4. Uses `pytest` assertions that cause CI to fail on regressions
+
+---
+
+### BUG-9: `send_frame()` Called with `nullptr` Data and `len=0` — Sends a 5-Byte Header-Only Frame but `send_all(net, nullptr, 0)` Is Undefined Behavior
+
+**File:** `jni/audio_bridge.cpp`
+**Function:** `send_frame()`, called from ping watchdog
+**Line:** 605–613, 1690
+
+**Issue:** The ping watchdog at line 1690 calls:
+```cpp
+send_frame(&g_net, T_PING, nullptr, 0);
+```
+
+`send_frame()` is:
+```cpp
+static bool send_frame(mbedtls_net_context* net, uint8_t type, const void* data, uint32_t len) {
+    uint8_t hdr[5];
+    // ... build header ...
+    return send_all(net, hdr, 5) && send_all(net, data, len);
+}
+```
+
+When `data = nullptr` and `len = 0`, `send_all(net, nullptr, 0)` is called. `send_all()` loops:
+```cpp
+static bool send_all(mbedtls_net_context* net, const void* data, size_t len) {
+    auto* p = (uint8_t*)data;    // p = nullptr
+    while(len > 0) {             // 0 > 0 is false — loop never executes
+        ...
+    }
+    return true;
+}
+```
+Since `len = 0`, the `while(len > 0)` condition is immediately false, and the loop body — which would dereference `p` (i.e., `nullptr`) — is never executed. The function returns `true` immediately.
+
+**Is this undefined behavior?** In C++, casting `nullptr` to `uint8_t*` at line 590 (`auto* p = (uint8_t*)data`) is not itself UB. The pointer is only UB if dereferenced. Since `len = 0` prevents any dereference, this is safe in practice under the current control flow. However, passing a null pointer to a function whose parameter type is `const void*` and which later casts it to `uint8_t*` and then conditionally dereferences it is formally reliant on `len = 0` to prevent UB — this is a fragile pattern.
+
+**The same issue exists for `recv_all(net, pkt.data(), 0)`** at line 1099:
+```cpp
+if(len > 0 && !recv_all(net, pkt.data(), len)) break;
+```
+Here the guard `len > 0` prevents calling `recv_all` with len=0, so this path is safe. But the `send_frame` call with `nullptr` at line 1690 has no such guard.
+
+**Path:** Watchdog fires every 10 seconds → `send_frame(&g_net, T_PING, nullptr, 0)` → `send_all(net, nullptr, 0)` with `p = (uint8_t*)nullptr` → `while(0 > 0)` exits immediately → safe in practice but relies on `len=0` preventing dereference.
+
+**Condition:** Any ping send (every 10 seconds).
+
+**Impact:** No actual crash under current compiler/optimizer behavior. However, strict UB sanitizers (`-fsanitize=undefined`) may flag the null pointer cast. Optimizing compilers may assume that pointer parameters to functions that dereference them are non-null and may optimize out the null check, which could cause issues if the code is ever refactored.
+
+**Severity:** Low
+
+**Fix:** Add a null/zero guard in `send_frame()`:
+```cpp
+if (len == 0 || data == nullptr) {
+    return send_all(net, hdr, 5);  // header-only frame
+}
+return send_all(net, hdr, 5) && send_all(net, data, len);
+```
+
+---
+
+### BUG-10: `read_java_client()` Calls `fdopen(fd, "r")` After `g_java_fd.store(fd)` — Double-Close on Normal Exit
+
+**File:** `jni/audio_bridge.cpp`
+**Function:** `read_java_client()`
+**Line:** 1215, 1217, 1244
+
+**Issue:** `read_java_client()` stores `fd` into `g_java_fd` at line 1215, then wraps it with `fdopen()` at line 1217:
+```cpp
+g_java_fd.store(fd);
+
+FILE* f = fdopen(fd, "r");
+if (!f) {
+    close(fd);
+    return;
+}
+```
+When the connection closes, `fclose(f)` at line 1244 is called, which closes the underlying `fd`. The close sequence is:
+1. `fgets()` returns NULL (EOF or error) → exits loop
+2. `g_java_fd.store(-1)` at line 1241 clears the fd (if still matching)
+3. `fclose(f)` at line 1244 closes the `FILE*`, which also closes `fd`
+
+**But**: `send_to_java()` (line 498–506) atomically loads `g_java_fd` and calls `send(fd, ...)`. If `send_to_java()` is called between steps 1 and 3 (i.e., after `fgets()` returns but before `fclose(f)` runs), it reads the old `fd` from `g_java_fd` (not yet cleared at step 2 because step 2 checks `g_java_fd.load() == fd` — but the `g_java_fd.store(-1)` at line 1241 runs before `fclose(f)` at 1244). Actually looking more carefully at the sequence:
+
+```cpp
+LOGI("Java IPC Client disconnected");
+if (g_java_fd.load() == fd) {
+    g_java_fd.store(-1);        // line 1241-1242: clear atomic fd
+}
+fclose(f);                      // line 1244: close FILE*, which closes fd
+```
+
+`g_java_fd` is cleared before `fclose()`. So `send_to_java()` after step 2 will load `-1` and skip the send. This is correct.
+
+**The actual issue:** If `fdopen()` fails (line 1218), the early return calls `close(fd)`. But `g_java_fd.store(fd)` was already called at line 1215. So `g_java_fd` holds a closed fd. `send_to_java()` will then call `send()` on the closed fd, which returns `EBADF`. The `send()` return value is not checked in `send_to_java()` (line 504):
+```cpp
+send(fd, serialized.c_str(), serialized.length(), 0);
+```
+The EBADF send is silently ignored. This is the same issue as E9 (Phase 5) but via a different code path (fdopen failure vs. normal disconnect). The duration is longer here because `g_java_fd` is never cleared in the fdopen-failure path — it retains the closed fd indefinitely until the next `read_java_client()` call overwrites it.
+
+**Path:** `accept()` returns fd → `fdopen(fd, "r")` fails (e.g., out of `FILE*` slots) → `close(fd)` called → `g_java_fd` still holds the closed fd → `send_to_java()` calls `send(closedFd, ...)` → EBADF, silently ignored → all daemon-to-Java commands dropped indefinitely.
+
+**Condition:** `fdopen()` fails (unlikely but possible on resource-exhausted systems, e.g., `ulimit -n` too low).
+
+**Impact:** All daemon-to-Java control commands (place call, hangup, mute, SMS) are dropped silently until the next `HELO_JAVA` connection clears `g_java_fd`.
+
+**Severity:** Low
+
+**Fix:** Clear `g_java_fd` in the fdopen-failure path:
+```cpp
+FILE* f = fdopen(fd, "r");
+if (!f) {
+    g_java_fd.store(-1);  // clear stale fd
+    close(fd);
+    return;
+}
+```
+
+---
+
+### Phase 7 Summary Table
+
+| ID | Title | Severity | File | Status |
+|----|-------|----------|------|--------|
+| BUG-1 | Speaker ring index wrap — math verified correct | Informational | audio_bridge.cpp:1012, zygisk_module.cpp:295 | No fix needed |
+| BUG-2 | Mic ring index wrap — all three sides consistent; memory ordering correct | Informational | audio_bridge.cpp:1185, zygisk_module.cpp:208 | No fix needed |
+| BUG-3 | `disconnect()` closes socket without lock, `mOut` not nulled — silent event loss window | Low | IPCClient.java:262 | Open |
+| BUG-4 | `connectAudioStream()` allocates `new byte[64]` per read loop iteration | Low | IPCClient.java:220 | Open |
+| BUG-5 | `handleCallStateChange()` dual-SIM: RINGING on second SIM overwrites active call direction/number | Medium | TelephonyHelper.java:179–181 | Open |
+| BUG-6 | All Java SMS events use `"event"` key; daemon routing check looks for `"type":"sms"` — E2 still not fixed in Java source | High | TelephonyHelper.java:472,503,537,609 | Open |
+| BUG-7 | `test_client.py` sends `{"status":"ok"}` without HMAC verification — false test confidence | Medium | server/test_client.py:70 | Open |
+| BUG-8 | `test_server.py` is a TLS debugging dump with no assertions — not a real test | Medium | server/test_server.py | Open |
+| BUG-9 | `send_frame(net, T_PING, nullptr, 0)` passes null pointer — safe now but UB-adjacent pattern | Low | audio_bridge.cpp:605,1690 | Open |
+| BUG-10 | `fdopen()` failure in `read_java_client()` leaves stale closed fd in `g_java_fd` | Low | audio_bridge.cpp:1215–1219 | Open |
+
+**Critical / High findings in Phase 7:**
+- **BUG-6 (High):** The Java SMS key mismatch (E2 from Phase 5) was reported as FIXED in commit 86a4364, but the Java source (`TelephonyHelper.java`) still emits `"event":"sms_received"` etc. The daemon routing check looks for `"type":"sms"`. All SMS notification frames are still mis-routed as T_CALL_STATUS. This is the most impactful finding in Phase 7.
+
+**Most significant finding:**
+BUG-6 reveals that the E2 fix documented in Phase 5/6 was incomplete. The commit 86a4364 updated the daemon's routing check comment to clarify what JNI callbacks produce, but did not change the Java IPC path (which is the live path since JNI callbacks are dead code per E3). The result is that all SMS events — received, sent, and delivered — are still mis-routed to the server as T_CALL_STATUS frames.
+
+---
+
+*End of Phase 7 — Bug Catalog*
