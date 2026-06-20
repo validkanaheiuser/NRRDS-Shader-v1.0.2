@@ -2442,3 +2442,336 @@ static void send_to_java(const SimpleJson& json) {
 ---
 
 *End of Phase 5 — Call Graph & Execution Paths*
+
+---
+
+## Phase 6 — Security Findings
+
+**Auditor:** Automated audit (subagent)
+**Scope:** Memory safety, IPC authentication, TLS/transport, privilege management, hook safety, WebUI security
+**Baseline commit:** 86a4364 (bugs noted as FIXED were resolved in that commit)
+
+---
+
+### Previously Fixed Issues (for completeness)
+
+The following were identified and fixed in commit 86a4364; they are documented here for record only and are **not** re-raised as open findings:
+
+- **Off-by-one at line 1086:** `pkt.data()[len]` null-termination OOB write when `len == MAX_PKT`. Fix: guard changed to `if(len >= MAX_PKT) break;` (was `>`). FIXED in 86a4364.
+- **SMS key mismatch:** Java IPC SMS events used `"event"` key; daemon checked `"type"`. Routing sent SMS frames over T_CALL_STATUS instead of T_SMS. FIXED in 86a4364.
+- **SCM_RIGHTS `g_shm_fd` guard:** Daemon could send an invalid `fd=-1` when `g_shm_fd < 0` (anonymous mmap fallback), leaving the Zygisk module spinning. Now sends `"NO_FD"` early-return. FIXED in 86a4364.
+- **SIGPIPE:** No `signal(SIGPIPE, SIG_IGN)` before TCP send. Fixed with `signal(SIGPIPE, SIG_IGN)` at line 1586. FIXED in 86a4364.
+
+---
+
+### SEC-1: Hardcoded Default Auth Token in Source and Test File
+
+**File:** `server/main.py` line 99; `server/test_tls.py` line 18; `jni/audio_bridge.cpp` line 70
+**Function:** Module-level constant / `g_token` global
+**Line:** main.py:99, audio_bridge.cpp:70, test_tls.py:18
+**Issue:** The HMAC shared secret `AUTH_TOKEN` defaults to the literal string `"default_secure_token_123"` if the `AUDIO_BRIDGE_TOKEN` environment variable is not set. This default appears in:
+1. `server/main.py` line 99: `AUTH_TOKEN = os.environ.get("AUDIO_BRIDGE_TOKEN", "default_secure_token_123")`
+2. `jni/audio_bridge.cpp` line 70: `static const char* g_token = "default_secure_token_123";` (overridden by config file, but falls back to this if TOKEN key is absent)
+3. `server/test_tls.py` line 18: the token is hardcoded in the test payload sent to port 59100.
+**Path:** Any network peer → TCP port 59100 → `do_handshake()` → HMAC-SHA256 constructed with known key → authentication passes.
+**Condition:** Operator does not set `AUDIO_BRIDGE_TOKEN` env-var and does not write a `TOKEN=` line to `/data/local/tmp/audio_bridge.conf`. This is the default out-of-box state.
+**Impact:** Any attacker who can reach TCP port 59100 (which binds to `0.0.0.0` — see SEC-2) can send a valid HMAC handshake using the well-known default token, impersonate a device, receive speaker audio, inject virtual mic audio, and issue dial/hangup/SMS/DTMF commands.
+**Severity:** Critical
+**Fix:** (1) Remove the hardcoded fallback from all source files — fail-open with a known-weak default is worse than fail-closed. Replace with: `AUTH_TOKEN = os.environ.get("AUDIO_BRIDGE_TOKEN") or sys.exit("AUDIO_BRIDGE_TOKEN must be set")`. (2) Generate a random 256-bit token at first run and write it to both the server config and the device config. (3) Remove the literal token from `test_tls.py` — use `os.environ.get("AUDIO_BRIDGE_TOKEN")` there too.
+
+---
+
+### SEC-2: TCP Port 59100 Binds to 0.0.0.0 Without TLS
+
+**File:** `server/main.py` line 500
+**Function:** `start_tcp()`
+**Line:** 500
+**Issue:** The server binds the device TCP listener on all interfaces: `srv = await asyncio.start_server(handle_device, "0.0.0.0", TCP_PORT)`. There is no TLS wrapping in `asyncio.start_server()` — no `ssl=` parameter is passed. `uvicorn` (HTTP/WS on port 8000) is also started without TLS: `uvicorn.run("main:app", host="0.0.0.0", port=HTTP_PORT, reload=False)` at line 651 passes no `ssl_certfile`/`ssl_keyfile`.
+
+The `test_tls.py` file attempts a TLS connection to port 59100 with `ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE` — this test would fail because the server does not wrap the TCP socket with TLS, yet the test does not assert success; it prints the exception. This confirms TLS is not operational on port 59100.
+**Path:** Remote attacker on same network → TCP port 59100 (plaintext) → intercepts or injects binary frames.
+**Condition:** Always — no TLS is configured.
+**Impact:** All audio frames (speaker and mic), HMAC handshakes, and control JSON are transmitted in cleartext over TCP. An on-path attacker can: (a) capture all audio, (b) replay HMAC handshakes (the `date` field in the handshake is a string with no enforced freshness window), (c) inject arbitrary control frames.
+**Severity:** High
+**Fix:** Wrap `asyncio.start_server()` with an `ssl.SSLContext` using `server.crt`/`server.key`. Enforce TLS 1.2+, disable TLS 1.0/1.1. Optionally use mutual TLS (client cert on the daemon side) so only enrolled devices can connect.
+
+---
+
+### SEC-3: TLS Private Key Committed to Repository
+
+**File:** `server/server.key`
+**Function:** N/A (file artifact)
+**Line:** N/A
+**Issue:** The RSA private key for the TLS certificate `server/server.crt` is committed to the git repository. Git history confirms it was added in commit `89ffe63` ("Add dashboard, TLS, logging and certs") and has been present ever since. The key begins with `-----BEGIN RSA PRIVATE KEY-----`, confirming it is a PKCS#1 RSA private key. The certificate (`server/server.crt`) has:
+- CN: `audiobridgelocal`
+- SAN: `audiobridgelocal`
+- Validity: 2026-04-18 to 2036-04-16 (10 years, self-signed)
+- CA:TRUE flag set (`X509v3 Basic Constraints: critical, CA:TRUE`)
+
+Even if TLS were enabled (see SEC-2), any party with read access to the repository (or its git history) can extract the private key and perform TLS MiTM attacks against any deployment using this certificate.
+**Path:** `git clone <repo>` → `cat server/server.key` → extract private key → MiTM TLS sessions.
+**Condition:** Always — private key is in the git index and history.
+**Impact:** Complete break of TLS confidentiality. An attacker with the private key can decrypt all recorded TLS traffic and perform live MiTM against connections that trust this certificate.
+**Severity:** High
+**Fix:** (1) Immediately revoke this certificate and generate a new keypair off-repository. (2) Add `server/server.key` (and ideally `server/server.crt`) to `.gitignore`. (3) Remove the key from git history using `git filter-repo --path server/server.key --invert-paths`. (4) Document that TLS certificates should be generated per-deployment, never committed.
+
+---
+
+### SEC-4: Unix Socket `@audio_bridge` Has No Peer Authentication
+
+**File:** `jni/audio_bridge.cpp` lines 1438–1492 (`unix_socket_server_thread`)
+**Function:** `unix_socket_server_thread()`
+**Line:** 1438–1492
+**Issue:** The abstract Unix socket `@audio_bridge` accepts connections from any process in the same network namespace. The daemon calls `SO_PEERCRED` via `getsockopt()` at line 1201 (inside `read_java_client()`), but this is used only for **logging** the peer's PID/UID and SELinux label — it is never checked. No UID allowlist, no token challenge, no nonce exchange is performed. Any process that can connect to `@audio_bridge` (i.e., any process whose SELinux domain is granted `connectto` to the daemon's socket domain by `sepolicy.rule`) can:
+- Send `"GET_SHM_FD"` to receive the shared memory file descriptor and `mmap()` the SHM ring buffer
+- Send `"HELO_JAVA"` to become the authoritative IPC client (overwrites `g_java_fd`, receiving all server control commands and telephony events)
+- Send `"HELO_AUDIO"` to inject arbitrary PCM audio into the Java PCM queue
+**Path:** Malicious app in a domain covered by the SELinux `connectto` rules → `connect(@audio_bridge)` → `send("GET_SHM_FD")` → receive SHM fd → `mmap()` SHM → corrupt mic/speaker ring buffer.
+**Condition:** SELinux policy grants `connectto` to the attacking process's domain. The `sepolicy.rule` (build.sh lines 566–581) grants `connectto` to `priv_app`, `system_app`, `platform_app`, `radio`, `ksu`, `magisk`, `su`, `init` domains. Any app installed in a privileged location (or with `system_app` label) qualifies.
+**Impact:** Privilege escalation within the daemon's trust model — a privileged app can impersonate the Audio Bridge APK, exfiltrate SHM audio data, inject audio into active calls, or steal telephony events.
+**Severity:** High
+**Fix:** After `accept()`, call `getsockopt(SO_PEERCRED)` and verify `cred.uid` is either 0 (root/daemon) or the UID of the `com.audiobridge` package. Reject connections from unexpected UIDs before dispatching any command. Alternatively, implement a nonce-based token exchange for the initial handshake.
+
+---
+
+### SEC-5: SHM Fallback to Anonymous `mmap` — No fd to Guard, No Zygisk Isolation
+
+**File:** `jni/audio_bridge.cpp` lines 711–729 (`setup_shared_memory`)
+**Function:** `setup_shared_memory()`
+**Line:** 712–729
+**Issue:** The SHM is created with `memfd_create(g_shm_path, MFD_CLOEXEC)` at line 712. `MFD_CLOEXEC` is correctly set so the fd is not inherited by `exec()`. However, there are two fallback paths:
+1. Lines 715–729: If `memfd_create` fails, falls back to `open("/dev/ashmem")` — Ashmem does NOT honor `MFD_CLOEXEC` (it is a separate device node, not a `memfd`). The Ashmem fd persists across `exec()` calls and is not closed-on-exec unless `fcntl(fd, F_SETFD, FD_CLOEXEC)` is called explicitly. No such `fcntl` call is made in the fallback path.
+2. Lines 718–729: If Ashmem also fails, falls back to anonymous `mmap` with `MAP_ANONYMOUS`. In this case `g_shm_fd = -1` and `sendmsg(SCM_RIGHTS)` is short-circuited (sends `"NO_FD"` instead). This means Zygisk hook injection is completely disabled.
+
+Additionally, the Zygisk module receives the SHM fd via `SCM_RIGHTS` and calls `mmap()` with `PROT_READ | PROT_WRITE`. The module writes `module_active = true` to the SHM. The daemon does not verify that the Zygisk module writing to SHM is the legitimate `arm64-v8a.so` — any process that can obtain the fd (via the unauthenticated `GET_SHM_FD` path, SEC-4) and call `mmap()` can corrupt the ring-buffer layout.
+**Path:** `setup_shared_memory()` falls back to ashmem → ashmem fd inherits across exec → child process of daemon inherits SHM fd.
+**Condition:** `memfd_create` syscall unavailable (kernel < 3.17 or missing `CONFIG_MEMFD_CREATE`); this is unlikely on Android 9+ but possible on custom kernels.
+**Impact:** In the ashmem fallback, the SHM fd could be inherited by any process exec'd by the daemon. Given the daemon runs as root and the SHM contains audio frames, this is a data-exposure risk.
+**Severity:** Medium
+**Fix:** In the ashmem fallback path, add `fcntl(g_shm_fd, F_SETFD, FD_CLOEXEC)` immediately after the `open("/dev/ashmem")` call (line 715). This ensures close-on-exec semantics match those of `memfd_create(MFD_CLOEXEC)`.
+
+---
+
+### SEC-6: TCP Handshake `date` Field Not Freshness-Checked — HMAC Replay Possible
+
+**File:** `server/main.py` lines 381–392 (`do_handshake`); `jni/audio_bridge.cpp` lines 654–708 (`handshake`)
+**Function:** `do_handshake()` / `handshake()`
+**Line:** main.py:381–392
+**Issue:** The HMAC-SHA256 handshake is constructed as `HMAC(token, "{device_id}-{date}")` where `date` is a string provided by the device (daemon) in the JSON registration object. The server extracts `date = info.get("date", "")` at line 385 but performs no freshness check on its value. There is no:
+- Server-side nonce sent to the daemon before the HMAC is computed
+- Replay window enforcement (e.g., reject if `date` timestamp is more than 60 seconds in the past)
+- Sequence number or connection ID
+
+An attacker who captures a valid registration JSON (plaintext, since TLS is absent — SEC-2) can replay it from any IP at any future time and authenticate successfully with the server.
+**Path:** Attacker sniffs TCP port 59100 → captures registration JSON → replays same JSON → server accepts → attacker controls a device slot.
+**Condition:** Attacker can observe TCP traffic (trivially possible since TLS is absent) and replay before the daemon generates a different `date` value.
+**Impact:** Authentication bypass — attacker impersonates a legitimate device, receives speaker audio and can send control commands.
+**Severity:** High
+**Fix:** (1) Fix TLS first (SEC-2) so the transport is confidential. (2) Add a server-side nonce: server sends a random nonce after accepting the TCP connection; daemon includes the nonce in the HMAC input; server verifies using the nonce it generated. This makes replay impossible.
+
+---
+
+### SEC-7: WebSocket `/ws/ui` Endpoint Has No Authentication
+
+**File:** `server/main.py` lines 526–562 (`ws_ui`)
+**Function:** `ws_ui()`
+**Line:** 526
+**Issue:** The WebSocket endpoint `/ws/ui` calls `await mgr.connect_ui(ws)` immediately, which calls `await ws.accept()` with no authentication check. Any WebSocket client that can reach port 8000 can:
+1. Receive all device state updates (call state, phone number, SMS content)
+2. Issue any control command (`dial`, `hangup`, `answer`, `send_sms`, `mute`, etc.) to any connected device
+
+There is no token in the URL query parameter, no `Authorization` header check, no cookie. The `AUTH_TOKEN` constant is defined at the server level (line 99) but is never checked by any HTTP/WS handler. The `/ws/audio/{device_id}` endpoint (line 565) has the same issue.
+
+The dashboard HTML served at `GET /` also has no authentication gating.
+**Path:** Attacker on same network → `ws://server:8000/ws/ui` → receives all telephony events → sends `{"command":"dial","device_id":"...","number":"..."}` → phone places a call.
+**Condition:** Port 8000 is reachable (it binds `0.0.0.0`).
+**Impact:** Full remote control of the device (dial, hang up, SMS send) and wiretapping of all call state including phone numbers.
+**Severity:** Critical
+**Fix:** Require a bearer token on the WebSocket connection. Options: (a) accept the token as a query parameter `?token=<AUTH_TOKEN>` and verify it in `ws_ui` before `ws.accept()`; (b) require an `Authorization: Bearer <token>` header; (c) set a session cookie on `GET /` after verifying a token. Use `hmac.compare_digest` to avoid timing attacks.
+
+---
+
+### SEC-8: Daemon Runs as Root Without Privilege Drop, Seccomp, or Chroot
+
+**File:** `jni/audio_bridge.cpp` (entire file); `zygisk/module/service.sh` line 60
+**Function:** `main()`
+**Line:** 1514 (daemon entry point)
+**Issue:** The daemon binary is launched by `service.sh` as root via KernelSU's `late_start service` hook. A search of `audio_bridge.cpp` for `setuid`, `setgid`, `prctl(PR_SET_DUMPABLE)`, `seccomp`, `chroot`, and `capset` returns zero matches. The daemon:
+- Never drops root privileges after initialization
+- Never installs a seccomp filter
+- Never `chroot()`s to a restricted directory
+- Never calls `prctl(PR_SET_DUMPABLE, 0)` to prevent ptrace from root-owned processes
+
+The daemon accepts JSON commands from the network (via TCP) and from the local Unix socket, and executes them with full root permissions including: `memfd_create`, `mmap(MAP_SHARED)`, `pcm_open()`, `pcm_write()`, Opus encode/decode, and indirect control of telephony via `send_to_java()`.
+**Path:** Attacker exploits a memory-corruption bug in the daemon (e.g., in Opus decoding or JSON parsing) → code execution as root.
+**Condition:** Any exploitable memory-safety bug in the daemon or its dependencies (Opus, TinyALSA, mbedTLS) when running as root.
+**Impact:** Full device compromise — root code execution.
+**Severity:** High
+**Fix:** After `setup_shared_memory()` and `unix_socket_server_thread()` are started (which require elevated access), call `prctl(PR_SET_DUMPABLE, 0)` and reduce capabilities with `capset()`. For full hardening: use `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` to restrict syscalls to only those needed (network send/recv, mmap read/write, Opus, ALSA). A minimal seccomp allowlist would be: `read`, `write`, `send`, `recv`, `recvmsg`, `sendmsg`, `mmap`, `munmap`, `close`, `futex`, `nanosleep`, `clock_gettime`, `ioctl` (for ALSA).
+
+---
+
+### SEC-9: Abstract Unix Socket Accessible to All Processes in Same Network Namespace — No SELinux-Level Isolation Per Command
+
+**File:** `jni/audio_bridge.cpp` lines 1446–1489; `zygisk/module/service.sh` lines 38–48 (SELinux rules)
+**Function:** `unix_socket_server_thread()` dispatch
+**Line:** 1446–1489
+**Issue:** The `unix_socket_server_thread()` dispatch parses the incoming command using string comparisons against four fixed commands: `"GET_SHM_FD"`, `"PING"`, `"HELO_JAVA"`, `"HELO_AUDIO"`. There is no per-command authorization:
+- `"GET_SHM_FD"` gives out the SHM file descriptor to any connector — should be restricted to the Zygisk module (running as `zygote`/root)
+- `"HELO_JAVA"` accepts the Java IPC connection — should be restricted to the `com.audiobridge` UID
+- `"HELO_AUDIO"` accepts an audio PCM stream — should be restricted to the `com.audiobridge` UID
+
+The SELinux policy grants `connectto` to `priv_app`, `system_app`, `platform_app`, `radio`, `ksu`, `magisk`, `su`, and `init` domains. Any of these can send any command without restriction. The Zygisk module can send `"HELO_JAVA"` and the Java app can send `"GET_SHM_FD"` — cross-protocol confusion is possible.
+**Path:** Malicious priv_app → connect `@audio_bridge` → send `"GET_SHM_FD"` → write to SHM mic_frames → inject arbitrary audio into active call.
+**Condition:** Attacker process has a domain covered by the SELinux `connectto` rule (priv_app, system_app, radio, etc.).
+**Impact:** Audio injection into active telephone calls; exfiltration of captured speaker audio; impersonation of Java IPC client to intercept telephony commands.
+**Severity:** High
+**Fix:** Add UID/PID checks after `SO_PEERCRED` (already retrieved in `read_java_client` but not in the main dispatch loop). In the main dispatch switch (lines 1446–1489), call `getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len)` before dispatching, and enforce: `GET_SHM_FD` only from UID 0 (Zygisk runs in zygote = root); `HELO_JAVA`/`HELO_AUDIO` only from the audiobridge app UID.
+
+---
+
+### SEC-10: `hooked_audio_track_write` Calls `original_audio_track_write` — Not Re-entrant Safe
+
+**File:** `zygisk/src/zygisk_module.cpp` lines 311–345
+**Function:** `hooked_audio_track_write()`
+**Line:** 342–344
+**Issue:** `hooked_audio_track_write` always calls through to `original_audio_track_write` (the passthrough is by design — speaker audio is captured without blocking). `original_audio_track_write` is the shadowhook trampoline, which in SHARED mode calls the next hook in the chain (if any) before invoking the real `AudioTrack::write`. If a second Zygisk module (e.g., LSPosed or another audio hook module) installs its own hook on the same `AudioTrack::write` symbol, the call chain becomes:
+```
+hooked_audio_track_write (module A)
+  → shadowhook trampoline
+    → hooked_audio_track_write_2 (module B)
+      → shadowhook trampoline
+        → real AudioTrack::write
+```
+This is the intended SHARED mode behavior and is correct. However, if `original_audio_track_write` is invoked **before** `shadowhook_hook_sym_name` completes its hook installation (i.e., during a PENDING hook that fires mid-write), the `orig_out` pointer may not yet be filled in. Line 342 guards this with a null-check (`? original_audio_track_write : (ssize_t)size`), which means if `original_audio_track_write` is still null, `write()` is faked as successful (returning `size`) without writing audio. This causes silent audio loss until the hook is fully installed.
+
+For `hooked_audio_record_read`, the behavior when `original_audio_record_read` is null is to return 0 (line 222) — this tells the caller that 0 bytes were read, which could cause the telephony audio loop to spin or stall.
+**Path:** App process starts → `postAppSpecialize` fires → shadowhook installs with `SHADOWHOOK_ERRNO_PENDING` (library not loaded yet) → app begins making `AudioRecord::read()` calls before library loads → `original_audio_record_read` is null → read() returns 0 → telephony audio loop stalls.
+**Condition:** `libaudioclient.so` is not yet loaded when `install_inline_hooks()` is called in `postAppSpecialize()` at line 578.
+**Impact:** Silent audio loss or telephony audio loop stall on first call after process startup. Not exploitable for privilege escalation but represents a functional correctness issue.
+**Severity:** Low
+**Fix:** For the PENDING case, the hook will fire once the library loads — at that point `orig_out` will be set by shadowhook. The null guard is the correct defensive response for the window before the hook fires. No fix is strictly needed, but a comment explaining this race window would improve maintainability.
+
+---
+
+### SEC-11: `pkt.data()[len]` Null-Termination — Pattern Is Safe But Fragile; Verify No Other Instance
+
+**File:** `jni/audio_bridge.cpp` line 1107
+**Function:** `receive_virtual_mic_thread()`
+**Line:** 1107
+**Issue:** The guard at line 1098 (`if(len >= MAX_PKT) break`) ensures `len` is at most `MAX_PKT - 1 = 3999` when execution reaches line 1107. The `pkt` vector is allocated at line 1081 with capacity `MAX_PKT = 4000`. Therefore `pkt.data()[len]` accesses index 0–3999, which is within the vector's allocated buffer — the write is safe. This is the fixed version of the off-by-one found in an earlier commit.
+
+However, this pattern (`pkt.data()[len] = '\0'` for null-termination) depends on the invariant `capacity == MAX_PKT` and `len < MAX_PKT` being both true simultaneously. A future refactor that changes `pkt` capacity or the bounds check order could silently reintroduce the OOB write. No other instance of this pattern was found in the codebase.
+**Path:** N/A (not currently vulnerable)
+**Condition:** Would become vulnerable if `pkt` capacity were reduced below `MAX_PKT` or if the `>=` guard were changed back to `>`.
+**Impact:** One-byte OOB write into heap metadata (if capacity reduced) — potentially exploitable heap corruption.
+**Severity:** Low (informational — currently safe, fragile future maintenance risk)
+**Fix:** Replace the null-termination with an explicit `std::string json_str((char*)pkt.data(), len)` (already done on line 1108), making the `pkt.data()[len] = '\0'` at line 1107 redundant. Removing line 1107 entirely would be safer and would eliminate the fragile dependency.
+
+---
+
+### SEC-12: `read_java_audio_stream` Accepts Unbounded Frame Count With No Rate Limit
+
+**File:** `jni/audio_bridge.cpp` lines 1252–1305
+**Function:** `read_java_audio_stream()`
+**Line:** 1272
+**Issue:** The Unix socket `HELO_AUDIO` handler accepts a stream of 4-byte-length-prefixed PCM frames. The per-frame size is bounded to `byte_len <= 8192` (line 1272). However, there is no rate limit on how many frames can be sent per second, and the queue is bounded only to 10 entries (line 1295). A malicious or buggy Java client can:
+1. Flood the socket with maximum-size (8192-byte) frames faster than the daemon consumes them
+2. The bounded queue (line 1295) drops excess frames silently, but the `recv()` loop at lines 1264–1283 continues reading as fast as the socket delivers data — consuming CPU on the audio-stream reader thread with no backpressure
+
+At 8192 bytes/frame, a fast local Unix socket can deliver ~1 GB/s of data to the daemon, which will parse each frame header, check length, `resize` a `std::vector`, call `recv()`, and copy into the chunk — all from root-privileged code.
+**Path:** Malicious app sends `HELO_AUDIO` to `@audio_bridge` → floods PCM frames at maximum rate → exhausts CPU on `SCHED_RR` priority-2 thread.
+**Condition:** Attacker controls a process that can connect to `@audio_bridge` (see SEC-4/SEC-9).
+**Impact:** CPU exhaustion on a real-time priority thread; potential denial of service to telephony audio path.
+**Severity:** Medium
+**Fix:** Add rate limiting or a `usleep()` pacing mechanism in `read_java_audio_stream()` when the queue is full (currently just silently drops). Consider dropping the connection (goto done) instead of silently discarding, to provide backpressure to the sender.
+
+---
+
+### SEC-13: `sprintf` in `handshake()` — Buffer Correct But Unbounded Format String Risk
+
+**File:** `jni/audio_bridge.cpp` line 687
+**Function:** `handshake()`
+**Line:** 687
+**Issue:** `sprintf(hex + i*2, "%02x", hmac[i])` is called in a loop with `i` from 0 to 31. The `hex` buffer is 65 bytes (`char hex[65]`). Each `sprintf` writes 2 hex chars at offset `i*2`. At `i=31`, the write is to `hex[62]` (2 chars = positions 62 and 63), with the null terminator at position 64 — exactly within the 65-byte buffer. This is correct.
+
+However, the use of `sprintf` (rather than `snprintf`) is a code quality concern. If the loop bounds or buffer size were ever changed, this becomes a stack buffer overflow. The `hmac` array is fixed-size 32 bytes (SHA-256 output), so the loop is statically bounded.
+**Path:** N/A (not currently vulnerable)
+**Condition:** Only becomes a buffer overflow if loop bound or buffer size is changed.
+**Impact:** Stack buffer overflow if refactored incorrectly.
+**Severity:** Low (informational)
+**Fix:** Replace `sprintf(hex + i*2, "%02x", hmac[i])` with `snprintf(hex + i*2, 3, "%02x", hmac[i])` or use `mbedtls_md_hexdump()`.
+
+---
+
+### SEC-14: `test_tls.py` Disables Certificate Verification — Confirms No Server-Side TLS
+
+**File:** `server/test_tls.py` lines 8–11
+**Function:** Test script
+**Line:** 8–11
+**Issue:** The test creates an SSL context with `ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE`. This disables all certificate chain verification. This is only necessary if the server uses a self-signed certificate (confirmed: `server.crt` is self-signed with CA:TRUE). Additionally, `ctx.maximum_version = ssl.TLSVersion.TLSv1_2` caps the protocol at TLS 1.2, disabling TLS 1.3.
+
+More critically, the test attempts to connect with TLS to port 59100, but `main.py` does not wrap port 59100 with TLS (SEC-2). The expected runtime behavior is that `ctx.wrap_socket(sock)` will fail with `ssl.SSLError: EOF occurred in violation of protocol` because the server sends a plain JSON line (`{"status":"error",...}\n`) rather than a TLS handshake. The test's `except Exception as e: print(f"FAILED: ...")` would catch this and print the failure — but there is no assertion, so CI would report the test as "passing" by printing "FAILED" without raising.
+**Path:** `python test_tls.py` runs → test silently reports failure but exits 0 → developer believes TLS is working.
+**Condition:** Always — the server does not speak TLS on port 59100.
+**Impact:** False confidence in TLS status. The test provides no actual security assurance. This is a testing deficiency rather than a direct vulnerability, but it obscures the SEC-2 finding.
+**Severity:** Medium
+**Fix:** (1) Fix SEC-2 (enable TLS on port 59100). (2) Fix `test_tls.py` to `sys.exit(1)` on failure and `ctx.verify_mode = ssl.CERT_REQUIRED` (with the server cert loaded into the trust store) so the test provides real assurance.
+
+---
+
+### SEC-15: `appops set com.audiobridge RECORD_AUDIO allow` — Bypasses Android Permission Model
+
+**File:** `zygisk/module/service.sh` line 20 (committed); `build.sh` line 609 (build-generated)
+**Function:** `service.sh` Stage 2 permission grants
+**Line:** 20
+**Issue:** `appops set com.audiobridge RECORD_AUDIO allow` grants the `RECORD_AUDIO` AppOps opcode unconditionally, bypassing the normal user-consent permission grant flow. While this is intentional for a rooted device, it creates a situation where:
+1. The APK records audio without the standard Android permission dialog — invisible to the device owner
+2. Android's privacy dashboard (`Settings > Privacy > Permission manager`) will show `RECORD_AUDIO` as "Allowed" but the user never explicitly granted it — deceptive on a shared/enterprise device
+3. If `com.audiobridge` is replaced by a malicious APK with the same package name (e.g., via `pm install -r` from a compromised update), the AppOps override persists for the new APK
+
+This is not a privilege escalation (requires root to set), but it is relevant for threat modeling if the device is used in a context where other users or administrators inspect it.
+**Path:** Attacker replaces `com.audiobridge` APK via `pm install -r` → AppOps override inherited by replacement APK → replacement APK has unrestricted microphone access without any user dialog.
+**Condition:** Root access is available to the attacker (already a requirement for module installation, so this is an escalation only within a root-present threat model).
+**Impact:** Persistence of microphone access after APK replacement; invisible audio recording.
+**Severity:** Low (within a rooted device threat model; informational for compliance/awareness)
+**Fix:** Document this behavior explicitly. Consider adding a unique signature check before `pm install -r` in `service.sh` to reject APK replacements that do not match the expected signing certificate.
+
+---
+
+### Phase 6 Summary Table
+
+| ID | Title | Severity | File | Status |
+|----|-------|----------|------|--------|
+| SEC-1 | Hardcoded default auth token `"default_secure_token_123"` in source + test | Critical | main.py:99, audio_bridge.cpp:70, test_tls.py:18 | Open |
+| SEC-2 | TCP port 59100 binds to 0.0.0.0 without TLS | High | main.py:500 | Open |
+| SEC-3 | TLS private key `server/server.key` committed to git repository | High | server/server.key | Open |
+| SEC-4 | Unix socket `@audio_bridge` accepts connections without peer UID authentication | High | audio_bridge.cpp:1438–1492 | Open |
+| SEC-5 | Ashmem SHM fallback missing `FD_CLOEXEC` flag | Medium | audio_bridge.cpp:715 | Open |
+| SEC-6 | HMAC handshake `date` field not freshness-checked — replay attack possible | High | main.py:385–392 | Open |
+| SEC-7 | WebSocket `/ws/ui` and `/ws/audio` endpoints have no authentication | Critical | main.py:526, 565 | Open |
+| SEC-8 | Daemon runs as root without privilege drop, seccomp, or chroot | High | audio_bridge.cpp:main() | Open |
+| SEC-9 | Unix socket dispatch performs no per-command authorization | High | audio_bridge.cpp:1446–1489 | Open |
+| SEC-10 | PENDING hook: null `orig_fn` pointer causes audio loss/stall window | Low | zygisk_module.cpp:220–222, 342 | Open |
+| SEC-11 | `pkt.data()[len]` null-termination is safe but fragile pattern | Low | audio_bridge.cpp:1107 | Open |
+| SEC-12 | `read_java_audio_stream` accepts frames with no rate limiting | Medium | audio_bridge.cpp:1260–1300 | Open |
+| SEC-13 | `sprintf` for HMAC hex encoding — unsafe if refactored | Low | audio_bridge.cpp:687 | Open |
+| SEC-14 | `test_tls.py` disables cert verification and has no assertion — false confidence | Medium | server/test_tls.py:8–11 | Open |
+| SEC-15 | `appops RECORD_AUDIO allow` persists after APK replacement | Low | service.sh:20 | Open |
+| — | Off-by-one `pkt.data()[len]` at len==MAX_PKT | (Critical) | audio_bridge.cpp:1098 | FIXED in 86a4364 |
+| — | SMS key mismatch `"event"` vs `"type"` | (Medium) | audio_bridge.cpp:944 | FIXED in 86a4364 |
+| — | SCM_RIGHTS sends fd=-1 when g_shm_fd < 0 | (High) | audio_bridge.cpp:1446 | FIXED in 86a4364 |
+| — | SIGPIPE not ignored before TCP send | (Medium) | audio_bridge.cpp:main() | FIXED in 86a4364 |
+
+**Critical findings (open):** SEC-1 (default token) and SEC-7 (unauthenticated WebSocket control). These two in combination allow any network peer to take full remote control of the phone: dial arbitrary numbers, send SMS, hang up calls, and receive live speaker audio — no authentication required.
+
+**Most impactful remediation order:**
+1. SEC-7: Add WebSocket token auth (blocks unauthenticated UI control)
+2. SEC-1: Remove hardcoded default token (closes trivial credential theft)
+3. SEC-2 + SEC-3: Enable TLS on port 59100 with a non-committed keypair
+4. SEC-6: Add server nonce to handshake to prevent replay
+5. SEC-4 + SEC-9: Add UID check on Unix socket accept path
+
+---
+
+*End of Phase 6 — Security Findings*
