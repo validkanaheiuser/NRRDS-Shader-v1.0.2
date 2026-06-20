@@ -4,715 +4,971 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>audio bridge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-
 :root {
-  --bg:#080808; --card:#0f0f0f; --card2:#141414;
-  --border:rgba(255,255,255,0.07); --bhi:rgba(255,255,255,0.14);
-  --text:#efefef; --dim:#909090; --muted:#555;
-  --accent:#efefef; --accent-fg:#000;
-  --chip:#181818; --chip-hi:#202020; --inp:#0c0c0c;
-  --danger:#f55; --good:#4d4; --warn:#fb3;
-  --sim-badge-bg:#1e3a5f; --sim-badge-color:#93c5fd;
+  --bg:       #080808;
+  --sb:       #0d0d0d;
+  --surface:  #111;
+  --surface2: #171717;
+  --border:   rgba(255,255,255,.07);
+  --border-hi:rgba(255,255,255,.13);
+  --accent:   #c8830a;
+  --accent-lo:rgba(200,131,10,.08);
+  --accent-md:rgba(200,131,10,.18);
+  --text:     #eeebe4;
+  --dim:      #888880;
+  --muted:    #3a3a36;
+  --good:     #56b870;
+  --danger:   #e05050;
+  --warn:     #d4870a;
+  --mono:     'JetBrains Mono', monospace;
 }
-[data-theme="light"] {
-  --bg:#f3f3f3; --card:#fff; --card2:#fafafa;
-  --border:rgba(0,0,0,0.08); --bhi:rgba(0,0,0,0.16);
-  --text:#111; --dim:#555; --muted:#999;
-  --accent:#111; --accent-fg:#fff;
-  --chip:#eee; --chip-hi:#e5e5e5; --inp:#f0f0f0;
-  --danger:#d33; --good:#090; --warn:#a60;
-  --sim-badge-bg:#dbeafe; --sim-badge-color:#1d4ed8;
+
+*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+html,body { height:100%; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,sans-serif; -webkit-font-smoothing:antialiased; }
+[v-cloak] { display:none; }
+
+/* ── Layout ─────────────────────────────────────────────────── */
+#app { display:flex; height:100vh; overflow:hidden; }
+
+/* ── Sidebar ────────────────────────────────────────────────── */
+.sidebar {
+  width:220px; flex-shrink:0;
+  background:var(--sb);
+  border-right:1px solid var(--border);
+  display:flex; flex-direction:column;
+  overflow:hidden;
 }
 
-[v-cloak]{display:none;}
-*{margin:0;padding:0;box-sizing:border-box;}
-html,body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased;}
-body{min-height:100vh;padding:1.5rem 1.25rem 5rem;}
-.wrap{max-width:1340px;margin:0 auto;}
+.sb-logo {
+  padding:1rem .9rem .8rem;
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:.5rem;
+}
+.sb-logo-mark {
+  font:600 13px var(--mono);
+  color:var(--accent);
+  background:var(--accent-lo);
+  border:1px solid var(--accent-md);
+  border-radius:5px;
+  padding:.15rem .4rem;
+  letter-spacing:.02em;
+}
+.sb-logo-name { font-size:.78rem; font-weight:500; letter-spacing:.06em; color:var(--dim); text-transform:uppercase; }
+.sb-status-dot {
+  width:6px; height:6px; border-radius:50%; background:var(--muted);
+  margin-left:auto; flex-shrink:0; transition:background .3s;
+}
+.sb-status-dot.online  { background:var(--good); box-shadow:0 0 5px var(--good); }
+.sb-status-dot.offline { background:var(--muted); }
+.sb-status-dot.authfail{ background:var(--danger); }
 
-/* ── Token gate ── */
-.token-gate{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem;}
-.token-box{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:2.5rem 2rem;max-width:420px;width:100%;text-align:center;}
-.token-box h2{font-size:1.25rem;font-weight:700;margin-bottom:.4rem;}
-.token-box p{font-size:.82rem;color:var(--muted);margin-bottom:1.5rem;}
-.token-box input{margin-bottom:.75rem;font-family:'JetBrains Mono',monospace;font-size:.82rem;}
-.token-err{font-size:.75rem;color:var(--danger);margin-top:.45rem;}
+.sb-section { padding:.6rem .5rem .4rem; flex:1; overflow-y:auto; }
+.sb-label { font-size:.65rem; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); padding:.15rem .4rem .5rem; }
 
-/* ── Header ── */
-.hdr{display:flex;align-items:center;gap:.75rem;margin-bottom:1.5rem;}
-.hdr-logo{width:44px;height:44px;border-radius:11px;background:var(--chip);display:grid;place-items:center;color:var(--dim);flex-shrink:0;}
-.hdr h1{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;text-transform:lowercase;line-height:1;}
-.hdr p{font-size:.78rem;color:var(--muted);margin-top:.1rem;}
-.hdr-right{margin-left:auto;display:flex;gap:.5rem;align-items:center;}
-.conn-pill{font-size:.72rem;color:var(--muted);padding:.28rem .65rem;border:1px solid var(--border);border-radius:999px;display:flex;align-items:center;gap:.38rem;transition:all .3s;}
-.conn-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);transition:background .3s;}
-.conn-pill.online .conn-dot{background:var(--good);box-shadow:0 0 5px var(--good);}
-.conn-pill.online{border-color:rgba(68,221,68,.2);}
-.conn-pill.offline .conn-dot{background:var(--danger);}
-.conn-pill.authfail .conn-dot{background:var(--warn);}
-.conn-pill.authfail{border-color:rgba(255,187,51,.3);color:var(--warn);}
-.ibtn{width:34px;height:34px;border-radius:8px;background:var(--card);border:1px solid var(--border);cursor:pointer;display:grid;place-items:center;color:var(--dim);transition:all .15s;}
-.ibtn:hover{background:var(--chip);color:var(--text);}
-.ibtn svg{width:15px;height:15px;}
+.dev-card {
+  padding:.55rem .65rem;
+  border-radius:7px;
+  cursor:pointer;
+  border:1px solid transparent;
+  margin-bottom:.28rem;
+  transition:background .15s, border-color .15s;
+  display:flex; align-items:center; gap:.55rem;
+}
+.dev-card:hover  { background:var(--surface); }
+.dev-card.sel    { background:var(--accent-lo); border-color:var(--accent-md); }
 
-/* ── Layout ── */
-.grid3{display:grid;grid-template-columns:210px 1fr 310px;gap:.85rem;margin-bottom:.85rem;align-items:start;}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.1rem;}
-.card+.card{margin-top:.75rem;}
-.card.full{grid-column:1/-1;}
-.lbl{font-size:.67rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.11em;margin-bottom:.75rem;}
+.dev-avatar {
+  width:30px; height:30px; border-radius:6px;
+  background:var(--surface2); color:var(--dim);
+  display:flex; align-items:center; justify-content:center;
+  font:600 12px var(--mono); flex-shrink:0;
+}
+.dev-card.sel .dev-avatar { background:var(--accent-md); color:var(--accent); }
 
-/* ── Devices ── */
-.devs{display:flex;flex-direction:column;gap:.35rem;}
-.dev{padding:.6rem .75rem;border:1px solid var(--border);border-radius:9px;cursor:pointer;background:var(--chip);transition:all .15s;position:relative;}
-.dev:hover{background:var(--chip-hi);border-color:var(--bhi);}
-.dev.sel{border-color:var(--bhi);}
-.dev-name{font-weight:600;font-size:.84rem;}
-.dev-meta{font-size:.67rem;color:var(--muted);margin-top:.12rem;font-family:'JetBrains Mono',monospace;}
-.dev-state{font-size:.7rem;margin-top:.12rem;}
-.dev-state.idle{color:var(--muted);}
-.dev-state.dialing,.dev-state.ringing{color:var(--warn);}
-.dev-state.active{color:var(--good);}
-.dev-badge{position:absolute;top:.55rem;right:.65rem;font-size:.63rem;padding:.15rem .42rem;border-radius:999px;font-weight:600;}
-.badge-d{background:rgba(255,187,51,.12);color:var(--warn);border:1px solid rgba(255,187,51,.28);}
-.badge-r{background:rgba(255,85,85,.12);color:var(--danger);border:1px solid rgba(255,85,85,.28);animation:pulse 1s ease-in-out infinite;}
-.badge-a{background:rgba(68,221,68,.12);color:var(--good);border:1px solid rgba(68,221,68,.28);}
-.empty-h{padding:1.2rem;color:var(--muted);font-size:.8rem;text-align:center;border:1px dashed var(--border);border-radius:9px;}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.dev-body { min-width:0; }
+.dev-name { font-size:.77rem; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dev-sub  { font-size:.65rem; color:var(--dim); margin-top:.05rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dev-state-pill {
+  display:inline-block; margin-top:.18rem;
+  font:500 .6rem var(--mono); padding:.06rem .3rem;
+  border-radius:3px; background:var(--surface2); color:var(--dim);
+  text-transform:lowercase; letter-spacing:.03em;
+}
+.dev-state-pill.ringing { background:rgba(212,135,10,.15); color:var(--warn); }
+.dev-state-pill.active  { background:rgba(86,184,112,.15); color:var(--good); }
+.dev-state-pill.dialing { background:rgba(200,131,10,.1);  color:var(--accent); }
 
-/* ── Quick contacts ── */
-.qc-list{display:flex;flex-direction:column;gap:.3rem;}
-.qc-item{display:flex;align-items:center;gap:.45rem;padding:.4rem .55rem;border-radius:7px;background:var(--chip);cursor:pointer;font-size:.78rem;transition:all .15s;}
-.qc-item:hover{background:var(--chip-hi);}
-.qc-avatar{width:26px;height:26px;border-radius:50%;background:var(--card2);display:grid;place-items:center;font-size:.65rem;font-weight:700;color:var(--dim);flex-shrink:0;}
-.qc-info{flex:1;min-width:0;}
-.qc-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.78rem;}
-.qc-num{font-size:.65rem;color:var(--muted);}
-.qc-del{opacity:0;font-size:.7rem;padding:.15rem .3rem;border-radius:5px;transition:opacity .15s;color:var(--muted);}
-.qc-item:hover .qc-del{opacity:.6;}
-.add-ctct{display:flex;gap:.35rem;margin-top:.45rem;}
-.add-ctct input{font-size:.74rem;padding:.38rem .55rem;}
-.add-ctct button{flex:0;padding:.38rem .55rem;font-size:.72rem;}
+.sb-empty { padding:.8rem .65rem; font-size:.75rem; color:var(--muted); text-align:center; line-height:1.7; }
 
-/* ── Call history ── */
-.hist-list{display:flex;flex-direction:column;gap:.28rem;}
-.hist-item{padding:.42rem .55rem;border-radius:7px;background:var(--chip);cursor:pointer;transition:all .15s;}
-.hist-item:hover{background:var(--chip-hi);}
-.hist-num{font-size:.78rem;font-weight:600;}
-.hist-meta{font-size:.65rem;color:var(--muted);margin-top:.08rem;}
+.sb-footer {
+  padding:.65rem .7rem;
+  border-top:1px solid var(--border);
+}
+.sb-connect-btn {
+  width:100%; padding:.45rem; font-size:.75rem; font-weight:500;
+  background:var(--accent); color:#000; border:none; border-radius:6px;
+  cursor:pointer; letter-spacing:.04em;
+}
+.sb-connect-btn:hover { filter:brightness(1.1); }
+.sb-token-form { margin-top:.5rem; display:flex; gap:.3rem; }
+.sb-token-form input {
+  flex:1; padding:.38rem .5rem; font:13px var(--mono);
+  background:var(--surface2); border:1px solid var(--border); border-radius:5px;
+  color:var(--text); outline:none;
+}
+.sb-token-form input:focus { border-color:var(--accent-md); }
+.sb-token-form button {
+  padding:.38rem .6rem; background:var(--accent); color:#000;
+  border:none; border-radius:5px; cursor:pointer; font-weight:600;
+}
+.sb-connected-row { display:flex; align-items:center; gap:.45rem; }
+.sb-connected-row .label { font-size:.72rem; color:var(--dim); }
+.sb-disconn-btn {
+  margin-left:auto; font-size:.67rem; color:var(--dim);
+  background:none; border:1px solid var(--border); border-radius:4px;
+  padding:.18rem .45rem; cursor:pointer;
+}
+.sb-disconn-btn:hover { color:var(--danger); border-color:rgba(224,80,80,.3); }
+.sb-token-err { font-size:.68rem; color:var(--danger); margin-top:.3rem; }
 
-/* ── Device info panel ── */
-.dinfo-row{display:flex;justify-content:space-between;align-items:baseline;padding:.22rem 0;border-bottom:1px solid var(--border);font-size:.77rem;}
-.dinfo-row:last-child{border-bottom:none;}
-.dinfo-key{color:var(--muted);font-size:.68rem;min-width:80px;}
-.dinfo-val{color:var(--text);text-align:right;font-family:'JetBrains Mono',monospace;font-size:.72rem;word-break:break-all;}
+/* ── Main area ──────────────────────────────────────────────── */
+.main {
+  flex:1; display:flex; flex-direction:column; overflow:hidden;
+  position:relative;
+}
 
-/* ── Battery + signal row ── */
-.status-row{display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;margin-bottom:.5rem;}
-.batt-chip{font-size:.73rem;padding:.18rem .5rem;background:var(--chip);border:1px solid var(--border);border-radius:7px;display:flex;align-items:center;gap:.28rem;}
-.batt-chip.charging{border-color:rgba(255,187,51,.28);color:var(--warn);}
-.sig-chip{font-size:.7rem;padding:.18rem .5rem;background:var(--chip);border:1px solid var(--border);border-radius:7px;display:flex;align-items:center;gap:.3rem;}
-.sig-bars{display:inline-flex;align-items:flex-end;gap:1.5px;height:12px;vertical-align:middle;}
-.sig-bar{width:3px;border-radius:1px;}
+/* Signature: amber bar at top during active call */
+.main::before {
+  content:''; position:absolute; top:0; left:0; right:0; height:2px;
+  background:transparent; z-index:10; transition:background .4s;
+}
+.main.call-active::before {
+  background:linear-gradient(90deg,transparent,var(--accent),transparent);
+  animation:callbar 2.4s ease-in-out infinite;
+}
+@keyframes callbar { 0%,100%{opacity:.3} 50%{opacity:1} }
 
-/* ── SIM list ── */
-.sim-list{display:flex;flex-direction:column;gap:.3rem;margin-top:.5rem;}
-.sim-row{display:flex;align-items:center;gap:.45rem;font-size:.75rem;padding:.3rem .45rem;background:var(--chip);border-radius:7px;}
-.sim-badge{font-size:.65rem;padding:.1rem .38rem;border-radius:999px;background:var(--sim-badge-bg);color:var(--sim-badge-color);font-weight:600;flex-shrink:0;}
-.sim-carrier{font-weight:500;}
-.sim-num{color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:.68rem;margin-left:auto;}
+/* ── Tab bar ────────────────────────────────────────────────── */
+.tab-bar {
+  display:flex; gap:0;
+  border-bottom:1px solid var(--border);
+  padding:0 .5rem;
+  flex-shrink:0;
+}
+.tab {
+  padding:.7rem .85rem;
+  font-size:.75rem; font-weight:500; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--dim); background:none; border:none; cursor:pointer;
+  border-bottom:2px solid transparent; margin-bottom:-1px;
+  position:relative; transition:color .15s;
+}
+.tab:hover { color:var(--text); }
+.tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+.tab-badge {
+  position:absolute; top:.4rem; right:.3rem;
+  font-size:.55rem; color:var(--accent); font-weight:600;
+}
 
-/* ── SIM filter ── */
-select{width:100%;background:var(--inp);border:1px solid transparent;border-radius:8px;padding:.52rem .72rem;color:var(--text);font-family:inherit;font-size:.83rem;outline:none;cursor:pointer;transition:border-color .15s;}
-select:focus{border-color:var(--bhi);}
-select option{background:var(--card);color:var(--text);}
+/* ── Tab content ────────────────────────────────────────────── */
+.tab-content { flex:1; overflow:hidden; }
+.tab-pane { height:100%; overflow-y:auto; padding:1.2rem 1.4rem; }
 
-/* ── Call panel ── */
-.call-num-display{font-size:1.85rem;font-weight:700;letter-spacing:.02em;min-height:2.6rem;display:flex;align-items:center;justify-content:center;padding:.4rem .5rem;transition:all .2s;word-break:break-all;}
-.call-num-display.ph{color:var(--muted);}
+/* ── Empty state ─────────────────────────────────────────────── */
+.empty-state {
+  height:100%; display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  color:var(--muted); font-size:.82rem; gap:.4rem;
+}
+.empty-state .es-icon { font-size:1.8rem; opacity:.3; }
 
-/* ── Dial pad ── */
-.dialpad{display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem;margin:.65rem 0;}
-.key{padding:.75rem .4rem;border:1px solid var(--border);border-radius:10px;background:var(--chip);cursor:pointer;transition:all .1s;text-align:center;user-select:none;}
-.key:hover{background:var(--chip-hi);border-color:var(--bhi);}
-.key:active{transform:scale(.93);}
-.key-digit{font-size:1.2rem;font-weight:700;line-height:1;}
-.key-sub{font-size:.52rem;color:var(--muted);margin-top:.1rem;letter-spacing:.06em;}
-.key.dtmf{border-color:rgba(68,221,68,.18);background:rgba(68,221,68,.04);}
-.key.dtmf:hover{background:rgba(68,221,68,.1);border-color:rgba(68,221,68,.3);}
-.key.dtmf:active{background:rgba(68,221,68,.18);}
+/* ── Cards ───────────────────────────────────────────────────── */
+.card {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:10px; padding:.9rem 1rem; margin-bottom:.7rem;
+}
+.card-title {
+  font-size:.67rem; letter-spacing:.09em; text-transform:uppercase;
+  color:var(--muted); margin-bottom:.65rem;
+}
 
-/* ── Call states ── */
-.cs-center{text-align:center;padding:.75rem 0;}
-.cs-tag{font-size:.65rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin-bottom:.45rem;}
-.cs-num{font-size:1.6rem;font-weight:700;margin-bottom:.3rem;word-break:break-all;}
-.cs-sub{font-size:.8rem;color:var(--dim);margin-bottom:.9rem;}
-.cs-sub.ring{color:var(--danger);animation:pulse 1s ease-in-out infinite;}
-.anim-dots::after{content:'·';animation:dot3 1.2s steps(3,end) infinite;}
-@keyframes dot3{0%{content:'·'}33%{content:'··'}66%{content:'···'}}
+/* ── KV rows ─────────────────────────────────────────────────── */
+.kv { display:flex; align-items:baseline; gap:.4rem; padding:.18rem 0; border-bottom:1px solid var(--border); }
+.kv:last-child { border-bottom:none; }
+.kv-k { font-size:.7rem; color:var(--dim); width:100px; flex-shrink:0; }
+.kv-v { font:13px var(--mono); color:var(--text); }
+.kv-v.good    { color:var(--good); }
+.kv-v.danger  { color:var(--danger); }
+.kv-v.warn    { color:var(--warn); }
 
-/* ── Active call ── */
-.active-num{font-size:1.05rem;font-weight:700;text-align:center;margin-bottom:.15rem;}
-.active-via{font-size:.74rem;color:var(--muted);text-align:center;margin-bottom:.4rem;}
-.timer{font-family:'JetBrains Mono',monospace;font-size:2.6rem;font-weight:700;letter-spacing:.04em;color:var(--good);margin:.3rem 0 .7rem;text-align:center;}
+/* ── Battery ─────────────────────────────────────────────────── */
+.batt-row { display:flex; align-items:center; gap:.5rem; }
+.batt-bar { height:6px; border-radius:3px; background:var(--muted); flex:1; overflow:hidden; }
+.batt-fill { height:100%; border-radius:3px; background:var(--good); transition:width .4s; }
+.batt-fill.low  { background:var(--danger); }
+.batt-fill.mid  { background:var(--warn); }
+.batt-pct { font:600 12px var(--mono); color:var(--dim); flex-shrink:0; min-width:32px; }
 
-/* ── Controls ── */
-.ctrl-row{display:flex;align-items:center;gap:.6rem;margin:.4rem 0;}
-.ctrl-lbl{font-size:.65rem;color:var(--muted);width:42px;flex-shrink:0;}
-input[type="range"]{flex:1;-webkit-appearance:none;appearance:none;height:3px;border-radius:999px;background:var(--bhi);outline:none;cursor:pointer;}
-input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--text);cursor:pointer;}
-input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:var(--text);border:none;cursor:pointer;}
-.ctrl-val{font-size:.68rem;color:var(--muted);width:22px;text-align:right;flex-shrink:0;}
+/* ── SIM chips ───────────────────────────────────────────────── */
+.sim-chips { display:flex; gap:.4rem; flex-wrap:wrap; }
+.sim-chip {
+  padding:.3rem .65rem;
+  border-radius:6px; border:1px solid var(--border);
+  font-size:.72rem; background:var(--surface2);
+}
+.sim-chip-carrier { font-weight:600; color:var(--text); }
+.sim-chip-num     { font:11px var(--mono); color:var(--dim); margin-top:.08rem; }
+.sim-chip.no-sim  { color:var(--muted); font-style:italic; }
 
-/* ── Meters ── */
-.meters{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin:.4rem 0;}
-.meter-lbl{font-size:.63rem;color:var(--muted);margin-bottom:.18rem;}
-.meter-bar{height:3px;background:var(--inp);border-radius:999px;overflow:hidden;}
-.meter-fill{height:100%;background:var(--text);width:0%;transition:width .08s;}
+/* ── Signal bars ─────────────────────────────────────────────── */
+.sig-bars { display:inline-flex; align-items:flex-end; gap:2px; height:12px; margin-left:.4rem; }
+.sig-bar  { width:3px; border-radius:1px; background:var(--muted); }
 
-/* ── Section divider ── */
-.sec-lbl{font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin:.6rem 0 .4rem;display:flex;align-items:center;gap:.4rem;}
-.sec-lbl::before,.sec-lbl::after{content:'';flex:1;height:1px;background:var(--border);}
-.sec-lbl::before{max-width:10px;}
+/* ── Buttons ─────────────────────────────────────────────────── */
+.btn { padding:.48rem .9rem; border-radius:7px; font-size:.78rem; font-weight:500; cursor:pointer; border:none; transition:filter .15s; }
+.btn-p  { background:var(--accent); color:#000; }
+.btn-p:hover { filter:brightness(1.12); }
+.btn-p:disabled { opacity:.4; cursor:not-allowed; filter:none; }
+.btn-g  { background:var(--good); color:#000; }
+.btn-g:hover { filter:brightness(1.1); }
+.btn-d  { background:var(--danger); color:#fff; }
+.btn-d:hover { filter:brightness(1.1); }
+.btn-ghost { background:none; border:1px solid var(--border); color:var(--dim); padding:.38rem .8rem; border-radius:6px; font-size:.75rem; cursor:pointer; }
+.btn-ghost:hover { border-color:var(--border-hi); color:var(--text); }
+.btn-icon  { background:none; border:1px solid var(--border); color:var(--dim); width:34px; height:34px; border-radius:7px; display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:.9rem; }
+.btn-icon:hover { border-color:var(--border-hi); color:var(--text); }
+.btn-icon.active { background:var(--accent-lo); border-color:var(--accent-md); color:var(--accent); }
 
-/* ── Buttons ── */
-.brow{display:flex;gap:.4rem;flex-wrap:wrap;}
-button{flex:1;min-width:55px;padding:.58rem .65rem;border:1px solid var(--border);border-radius:8px;background:var(--chip);color:var(--text);font-family:inherit;font-size:.82rem;font-weight:500;cursor:pointer;transition:all .15s;text-transform:lowercase;letter-spacing:.01em;}
-button:hover:not(:disabled){background:var(--chip-hi);border-color:var(--bhi);}
-button:active:not(:disabled){transform:translateY(1px);}
-button:disabled{opacity:.3;cursor:not-allowed;}
-.bp{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600;}
-.bp:hover:not(:disabled){filter:brightness(.9);}
-.bd{color:var(--danger);border-color:rgba(255,85,85,.28);}
-.bd:hover:not(:disabled){background:rgba(255,85,85,.1);}
-.bg{color:var(--good);border-color:rgba(68,221,68,.28);}
-.bg:hover:not(:disabled){background:rgba(68,221,68,.1);}
-.bact{background:rgba(68,221,68,.1);color:var(--good);border-color:rgba(68,221,68,.3);}
-.bact:hover:not(:disabled){background:rgba(68,221,68,.18);}
+/* ── Form elements ───────────────────────────────────────────── */
+.field { display:flex; flex-direction:column; gap:.3rem; margin-bottom:.55rem; }
+.field label { font-size:.68rem; letter-spacing:.05em; text-transform:uppercase; color:var(--dim); }
+.inp, .ta {
+  padding:.45rem .6rem;
+  background:var(--surface2); border:1px solid var(--border); border-radius:7px;
+  color:var(--text); font:13px system-ui,sans-serif; outline:none;
+  transition:border-color .15s;
+}
+.inp:focus, .ta:focus { border-color:rgba(200,131,10,.4); }
+.ta { resize:vertical; min-height:72px; }
+.inp-mono { font:13px var(--mono); }
 
-/* ── Forms ── */
-.fld{margin-bottom:.55rem;}
-.fld label{display:block;font-size:.7rem;color:var(--muted);margin-bottom:.22rem;text-transform:lowercase;}
-input:not([type="range"]),textarea{width:100%;background:var(--inp);border:1px solid transparent;border-radius:8px;padding:.58rem .72rem;color:var(--text);font-family:inherit;font-size:.85rem;outline:none;transition:border-color .15s;}
-input:not([type="range"]):focus,textarea:focus{border-color:var(--bhi);}
-input::placeholder,textarea::placeholder{color:var(--muted);}
-textarea{resize:vertical;min-height:70px;font-size:.78rem;}
+select.inp {
+  -webkit-appearance:none; appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23666' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:right .6rem center;
+  padding-right:1.8rem;
+}
 
-/* ── SMS feed (flat list, newest first) ── */
-.sms-feed{display:flex;flex-direction:column;gap:.4rem;max-height:340px;overflow-y:auto;padding-right:.1rem;}
-.sms-item{padding:.55rem .7rem;border:1px solid var(--border);border-radius:10px;background:var(--chip);}
-.sms-hdr{display:flex;align-items:center;gap:.4rem;margin-bottom:.25rem;flex-wrap:wrap;}
-.sms-sim{font-size:.62rem;padding:.08rem .38rem;border-radius:999px;background:var(--sim-badge-bg);color:var(--sim-badge-color);font-weight:600;flex-shrink:0;}
-.sms-from{font-size:.76rem;font-weight:600;}
-.sms-ts{font-size:.63rem;color:var(--muted);margin-left:auto;}
-.sms-body{font-size:.77rem;color:var(--dim);line-height:1.5;word-break:break-word;}
-.inbox-empty{color:var(--muted);font-size:.8rem;padding:.9rem;text-align:center;}
+/* ── Call tab layout ─────────────────────────────────────────── */
+.call-pane { padding:0; overflow:hidden; height:100%; }
+.call-layout { display:flex; height:100%; }
+.call-left  { flex:0 0 340px; border-right:1px solid var(--border); padding:1.2rem; overflow-y:auto; }
+.call-right { flex:1; padding:1.2rem; overflow-y:auto; }
 
-/* ── Log ── */
-.log{background:var(--inp);border:1px solid var(--border);border-radius:10px;padding:.7rem .85rem;font-family:'JetBrains Mono',monospace;font-size:.73rem;max-height:200px;overflow-y:auto;color:var(--dim);line-height:1.75;}
-.le{display:flex;gap:.55rem;}
-.le .ts{color:var(--muted);flex-shrink:0;user-select:none;}
-.le.ev .msg{color:var(--good);}
-.le.er .msg{color:var(--danger);}
-.le.au .msg{color:#a78bfa;}
-.le.sm .msg{color:var(--warn);}
+/* ── Dialpad ─────────────────────────────────────────────────── */
+.num-display {
+  font:600 22px var(--mono); letter-spacing:.08em;
+  padding:.6rem .2rem .4rem; min-height:2.8rem;
+  color:var(--text); border-bottom:1px solid var(--border); margin-bottom:.7rem;
+}
+.num-display.ph { color:var(--muted); }
 
-/* ── Toasts ── */
-.toasts{position:fixed;top:1rem;right:1rem;display:flex;flex-direction:column;gap:.4rem;z-index:999;pointer-events:none;}
-.toast{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:.6rem .8rem;min-width:190px;max-width:320px;font-size:.8rem;animation:tslide .18s ease-out;pointer-events:auto;cursor:pointer;}
-.toast.ev{border-color:rgba(68,221,68,.3);}
-.toast.er{border-color:rgba(255,85,85,.3);}
-.toast.sm{border-color:rgba(255,187,51,.3);}
-.t-ttl{font-weight:600;margin-bottom:.1rem;}
-.toast.ev .t-ttl{color:var(--good);}
-.toast.er .t-ttl{color:var(--danger);}
-.toast.sm .t-ttl{color:var(--warn);}
-.t-bod{color:var(--dim);font-size:.72rem;font-family:'JetBrains Mono',monospace;}
-@keyframes tslide{from{transform:translateX(14px);opacity:0}to{transform:translateX(0);opacity:1}}
+.dialpad { display:grid; grid-template-columns:repeat(3,1fr); gap:.35rem; margin:.6rem 0; }
+.key {
+  padding:.65rem 0; text-align:center;
+  background:var(--surface2); border:1px solid var(--border); border-radius:8px;
+  cursor:pointer; transition:background .1s, border-color .1s;
+  user-select:none;
+}
+.key:hover  { background:var(--surface); border-color:var(--border-hi); }
+.key:active { background:var(--accent-lo); border-color:var(--accent-md); }
+.key-d { font:600 17px var(--mono); display:block; }
+.key-l { font-size:.52rem; color:var(--muted); letter-spacing:.1em; display:block; }
+.key.dtmf { padding:.5rem 0; }
 
-/* ── Incoming call modal ── */
-.incall-overlay{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:1000;display:flex;align-items:center;justify-content:center;animation:fadeIn .18s ease-out;}
-@keyframes fadeIn{from{opacity:0}to{opacity:1}}
-.incall-modal{background:var(--card);border:1px solid rgba(255,85,85,.35);border-radius:18px;padding:2rem 2.2rem 1.6rem;min-width:260px;text-align:center;box-shadow:0 0 40px rgba(255,85,85,.18);}
-.incall-label{font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--danger);font-weight:600;animation:pulse 1s ease-in-out infinite;margin-bottom:.7rem;}
-.incall-num{font-size:2rem;font-weight:700;letter-spacing:.02em;margin-bottom:.3rem;}
-.incall-via{font-size:.78rem;color:var(--muted);margin-bottom:1.4rem;}
-.incall-btns{display:flex;gap:.8rem;justify-content:center;}
-.incall-btns button{flex:1;padding:.7rem 0;font-size:.85rem;border-radius:10px;font-weight:600;cursor:pointer;border:none;}
-.btn-incall-answer{background:var(--good);color:#000;}
-.btn-incall-reject{background:var(--danger);color:#fff;}
+.dial-actions { display:flex; gap:.4rem; margin-top:.5rem; }
+.dial-actions .btn { flex:1; padding:.55rem; }
 
-/* ── Call panel transitions ── */
-.cpanel-enter-active,.cpanel-leave-active{transition:opacity .18s,transform .18s;}
-.cpanel-enter-from{opacity:0;transform:translateY(6px);}
-.cpanel-leave-to{opacity:0;transform:translateY(-6px);}
+/* ── Call states ─────────────────────────────────────────────── */
+.cs-center { text-align:center; padding:1.5rem 0; }
+.cs-state  { font:600 11px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--dim); margin-bottom:.3rem; }
+.cs-number { font:700 26px var(--mono); margin:.2rem 0; }
+.cs-sub    { font-size:.76rem; color:var(--dim); }
+.cs-sub.warn  { color:var(--warn); }
+.cs-actions   { display:flex; gap:.4rem; justify-content:center; margin-top:1rem; }
 
-/* ── Responsive ── */
-@media(max-width:960px){.grid3{grid-template-columns:1fr;}body{padding:1rem .75rem 4rem;}}
-@media(min-width:961px) and (max-width:1180px){.grid3{grid-template-columns:180px 1fr 260px;}}
+.active-header { border-bottom:1px solid var(--border); padding-bottom:.8rem; margin-bottom:.8rem; }
+.active-timer  { font:700 28px var(--mono); color:var(--text); margin-bottom:.2rem; }
+.active-num    { font:500 13px var(--mono); color:var(--dim); }
+
+.call-ctrl-row { display:flex; gap:.35rem; flex-wrap:wrap; margin-bottom:.7rem; }
+
+/* ── DTMF collapsible ────────────────────────────────────────── */
+.section-toggle {
+  display:flex; align-items:center; gap:.4rem; width:100%;
+  background:none; border:none; cursor:pointer; padding:.35rem 0;
+  color:var(--dim); font-size:.7rem; letter-spacing:.06em; text-transform:uppercase;
+  border-top:1px solid var(--border); margin-top:.5rem;
+}
+.section-toggle:hover { color:var(--text); }
+.toggle-chevron { margin-left:auto; font-size:.7rem; transition:transform .2s; }
+.toggle-chevron.open { transform:rotate(180deg); }
+
+/* ── Call notes ─────────────────────────────────────────────── */
+.call-notes { margin-top:.7rem; }
+.call-notes label { font-size:.67rem; letter-spacing:.07em; text-transform:uppercase; color:var(--dim); display:block; margin-bottom:.3rem; }
+.call-notes .ta { width:100%; min-height:90px; }
+
+/* ── Volume ──────────────────────────────────────────────────── */
+.vol-row { display:flex; align-items:center; gap:.6rem; }
+.vol-row input[type=range] { flex:1; accent-color:var(--accent); }
+.vol-row span { font:12px var(--mono); color:var(--dim); min-width:20px; }
+
+/* ── Audio meters ────────────────────────────────────────────── */
+.meters { display:flex; flex-direction:column; gap:.3rem; margin-top:.5rem; }
+.meter-row { display:flex; align-items:center; gap:.5rem; }
+.meter-lbl { font-size:.65rem; color:var(--dim); width:18px; }
+.meter-track { flex:1; height:4px; border-radius:2px; background:var(--muted); overflow:hidden; }
+.meter-fill  { height:100%; border-radius:2px; background:var(--accent); transition:width .08s; }
+
+/* ── Call history ────────────────────────────────────────────── */
+.hist-header { display:flex; align-items:center; gap:.4rem; margin-bottom:.7rem; }
+.hist-header h3 { font-size:.67rem; letter-spacing:.1em; text-transform:uppercase; color:var(--dim); }
+.hist-header button { margin-left:auto; }
+
+.hist-item { border-bottom:1px solid var(--border); }
+.hist-row {
+  display:flex; align-items:center; gap:.5rem;
+  padding:.5rem .2rem; cursor:pointer; border-radius:5px;
+}
+.hist-row:hover { background:var(--surface2); }
+.hist-dir  { font:600 13px var(--mono); color:var(--dim); width:16px; flex-shrink:0; }
+.hist-dir.in  { color:var(--good); }
+.hist-dir.out { color:var(--accent); }
+.hist-num  { font:500 13px var(--mono); flex:1; }
+.hist-ts   { font-size:.67rem; color:var(--muted); }
+.hist-dur  { font:11px var(--mono); color:var(--muted); min-width:30px; text-align:right; }
+.hist-expanded { padding:.5rem .2rem .7rem; display:flex; flex-direction:column; gap:.5rem; }
+.hist-notes     { font-size:.78rem; color:var(--dim); line-height:1.6; white-space:pre-wrap; }
+.hist-notes-em  { font-size:.75rem; color:var(--muted); font-style:italic; }
+.hist-exp-actions { display:flex; gap:.4rem; }
+
+/* ── Messages tab ────────────────────────────────────────────── */
+.msg-pane { display:flex; flex-direction:column; height:100%; }
+.msg-compose { padding:1.2rem 1.4rem; border-bottom:1px solid var(--border); flex-shrink:0; }
+.msg-compose-row { display:flex; gap:.5rem; align-items:flex-end; }
+.msg-to-row { display:flex; gap:.5rem; margin-bottom:.5rem; }
+.msg-to-row .inp { flex:1; }
+.msg-send-btn { padding:.45rem 1rem; flex-shrink:0; }
+.msg-inbox { flex:1; overflow-y:auto; padding:1rem 1.4rem; }
+.msg-inbox-header { font-size:.67rem; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin-bottom:.65rem; display:flex; gap:.4rem; align-items:center; }
+.msg-inbox-header button { margin-left:auto; }
+.sms-item { padding:.6rem .7rem; border:1px solid var(--border); border-radius:9px; margin-bottom:.4rem; background:var(--surface); }
+.sms-hdr { display:flex; align-items:center; gap:.4rem; margin-bottom:.25rem; flex-wrap:wrap; }
+.sms-sim  { font:600 .6rem var(--mono); padding:.06rem .35rem; border-radius:3px; background:var(--accent-lo); border:1px solid var(--accent-md); color:var(--accent); flex-shrink:0; }
+.sms-from { font-size:.76rem; font-weight:600; }
+.sms-ts   { font-size:.63rem; color:var(--muted); margin-left:auto; font:11px var(--mono); }
+.sms-body { font-size:.78rem; color:var(--dim); line-height:1.55; word-break:break-word; }
+.inbox-empty { color:var(--muted); font-size:.78rem; padding:.8rem 0; }
+
+/* ── Log tab ─────────────────────────────────────────────────── */
+.log-pane { height:100%; padding:0; }
+.log-box  { height:100%; overflow-y:auto; padding:1rem 1.4rem; font:12px var(--mono); }
+.log-line { display:flex; gap:.8rem; padding:.12rem 0; border-bottom:1px solid rgba(255,255,255,.025); }
+.log-ts   { color:var(--muted); flex-shrink:0; }
+.log-msg  { color:var(--dim); }
+.log-line.ev .log-msg { color:var(--text); }
+.log-line.er .log-msg { color:var(--danger); }
+.log-line.sm .log-msg { color:var(--warn); }
+.log-line.au .log-msg { color:var(--accent); }
+
+/* ── Settings tab ────────────────────────────────────────────── */
+.settings-pane { max-width:540px; }
+.settings-section { border:1px solid var(--border); border-radius:10px; margin-bottom:.7rem; overflow:hidden; }
+.settings-header {
+  display:flex; align-items:center; padding:.75rem 1rem;
+  cursor:pointer; background:var(--surface);
+  font-size:.78rem; font-weight:500;
+  transition:background .15s;
+}
+.settings-header:hover { background:var(--surface2); }
+.settings-header-chevron { margin-left:auto; color:var(--muted); font-size:.7rem; transition:transform .2s; }
+.settings-header-chevron.open { transform:rotate(180deg); }
+.settings-body { padding:1rem; border-top:1px solid var(--border); }
+.settings-actions { display:flex; gap:.4rem; margin-top:.8rem; }
+
+/* ── Contacts ────────────────────────────────────────────────── */
+.contact-list { margin-bottom:.6rem; }
+.contact-item { display:flex; align-items:center; gap:.5rem; padding:.3rem 0; border-bottom:1px solid var(--border); }
+.contact-item:last-child { border:none; }
+.contact-name { font-size:.78rem; font-weight:500; flex:1; }
+.contact-num  { font:11px var(--mono); color:var(--dim); }
+.contact-item button { opacity:.4; } .contact-item:hover button { opacity:1; }
+.add-contact-row { display:flex; gap:.4rem; }
+.add-contact-row .inp { flex:1; }
+
+/* ── Incoming call modal ─────────────────────────────────────── */
+.incall-overlay {
+  position:fixed; inset:0; background:rgba(0,0,0,.78);
+  z-index:1000; display:flex; align-items:center; justify-content:center;
+  animation:fadeIn .16s ease-out;
+}
+@keyframes fadeIn { from{opacity:0} to{opacity:1} }
+.incall-modal {
+  background:var(--surface); border:1px solid var(--border);
+  border-radius:16px; padding:2rem 2.4rem 1.8rem;
+  min-width:280px; text-align:center;
+  box-shadow:0 0 0 1px var(--accent-md), 0 24px 60px rgba(0,0,0,.6);
+}
+.incall-type   { font:600 .68rem var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--danger); animation:pulse 1.2s ease-in-out infinite; margin-bottom:.6rem; }
+.incall-number { font:700 28px var(--mono); margin-bottom:.2rem; }
+.incall-via    { font-size:.75rem; color:var(--dim); margin-bottom:1.5rem; }
+.incall-btns   { display:flex; gap:.7rem; justify-content:center; }
+.incall-btns .btn { flex:1; padding:.7rem; font-size:.82rem; }
+@keyframes pulse { 0%,100%{opacity:.6} 50%{opacity:1} }
+
+/* ── Toasts ──────────────────────────────────────────────────── */
+.toasts { position:fixed; top:1rem; right:1rem; display:flex; flex-direction:column; gap:.35rem; z-index:999; pointer-events:none; }
+.toast {
+  background:var(--surface); border:1px solid var(--border); border-radius:9px;
+  padding:.6rem .85rem; min-width:200px; max-width:300px;
+  font-size:.78rem; animation:tslide .16s ease-out; pointer-events:auto; cursor:pointer;
+}
+.toast.ev { border-color:rgba(86,184,112,.3); }
+.toast.er { border-color:rgba(224,80,80,.3); }
+.toast.sm { border-color:rgba(200,131,10,.3); }
+.toast-title { font-weight:600; margin-bottom:.12rem; }
+.toast.ev .toast-title { color:var(--good); }
+.toast.er .toast-title { color:var(--danger); }
+.toast.sm .toast-title { color:var(--accent); }
+.toast-body { color:var(--dim); font-size:.74rem; }
+@keyframes tslide { from{transform:translateX(12px);opacity:0} to{transform:translateX(0);opacity:1} }
+
+/* ── SIM filter select ───────────────────────────────────────── */
+.sim-filter-row { display:flex; align-items:center; gap:.5rem; margin-top:.5rem; }
+.sim-filter-row label { font-size:.7rem; color:var(--dim); }
+.sim-filter-row select { flex:0 0 auto; }
+
+/* ── Scrollbars ──────────────────────────────────────────────── */
+::-webkit-scrollbar { width:5px; height:5px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--muted); border-radius:3px; }
+
+/* ── Responsive ──────────────────────────────────────────────── */
+@media (max-width:680px) {
+  .sidebar { width:180px; }
+  .call-layout { flex-direction:column; }
+  .call-left { flex:none; border-right:none; border-bottom:1px solid var(--border); }
+}
+@media (max-width:480px) {
+  .sidebar { display:none; }
+}
 </style>
 </head>
-<body data-theme="dark">
+<body>
 <div id="app" v-cloak>
 
-<!-- Incoming call modal (shown only for selected device) -->
-<div v-if="callPanel === 'ringing-in'" class="incall-overlay">
-  <div class="incall-modal">
-    <div class="incall-label">incoming call</div>
-    <div class="incall-num">{{ selectedDevice?.call?.number || 'unknown' }}</div>
-    <div class="incall-via">via {{ selectedDevice?.name || selectedDevice?.id || 'device' }}</div>
-    <div class="incall-btns">
-      <button class="btn-incall-reject" @click="hangup">reject</button>
-      <button class="btn-incall-answer" @click="answer">answer</button>
+  <!-- ── SIDEBAR ───────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="sb-logo">
+      <span class="sb-logo-mark">ab</span>
+      <span class="sb-logo-name">bridge</span>
+      <span :class="['sb-status-dot', connClass]" :title="connLabel"></span>
     </div>
-  </div>
-</div>
 
-<!-- Toasts -->
-<div class="toasts">
-  <div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind" @click="removeToast(t.id)">
-    <div class="t-ttl">{{ t.title }}</div>
-    <div class="t-bod">{{ t.body }}</div>
-  </div>
-</div>
-
-<!-- Token gate -->
-<div v-if="!token" class="token-gate">
-  <div class="token-box">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:36px;height:36px;color:#555;margin-bottom:1rem;">
-      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
-      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-      <line x1="12" y1="19" x2="12" y2="22"/>
-    </svg>
-    <h2>audio bridge</h2>
-    <p>Enter your access token to connect. The token will be stored in the URL hash and never sent to the server in logs.</p>
-    <input v-model="tokenInput" type="password" placeholder="paste token here" @keydown.enter="submitToken" autofocus>
-    <div class="brow"><button class="bp" @click="submitToken">connect</button></div>
-    <div v-if="tokenErr" class="token-err">{{ tokenErr }}</div>
-  </div>
-</div>
-
-<!-- Main app -->
-<div v-else class="wrap">
-
-<!-- Header -->
-<header class="hdr">
-  <div class="hdr-logo">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="width:22px;height:22px;">
-      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
-      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-      <line x1="12" y1="19" x2="12" y2="22"/>
-    </svg>
-  </div>
-  <div>
-    <h1>audio bridge</h1>
-    <p>{{ headerSub }}</p>
-  </div>
-  <div class="hdr-right">
-    <div class="conn-pill" :class="connClass">
-      <span class="conn-dot"></span>
-      <span>{{ connLabel }}</span>
-    </div>
-    <button class="ibtn" @click="toggleTheme" title="toggle theme">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <template v-if="theme === 'dark'"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></template>
-        <template v-else><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></template>
-      </svg>
-    </button>
-    <button class="ibtn" @click="clearToken" title="change token">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-    </button>
-  </div>
-</header>
-
-<!-- 3-column grid -->
-<div class="grid3">
-
-  <!-- LEFT: Devices + Quick Contacts + Call History -->
-  <div>
-    <div class="card">
-      <div class="lbl">devices</div>
-      <div class="devs">
-        <div v-if="!devices.length" class="empty-h">no devices · configure daemon on phone</div>
-        <div v-for="d in devices" :key="d.id" class="dev" :class="{sel: d.id === selectedId}" @click="selectedId = d.id">
+    <div class="sb-section">
+      <div class="sb-label">devices</div>
+      <div v-if="!devices.length" class="sb-empty">
+        no devices<br><span style="font-size:.67rem">connect a device to start</span>
+      </div>
+      <div
+        v-for="d in devices" :key="d.id"
+        :class="['dev-card', { sel: d.id === selectedId }]"
+        @click="selectedId = d.id"
+      >
+        <div class="dev-avatar">{{ (d.name || d.id || '?')[0].toUpperCase() }}</div>
+        <div class="dev-body">
           <div class="dev-name">{{ d.name || d.id }}</div>
-          <div class="dev-meta">{{ d.id }}{{ d.android ? ' · api ' + d.android : '' }}</div>
-          <div class="dev-state" :class="(d.call?.state||'IDLE').toLowerCase()">
-            {{ (d.call?.state||'idle').toLowerCase() }}{{ d.call?.number ? ' · ' + d.call.number : '' }}
-          </div>
-          <div v-if="d.call?.state === 'DIALING'" class="dev-badge badge-d">dialing</div>
-          <div v-else-if="d.call?.state === 'RINGING'" class="dev-badge badge-r">ringing</div>
-          <div v-else-if="d.call?.state === 'ACTIVE'" class="dev-badge badge-a">active</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="lbl">quick contacts</div>
-      <div class="qc-list">
-        <div v-if="!contacts.length" style="color:var(--muted);font-size:.75rem;padding:.2rem 0;">add contacts below</div>
-        <div v-for="(c, i) in contacts" :key="i" class="qc-item" @click="dialContact(c)">
-          <div class="qc-avatar">{{ c.name.charAt(0).toUpperCase() }}</div>
-          <div class="qc-info">
-            <div class="qc-name">{{ c.name }}</div>
-            <div class="qc-num">{{ c.number }}</div>
-          </div>
-          <button @click.stop="removeContact(i)" class="qc-del" style="flex:0;min-width:0;padding:.15rem .3rem;font-size:.68rem;">✕</button>
-        </div>
-      </div>
-      <div class="add-ctct">
-        <input v-model="newCName" placeholder="name" @keydown.enter="addContact">
-        <input v-model="newCNum" placeholder="+1234567890" @keydown.enter="addContact">
-        <button @click="addContact">+</button>
-      </div>
-    </div>
-
-    <div v-if="callHistory.length" class="card">
-      <div class="lbl">recent calls</div>
-      <div class="hist-list">
-        <div v-for="(h, i) in callHistory.slice(0, 8)" :key="i" class="hist-item" @click="dialNumber(h.number)">
-          <div class="hist-num">{{ h.number }}</div>
-          <div class="hist-meta">{{ h.dir }} · {{ fmtClock(h.ts) }}{{ h.dur ? ' · ' + fmtDur(h.dur) : '' }}</div>
-        </div>
-      </div>
-    </div>
-  </div><!-- end left -->
-
-  <!-- CENTER: Call card -->
-  <div class="card">
-    <div class="lbl">{{ callLbl }}</div>
-
-    <transition name="cpanel" mode="out-in">
-
-      <!-- IDLE: number input + dial pad -->
-      <div v-if="callPanel === 'idle'" key="idle">
-        <div class="call-num-display" :class="{ph: !phoneNum}">{{ phoneNum || 'enter number' }}</div>
-        <div class="brow" style="margin-bottom:.5rem;">
-          <button @click="delChar" style="flex:0;padding:.52rem .75rem;">&#x232B;</button>
-          <button @click="phoneNum = ''" style="flex:0;padding:.52rem .75rem;">&#x2715;</button>
-          <button v-if="callHistory.length" @click="dialNumber(callHistory[0].number)" style="flex:0;padding:.52rem .7rem;font-size:.75rem;">redial</button>
-        </div>
-        <div class="dialpad">
-          <div v-for="k in dialKeys" :key="k.d" class="key" @click="pressKey(k.d)">
-            <div class="key-digit">{{ k.d }}</div>
-            <div class="key-sub">{{ k.l }}</div>
-          </div>
-        </div>
-        <div class="brow">
-          <button class="bp" :disabled="!selectedId || !phoneNum" @click="dial">call</button>
-        </div>
-      </div>
-
-      <!-- DIALING -->
-      <div v-else-if="callPanel === 'dialing'" key="dialing" class="cs-center">
-        <div class="cs-tag">calling</div>
-        <div class="cs-num">{{ selectedDevice?.call?.number || '&#x2014;' }}</div>
-        <div class="cs-sub" style="color:var(--warn)">ringing<span class="anim-dots"></span></div>
-        <div class="brow"><button class="bd" @click="hangup">cancel call</button></div>
-      </div>
-
-      <!-- RINGING incoming -->
-      <div v-else-if="callPanel === 'ringing-in'" key="ringing-in" class="cs-center">
-        <div class="cs-tag cs-sub ring">incoming call</div>
-        <div class="cs-num">{{ selectedDevice?.call?.number || 'unknown' }}</div>
-        <div class="cs-sub">via {{ selectedDevice?.name || selectedDevice?.id }}</div>
-        <div class="brow">
-          <button class="bg" @click="answer">answer</button>
-          <button class="bd" @click="hangup">reject</button>
-        </div>
-      </div>
-
-      <!-- RINGING outgoing -->
-      <div v-else-if="callPanel === 'ringing-out'" key="ringing-out" class="cs-center">
-        <div class="cs-tag">ringing</div>
-        <div class="cs-num">{{ selectedDevice?.call?.number || '&#x2014;' }}</div>
-        <div class="cs-sub" style="color:var(--warn)">waiting for answer<span class="anim-dots"></span></div>
-        <div class="brow"><button class="bd" @click="hangup">cancel</button></div>
-      </div>
-
-      <!-- ACTIVE call -->
-      <div v-else key="active">
-        <div class="active-num">{{ selectedDevice?.call?.number || 'connected' }}</div>
-        <div class="active-via">via {{ selectedDevice?.name || selectedDevice?.id }}</div>
-        <div class="timer">{{ timerDisplay }}</div>
-
-        <div class="brow" style="margin-bottom:.6rem;">
-          <button :class="selectedDevice?.call?.muted ? 'bact' : ''" @click="toggleMute">
-            {{ selectedDevice?.call?.muted ? 'unmute' : 'mute' }}
-          </button>
-          <button :class="speakerOn ? 'bact' : ''" @click="toggleSpeaker">
-            spkr {{ speakerOn ? 'on' : 'off' }}
-          </button>
-          <button class="bd" @click="hangup">hang up</button>
-        </div>
-
-        <div class="ctrl-row">
-          <span class="ctrl-lbl">volume</span>
-          <input type="range" min="0" max="15" v-model.number="callVolume" @change="applyVolume">
-          <span class="ctrl-val">{{ callVolume }}</span>
-        </div>
-
-        <div class="sec-lbl">audio</div>
-        <div class="brow">
-          <button v-if="!audioActive" @click="startAudio(false)">listen in</button>
-          <button v-if="!audioActive" class="bp" @click="startAudio(true)">speak</button>
-          <button v-if="audioActive" class="bd" @click="stopAudio">stop audio</button>
-        </div>
-        <div v-if="audioActive" class="meters">
-          <div><div class="meter-lbl">rx · phone speaker</div><div class="meter-bar"><div class="meter-fill" :style="{width: meterRx + '%'}"></div></div></div>
-          <div><div class="meter-lbl">tx · your mic</div><div class="meter-bar"><div class="meter-fill" :style="{width: meterTx + '%'}"></div></div></div>
-        </div>
-
-        <div class="sec-lbl">dtmf</div>
-        <div class="dialpad">
-          <div v-for="k in dialKeys" :key="'dt'+k.d" class="key dtmf" @click="sendDtmf(k.d)">
-            <div class="key-digit">{{ k.d }}</div>
-          </div>
-        </div>
-      </div>
-
-    </transition>
-  </div><!-- end center -->
-
-  <!-- RIGHT: Device info + SIM filter + SMS -->
-  <div>
-
-    <!-- Device info panel -->
-    <div v-if="selectedDevice" class="card">
-      <div class="lbl">device info</div>
-
-      <!-- Battery + signal status row -->
-      <div v-if="selectedDevice.device_status && (selectedDevice.device_status.battery_pct != null || selectedDevice.device_status.sims)" class="status-row">
-        <div v-if="selectedDevice.device_status.battery_pct != null"
-             class="batt-chip"
-             :class="{charging: selectedDevice.device_status.battery_charging}">
-          <span>&#x1F50B;</span>
-          <span>{{ selectedDevice.device_status.battery_pct }}%</span>
-          <span v-if="selectedDevice.device_status.battery_charging">&#x26A1;</span>
-        </div>
-        <div v-for="(sim, idx) in (selectedDevice.device_status.sims || [])" :key="idx" class="sig-chip">
-          <span class="sig-bars">
-            <span v-for="b in 4" :key="b" class="sig-bar"
-              :style="{
-                height: (b * 3) + 'px',
-                background: sigBarColor(sim.signal_bars, b)
-              }"></span>
+          <div class="dev-sub">{{ [d.brand, d.android ? 'A'+d.android : ''].filter(Boolean).join(' · ') }}</div>
+          <span :class="['dev-state-pill', (d.call?.state || 'idle').toLowerCase()]">
+            {{ (d.call?.state || 'idle').toLowerCase() }}
           </span>
-          <span style="font-size:.68rem;">SIM{{ sim.slot != null ? sim.slot + 1 : idx + 1 }}</span>
-          <span v-if="sim.network_type" style="font-size:.63rem;color:var(--muted);">{{ sim.network_type }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sb-footer">
+      <template v-if="!token">
+        <button class="sb-connect-btn" @click="showConnectForm = !showConnectForm">
+          {{ showConnectForm ? 'cancel' : 'connect' }}
+        </button>
+        <div v-if="showConnectForm" class="sb-token-form">
+          <input
+            v-model="tokenInput" type="password" placeholder="server token"
+            @keydown.enter="submitToken"
+          >
+          <button @click="submitToken">→</button>
+        </div>
+        <div v-if="tokenErr" class="sb-token-err">{{ tokenErr }}</div>
+      </template>
+      <template v-else>
+        <div class="sb-connected-row">
+          <span :class="['sb-status-dot', connClass]"></span>
+          <span class="label">{{ connLabel }}</span>
+          <button class="sb-disconn-btn" @click="clearToken">disconnect</button>
+        </div>
+      </template>
+    </div>
+  </aside>
+
+  <!-- ── MAIN ──────────────────────────────────────────────────── -->
+  <main :class="['main', { 'call-active': callPanel === 'active' }]">
+
+    <!-- Tab bar -->
+    <nav class="tab-bar">
+      <button
+        v-for="t in tabs" :key="t.id"
+        :class="['tab', { active: activeTab === t.id }]"
+        @click="activeTab = t.id"
+      >
+        {{ t.label }}
+        <span v-if="t.id === 'call' && callPanel !== 'idle'" class="tab-badge">●</span>
+        <span v-if="t.id === 'messages' && smsFeed.length" class="tab-badge">{{ smsFeed.length }}</span>
+      </button>
+    </nav>
+
+    <div class="tab-content">
+
+      <!-- ── OVERVIEW TAB ─────────────────────────────────────── -->
+      <div v-if="activeTab === 'overview'" class="tab-pane">
+        <div v-if="!selectedDevice" class="empty-state">
+          <div class="es-icon">◎</div>
+          <div>select a device from the sidebar</div>
+        </div>
+        <template v-else>
+
+          <!-- Device info -->
+          <div class="card">
+            <div class="card-title">device</div>
+            <div class="kv"><span class="kv-k">model</span><span class="kv-v">{{ selectedDevice.device_info?.model || selectedDevice.name || '—' }}</span></div>
+            <div class="kv"><span class="kv-k">brand</span><span class="kv-v">{{ selectedDevice.device_info?.manufacturer || selectedDevice.brand || '—' }}</span></div>
+            <div class="kv"><span class="kv-k">android</span><span class="kv-v">{{ selectedDevice.device_info?.android_version || selectedDevice.android || '—' }}</span></div>
+            <div class="kv"><span class="kv-k">device id</span><span class="kv-v" style="font-size:.72rem">{{ selectedId }}</span></div>
+          </div>
+
+          <!-- Status + battery -->
+          <div class="card">
+            <div class="card-title">status</div>
+            <div class="kv">
+              <span class="kv-k">call state</span>
+              <span :class="['kv-v', callPanel === 'active' ? 'good' : callPanel.startsWith('ringing') ? 'warn' : '']">
+                {{ selectedDevice.call?.state || 'IDLE' }}
+                <span v-if="selectedDevice.call?.number"> · {{ selectedDevice.call.number }}</span>
+              </span>
+            </div>
+            <div class="kv" v-if="selectedDevice.device_status">
+              <span class="kv-k">battery</span>
+              <span class="kv-v">
+                <div class="batt-row">
+                  <div class="batt-bar" style="width:80px">
+                    <div class="batt-fill"
+                      :class="{ low: (selectedDevice.device_status.battery_pct||0)<20, mid: (selectedDevice.device_status.battery_pct||0)<50 }"
+                      :style="{ width: (selectedDevice.device_status.battery_pct||0)+'%' }">
+                    </div>
+                  </div>
+                  <span class="batt-pct">{{ selectedDevice.device_status.battery_pct ?? '—' }}%{{ selectedDevice.device_status.battery_charging ? ' ⚡' : '' }}</span>
+                </div>
+              </span>
+            </div>
+          </div>
+
+          <!-- SIMs -->
+          <div class="card" v-if="selectedDevice.device_status?.sims?.length">
+            <div class="card-title">sims</div>
+            <div class="sim-chips">
+              <div
+                v-for="(sim, i) in selectedDevice.device_status.sims" :key="i"
+                :class="['sim-chip', { 'no-sim': !sim.carrier }]"
+              >
+                <div class="sim-chip-carrier">{{ sim.carrier || 'SIM '+(i+1)+' empty' }}</div>
+                <div v-if="sim.phone_number" class="sim-chip-num">{{ sim.phone_number }}</div>
+                <div v-if="sim.signal_bars != null" class="sig-bars">
+                  <div v-for="b in 4" :key="b" class="sig-bar" :style="{ height: (3+b*2.5)+'px', background: b <= sim.signal_bars ? (sim.signal_bars>=3?'var(--good)':sim.signal_bars>=2?'var(--warn)':'var(--danger)') : 'var(--muted)' }"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- SIM filter -->
+          <div class="card">
+            <div class="card-title">call routing</div>
+            <div class="sim-filter-row">
+              <label>accept incoming on</label>
+              <select class="inp" v-model="simFilter" @change="applySimFilter" style="font-size:.75rem;padding:.32rem .5rem;">
+                <option value="all">all SIMs</option>
+                <option value="0">SIM 1 only</option>
+                <option value="1">SIM 2 only</option>
+                <option value="none">none (reject all)</option>
+              </select>
+            </div>
+          </div>
+
+        </template>
+      </div>
+
+      <!-- ── CALL TAB ──────────────────────────────────────────── -->
+      <div v-if="activeTab === 'call'" class="tab-pane call-pane">
+        <div v-if="!selectedId" class="empty-state">
+          <div class="es-icon">☎</div>
+          <div>select a device first</div>
+        </div>
+        <div v-else class="call-layout">
+
+          <!-- Left panel: dial / active call -->
+          <div class="call-left">
+
+            <!-- IDLE: dialpad -->
+            <template v-if="callPanel === 'idle'">
+              <div :class="['num-display', { ph: !phoneNum }]">{{ phoneNum || 'enter number' }}</div>
+              <div style="display:flex;gap:.35rem;margin-bottom:.5rem;">
+                <button class="btn-icon" @click="delChar" title="backspace" style="flex:0">⌫</button>
+                <button v-if="callHistory.length" class="btn-ghost" @click="dialNumber(callHistory[0].number)" style="font-size:.72rem;flex:0;padding:.35rem .65rem;">redial</button>
+              </div>
+              <div class="dialpad">
+                <div v-for="k in dialKeys" :key="k.d" class="key" @click="pressKey(k.d)">
+                  <span class="key-d">{{ k.d }}</span>
+                  <span class="key-l">{{ k.l }}</span>
+                </div>
+              </div>
+              <div class="dial-actions">
+                <button class="btn btn-p" :disabled="!phoneNum" @click="dial">call</button>
+              </div>
+            </template>
+
+            <!-- DIALING -->
+            <template v-else-if="callPanel === 'dialing'">
+              <div class="cs-center">
+                <div class="cs-state">dialing</div>
+                <div class="cs-number">{{ selectedDevice?.call?.number || phoneNum }}</div>
+                <div class="cs-sub warn">placing call…</div>
+                <div class="cs-actions"><button class="btn btn-d" @click="hangup">cancel</button></div>
+              </div>
+            </template>
+
+            <!-- RINGING OUT -->
+            <template v-else-if="callPanel === 'ringing-out'">
+              <div class="cs-center">
+                <div class="cs-state">ringing</div>
+                <div class="cs-number">{{ selectedDevice?.call?.number }}</div>
+                <div class="cs-sub warn">waiting for answer…</div>
+                <div class="cs-actions"><button class="btn btn-d" @click="hangup">cancel</button></div>
+              </div>
+            </template>
+
+            <!-- ACTIVE -->
+            <template v-else-if="callPanel === 'active'">
+              <div class="active-header">
+                <div class="active-timer">{{ timerDisplay }}</div>
+                <div class="active-num">{{ selectedDevice?.call?.number }}</div>
+              </div>
+
+              <div class="call-ctrl-row">
+                <button :class="['btn-icon', { active: selectedDevice?.call?.muted }]" @click="toggleMute" title="mute (m)">
+                  {{ selectedDevice?.call?.muted ? '🔇' : '🎙' }}
+                </button>
+                <button :class="['btn-icon', { active: speakerOn }]" @click="toggleSpeaker" title="speaker">🔊</button>
+                <button class="btn btn-d" @click="hangup" style="flex:1;margin-left:.2rem;">hang up</button>
+              </div>
+
+              <!-- Volume -->
+              <div class="vol-row" style="margin-bottom:.6rem;">
+                <span style="font-size:.67rem;color:var(--muted)">vol</span>
+                <input type="range" min="0" max="15" v-model.number="callVolume" @change="applyVolume">
+                <span>{{ callVolume }}</span>
+              </div>
+
+              <!-- Audio -->
+              <div style="display:flex;gap:.35rem;margin-bottom:.6rem;">
+                <button v-if="!audioActive" class="btn-ghost" @click="startAudio(false)" style="font-size:.72rem;flex:1">listen in</button>
+                <button v-if="!audioActive" class="btn-ghost" @click="startAudio(true)" style="font-size:.72rem;flex:1">speak</button>
+                <button v-if="audioActive" class="btn-ghost" @click="stopAudio" style="font-size:.72rem;flex:1;color:var(--danger)">stop audio</button>
+              </div>
+
+              <div v-if="audioActive" class="meters">
+                <div class="meter-row"><span class="meter-lbl">rx</span><div class="meter-track"><div class="meter-fill" :style="{ width: meterRx+'%' }"></div></div></div>
+                <div class="meter-row"><span class="meter-lbl">tx</span><div class="meter-track"><div class="meter-fill" :style="{ width: meterTx+'%' }"></div></div></div>
+              </div>
+
+              <!-- DTMF (collapsible) -->
+              <button class="section-toggle" @click="showDtmf = !showDtmf">
+                dtmf
+                <span :class="['toggle-chevron', { open: showDtmf }]">▾</span>
+              </button>
+              <div v-if="showDtmf" class="dialpad" style="margin-top:.4rem;">
+                <div v-for="k in dialKeys" :key="'dt'+k.d" class="key dtmf" @click="sendDtmf(k.d)">
+                  <span class="key-d" style="font-size:14px">{{ k.d }}</span>
+                </div>
+              </div>
+
+              <!-- In-call notes -->
+              <div class="call-notes">
+                <label>call notes</label>
+                <textarea class="ta" v-model="callNote" placeholder="type notes about this call…"></textarea>
+              </div>
+            </template>
+
+          </div>
+
+          <!-- Right panel: history -->
+          <div class="call-right">
+            <div class="hist-header">
+              <h3>history</h3>
+              <button v-if="callHistory.length" class="btn-ghost" @click="clearHistory" style="font-size:.68rem">clear</button>
+            </div>
+
+            <div v-if="!callHistory.length" class="inbox-empty">no calls yet</div>
+            <div v-for="(h, i) in callHistory" :key="h.ts" class="hist-item">
+              <div class="hist-row" @click="expandedHist = expandedHist === i ? null : i">
+                <span :class="['hist-dir', h.dir === 'incoming' ? 'in' : 'out']">{{ h.dir === 'incoming' ? '↓' : '↑' }}</span>
+                <span class="hist-num">{{ h.number || 'unknown' }}</span>
+                <span class="hist-ts">{{ fmtRelTime(h.ts) }}</span>
+                <span class="hist-dur">{{ fmtDur(h.dur) }}</span>
+              </div>
+              <div v-if="expandedHist === i" class="hist-expanded">
+                <div v-if="h.notes" class="hist-notes">{{ h.notes }}</div>
+                <div v-else class="hist-notes-em">no notes for this call</div>
+                <div class="hist-exp-actions">
+                  <button class="btn-ghost" @click="dialNumber(h.number)" style="font-size:.7rem">redial</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
 
-      <!-- Manufacturer + model -->
-      <div class="dinfo-row" v-if="selectedDevice.device_info?.manufacturer || selectedDevice.brand || selectedDevice.device_info?.model">
-        <span class="dinfo-key">device</span>
-        <span class="dinfo-val">{{ selectedDevice.device_info?.manufacturer || selectedDevice.brand || '' }} {{ selectedDevice.device_info?.model || selectedDevice.name || '' }}</span>
-      </div>
-      <!-- Android version + SDK -->
-      <div class="dinfo-row" v-if="selectedDevice.device_info?.android_version || selectedDevice.android">
-        <span class="dinfo-key">android</span>
-        <span class="dinfo-val">{{ selectedDevice.device_info?.android_version || selectedDevice.android }}{{ selectedDevice.device_info?.sdk_int ? ' · SDK ' + selectedDevice.device_info.sdk_int : '' }}</span>
-      </div>
-      <!-- ROM (Build.DISPLAY) -->
-      <div class="dinfo-row" v-if="selectedDevice.device_info?.rom">
-        <span class="dinfo-key">ROM</span>
-        <span class="dinfo-val">{{ selectedDevice.device_info.rom }}</span>
+      <!-- ── MESSAGES TAB ──────────────────────────────────────── -->
+      <div v-if="activeTab === 'messages'" class="tab-pane msg-pane" style="padding:0">
+        <div v-if="!selectedId" class="empty-state">
+          <div class="es-icon">✉</div>
+          <div>select a device first</div>
+        </div>
+        <template v-else>
+          <div class="msg-compose">
+            <div class="msg-to-row">
+              <input class="inp" v-model="smsTo" placeholder="to: phone number" style="flex:1;">
+            </div>
+            <div class="msg-compose-row">
+              <textarea class="ta" v-model="smsBody" placeholder="message…" @keydown.ctrl.enter="sendSms" @keydown.meta.enter="sendSms" style="flex:1;min-height:60px;"></textarea>
+              <button class="btn btn-p msg-send-btn" :disabled="!smsTo || !smsBody" @click="sendSms">send</button>
+            </div>
+          </div>
+          <div class="msg-inbox">
+            <div class="msg-inbox-header">
+              inbox
+              <span v-if="smsFeed.length" style="color:var(--muted)">({{ smsFeed.length }})</span>
+              <button v-if="smsFeed.length" class="btn-ghost" @click="clearSms" style="font-size:.68rem">clear</button>
+            </div>
+            <div v-if="!smsFeed.length" class="inbox-empty">no messages yet</div>
+            <div v-for="(m, i) in smsFeed" :key="i" class="sms-item">
+              <div class="sms-hdr">
+                <span class="sms-sim">{{ m.simLabel }}</span>
+                <span class="sms-from">{{ m.from }}</span>
+                <span class="sms-ts">{{ fmtClock(m.ts) }}</span>
+              </div>
+              <div class="sms-body" v-html="m.bodyHtml"></div>
+            </div>
+          </div>
+        </template>
       </div>
 
-      <!-- SIM list -->
-      <div v-if="(selectedDevice.device_info?.sims || []).length" style="margin-top:.55rem;">
-        <div class="lbl" style="margin-bottom:.35rem;">SIMs</div>
-        <div class="sim-list">
-          <div v-for="(sim, idx) in (selectedDevice.device_info.sims || [])" :key="idx" class="sim-row">
-            <span class="sim-badge">SIM {{ (sim.slot != null ? sim.slot : idx) + 1 }}</span>
-            <span class="sim-carrier">{{ sim.carrier || sim.operator || 'unknown' }}</span>
-            <span class="sim-num">{{ sim.number || sim.phone_number || '' }}</span>
+      <!-- ── LOG TAB ───────────────────────────────────────────── -->
+      <div v-if="activeTab === 'log'" class="tab-pane log-pane" style="padding:0">
+        <div ref="logEl" class="log-box">
+          <div v-if="!eventLog.length" style="color:var(--muted);padding:.5rem 0;font-size:.78rem;">no events yet</div>
+          <div v-for="(e,i) in eventLog" :key="i" :class="['log-line', e.cls]">
+            <span class="log-ts">{{ e.ts }}</span>
+            <span class="log-msg">{{ e.msg }}</span>
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- SIM filter -->
-    <div v-if="selectedDevice" class="card">
-      <div class="lbl">SIM filter</div>
-      <div class="fld">
-        <label>accept incoming calls on</label>
-        <select v-model="simFilter" @change="applySimFilter">
-          <option value="all">Accept all SIMs</option>
-          <option value="0">SIM 1 only</option>
-          <option value="1">SIM 2 only</option>
-          <option value="none">Reject all</option>
-        </select>
-      </div>
-    </div>
+      <!-- ── SETTINGS TAB ──────────────────────────────────────── -->
+      <div v-if="activeTab === 'settings'" class="tab-pane settings-pane">
 
-    <!-- Send SMS -->
-    <div class="card">
-      <div class="lbl">send sms</div>
-      <div class="fld">
-        <label>to</label>
-        <input type="tel" v-model="smsTo" placeholder="+1234567890" @keydown.enter="smsBody && sendSms()">
-      </div>
-      <div class="fld">
-        <label>message</label>
-        <textarea v-model="smsBody" placeholder="type a message…" @keydown.enter.ctrl="sendSms" @keydown.enter.meta="sendSms"></textarea>
-      </div>
-      <div class="brow">
-        <button class="bp" :disabled="!selectedId || !smsTo || !smsBody" @click="sendSms">send</button>
-      </div>
-    </div>
-
-    <!-- SMS feed -->
-    <div class="card">
-      <div style="display:flex;align-items:center;margin-bottom:.75rem;">
-        <span class="lbl" style="margin-bottom:0;">messages</span>
-        <span v-if="smsFeed.length" style="font-size:.67rem;color:var(--muted);margin-left:.38rem;">({{ smsFeed.length }})</span>
-        <button v-if="smsFeed.length" @click="clearSms" style="flex:0;padding:.2rem .42rem;font-size:.66rem;margin-left:auto;">clear</button>
-      </div>
-      <div class="sms-feed">
-        <div v-if="!smsFeed.length" class="inbox-empty">no messages yet</div>
-        <div v-for="(m, i) in smsFeed" :key="i" class="sms-item">
-          <div class="sms-hdr">
-            <span class="sms-sim">{{ m.simLabel }}</span>
-            <span class="sms-from">{{ m.from }}</span>
-            <span class="sms-ts">{{ fmtClock(m.ts) }}</span>
+        <!-- Server config -->
+        <div class="settings-section">
+          <div class="settings-header" @click="openSection.server = !openSection.server">
+            server connection
+            <span :class="['settings-header-chevron', { open: openSection.server }]">▾</span>
           </div>
-          <div class="sms-body" v-html="m.bodyHtml"></div>
+          <div v-if="openSection.server" class="settings-body">
+            <div class="field"><label>host</label><input class="inp" v-model="cfgEdit.host" placeholder="192.168.x.x"></div>
+            <div class="field"><label>port</label><input class="inp inp-mono" v-model.number="cfgEdit.port" type="number"></div>
+            <div class="field"><label>token</label><input class="inp inp-mono" v-model="cfgEdit.token" type="password"></div>
+            <label style="display:flex;align-items:center;gap:.5rem;font-size:.76rem;color:var(--dim);cursor:pointer;">
+              <input type="checkbox" v-model="cfgEdit.use_tls"> use TLS
+            </label>
+            <div v-if="cfgEdit.use_tls" class="field" style="margin-top:.5rem;"><label>server cert SHA-256</label><input class="inp inp-mono" v-model="cfgEdit.server_cert_sha256" placeholder="hex fingerprint"></div>
+            <div class="settings-actions">
+              <button class="btn btn-p" @click="saveConfig">save &amp; restart</button>
+              <button class="btn-ghost" @click="openSection.server = false">cancel</button>
+            </div>
+          </div>
         </div>
+
+        <!-- Audio config -->
+        <div class="settings-section">
+          <div class="settings-header" @click="openSection.audio = !openSection.audio">
+            audio configuration
+            <span :class="['settings-header-chevron', { open: openSection.audio }]">▾</span>
+          </div>
+          <div v-if="openSection.audio" class="settings-body">
+            <div class="field"><label>PCM card</label><input class="inp inp-mono" v-model.number="cfgEdit.pcm_card" type="number"></div>
+            <div class="field"><label>TX injection device</label><input class="inp inp-mono" v-model.number="cfgEdit.pcm_tx_injection_device" type="number"></div>
+            <div class="field"><label>TX injection rate (Hz)</label><input class="inp inp-mono" v-model.number="cfgEdit.pcm_tx_rate" type="number" placeholder="8000"></div>
+            <div class="field"><label>RX capture device</label><input class="inp inp-mono" v-model.number="cfgEdit.pcm_rx_capture_device" type="number"></div>
+            <div class="field"><label>RX capture rate (Hz)</label><input class="inp inp-mono" v-model.number="cfgEdit.pcm_rx_rate" type="number"></div>
+            <div class="settings-actions">
+              <button class="btn btn-p" @click="saveConfig">save &amp; restart</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick contacts -->
+        <div class="settings-section">
+          <div class="settings-header" @click="openSection.contacts = !openSection.contacts">
+            quick contacts
+            <span :class="['settings-header-chevron', { open: openSection.contacts }]">▾</span>
+          </div>
+          <div v-if="openSection.contacts" class="settings-body">
+            <div class="contact-list">
+              <div v-if="!contacts.length" class="inbox-empty">no contacts</div>
+              <div v-for="(c, i) in contacts" :key="i" class="contact-item">
+                <span class="contact-name">{{ c.name }}</span>
+                <span class="contact-num">{{ c.number }}</span>
+                <button class="btn-icon" @click="dialContact(c)" title="dial" style="width:28px;height:28px;font-size:.8rem;">☎</button>
+                <button class="btn-icon" @click="removeContact(i)" title="remove" style="width:28px;height:28px;font-size:.8rem;color:var(--danger)">✕</button>
+              </div>
+            </div>
+            <div class="add-contact-row">
+              <input class="inp" v-model="newCName" placeholder="name" style="max-width:110px;">
+              <input class="inp inp-mono" v-model="newCNum" placeholder="number">
+              <button class="btn btn-p" @click="addContact" :disabled="!newCName||!newCNum" style="padding:.4rem .7rem;">add</button>
+            </div>
+          </div>
+        </div>
+
       </div>
     </div>
+  </main>
 
-  </div><!-- end right -->
-
-</div><!-- end grid3 -->
-
-<!-- Event log -->
-<div class="card full">
-  <div class="lbl">event log</div>
-  <div class="log" ref="logEl">
-    <div v-for="(e, i) in eventLog" :key="i" class="le" :class="e.cls">
-      <span class="ts">{{ e.ts }}</span><span class="msg">{{ e.msg }}</span>
+  <!-- ── INCOMING CALL MODAL ─────────────────────────────────── -->
+  <div v-if="callPanel === 'ringing-in'" class="incall-overlay">
+    <div class="incall-modal">
+      <div class="incall-type">incoming call</div>
+      <div class="incall-number">{{ selectedDevice?.call?.number || 'unknown' }}</div>
+      <div class="incall-via">via {{ selectedDevice?.name || selectedId }}</div>
+      <div class="incall-btns">
+        <button class="btn btn-d" @click="hangup">reject</button>
+        <button class="btn btn-g" @click="answer">answer</button>
+      </div>
     </div>
   </div>
+
+  <!-- ── TOASTS ─────────────────────────────────────────────── -->
+  <div class="toasts">
+    <div v-for="t in toasts" :key="t.id" :class="['toast', t.kind]" @click="removeToast(t.id)">
+      <div class="toast-title">{{ t.title }}</div>
+      <div class="toast-body">{{ t.body }}</div>
+    </div>
+  </div>
+
 </div>
-
-</div><!-- wrap -->
-</div><!-- app -->
-
 <script>
-const { createApp, ref, computed, reactive, watch, nextTick, onMounted, onUnmounted } = Vue;
+const { createApp, ref, computed, nextTick, onMounted, onUnmounted } = Vue;
 
-// ── XSS escape ────────────────────────────────────────────────────────────────
 function escHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 createApp({
   setup() {
-    // ── Token handling ────────────────────────────────────────────
-    // Token stored in URL hash (#token=XXX) — not in path/query (avoids server logs).
-    const hashParams = new URLSearchParams(window.location.hash.slice(1));
-    const token      = ref(hashParams.get('token') || '');
-    const tokenInput = ref('');
-    const tokenErr   = ref('');
+    // ── State ─────────────────────────────────────────────────
+    const token       = ref(localStorage.getItem('ab-token') || '');
+    const tokenInput  = ref('');
+    const tokenErr    = ref('');
+    const connected   = ref(false);
+    const authFailed  = ref(false);
+    const devices     = ref([]);
+    const selectedId  = ref(null);
+    const activeTab   = ref('overview');
+    const showConnectForm = ref(!localStorage.getItem('ab-token'));
 
-    function submitToken() {
-      const t = tokenInput.value.trim();
-      if (!t) { tokenErr.value = 'token is required'; return; }
-      token.value = t;
-      // Store in hash so page reloads keep it without hitting server logs
-      window.location.hash = 'token=' + encodeURIComponent(t);
-      tokenErr.value = '';
-      // Start connection now that we have a token
-      nextTick(connectWS);
-    }
-
-    function clearToken() {
-      token.value = '';
-      tokenInput.value = '';
-      window.location.hash = '';
-      if (ws) { try { ws.close(); } catch(_) {} ws = null; }
-      connected.value = false;
-      authFailed.value = false;
-    }
-
-    // ── Reactive state ────────────────────────────────────────────
-    const theme      = ref(localStorage.getItem('ab-theme') || 'dark');
-    const connected  = ref(false);
-    const authFailed = ref(false);
-    const devices    = ref([]);
-    const selectedId = ref(null);
-    const phoneNum   = ref('');
-    const smsTo      = ref('');
-    const smsBody    = ref('');
-    const eventLog   = ref([]);
-    const logEl      = ref(null);
-    const toasts     = ref([]);
-    const timerDisplay = ref('00:00');
-    const speakerOn  = ref(false);
-    const callVolume = ref(7);
-    const meterRx    = ref(0);
-    const meterTx    = ref(0);
+    const phoneNum    = ref('');
+    const smsTo       = ref('');
+    const smsBody     = ref('');
+    const eventLog    = ref([]);
+    const logEl       = ref(null);
+    const toasts      = ref([]);
+    const timerDisplay= ref('00:00');
+    const speakerOn   = ref(false);
+    const callVolume  = ref(7);
+    const meterRx     = ref(0);
+    const meterTx     = ref(0);
     const audioActive = ref(false);
-    const contacts   = ref(JSON.parse(localStorage.getItem('ab-contacts') || '[]'));
-    const newCName   = ref('');
-    const newCNum    = ref('');
-    const callHistory = ref(JSON.parse(localStorage.getItem('ab-callhist') || '[]'));
-    const smsFeed    = ref([]);   // flat list, newest first, max 50
-    const simFilter  = ref('all');
+    const smsFeed     = ref([]);
+    const callNote    = ref('');
+    const expandedHist= ref(null);
+    const showDtmf    = ref(false);
 
-    // ── Computed ──────────────────────────────────────────────────
+    const contacts    = ref(JSON.parse(localStorage.getItem('ab-contacts') || '[]'));
+    const newCName    = ref('');
+    const newCNum     = ref('');
+    const callHistory = ref(JSON.parse(localStorage.getItem('ab-callhist') || '[]'));
+
+    const openSection = ref({ server: false, audio: false, contacts: false });
+    const cfgEdit     = ref({ host:'', port:59100, token:'', use_tls:false, server_cert_sha256:'', pcm_card:0, pcm_tx_injection_device:27, pcm_tx_rate:8000, pcm_rx_capture_device:0, pcm_rx_rate:16000 });
+
+    const simFilter   = ref('all');
+
+    const tabs = [
+      { id:'overview',  label:'overview' },
+      { id:'call',      label:'call' },
+      { id:'messages',  label:'messages' },
+      { id:'log',       label:'log' },
+      { id:'settings',  label:'settings' },
+    ];
+
+    let _callNum = '', _callDir = '', _callStart = 0;
+
+    // ── Computed ──────────────────────────────────────────────
     const selectedDevice = computed(() =>
       devices.value.find(d => d.id === selectedId.value) || null
     );
-    const callState = computed(() => selectedDevice.value?.call?.state || 'IDLE');
 
     const callPanel = computed(() => {
-      const s = callState.value;
+      const s   = selectedDevice.value?.call?.state || 'IDLE';
       const dir = selectedDevice.value?.call?.direction;
       if (s === 'DIALING') return 'dialing';
       if (s === 'RINGING' && dir === 'incoming') return 'ringing-in';
       if (s === 'RINGING') return 'ringing-out';
-      if (s === 'ACTIVE') return 'active';
+      if (s === 'ACTIVE')  return 'active';
       return 'idle';
-    });
-
-    const callLbl = computed(() => {
-      const p = callPanel.value;
-      if (p === 'dialing') return 'call · dialing';
-      if (p === 'ringing-in') return 'call · incoming';
-      if (p === 'ringing-out') return 'call · ringing';
-      if (p === 'active') return 'call · active';
-      return 'call';
-    });
-
-    const headerSub = computed(() => {
-      if (authFailed.value) return 'auth failed · check token';
-      if (!connected.value) return 'connecting…';
-      if (!devices.value.length) return 'no devices connected';
-      if (devices.value.length === 1) return devices.value[0].name || devices.value[0].id;
-      return devices.value.length + ' devices connected';
     });
 
     const connClass = computed(() => {
       if (authFailed.value) return 'authfail';
       return connected.value ? 'online' : 'offline';
     });
-
     const connLabel = computed(() => {
       if (authFailed.value) return 'auth failed';
       return connected.value ? 'online' : 'offline';
     });
 
-    // ── Dial keys ─────────────────────────────────────────────────
     const dialKeys = [
       {d:'1',l:''},{d:'2',l:'ABC'},{d:'3',l:'DEF'},
       {d:'4',l:'GHI'},{d:'5',l:'JKL'},{d:'6',l:'MNO'},
@@ -720,14 +976,27 @@ createApp({
       {d:'*',l:''},{d:'0',l:'+'},{d:'#',l:''},
     ];
 
-    // ── Theme ─────────────────────────────────────────────────────
-    function toggleTheme() {
-      theme.value = theme.value === 'dark' ? 'light' : 'dark';
-      document.body.setAttribute('data-theme', theme.value);
-      localStorage.setItem('ab-theme', theme.value);
+    // ── Token ─────────────────────────────────────────────────
+    function submitToken() {
+      const t = tokenInput.value.trim();
+      if (!t) { tokenErr.value = 'token required'; return; }
+      tokenErr.value = '';
+      token.value = t;
+      localStorage.setItem('ab-token', t);
+      showConnectForm.value = false;
+      connectWS();
+    }
+    function clearToken() {
+      if (ws) { try { ws.close(); } catch(_){} ws = null; }
+      token.value = ''; tokenInput.value = '';
+      localStorage.removeItem('ab-token');
+      connected.value = false;
+      devices.value = [];
+      selectedId.value = null;
+      showConnectForm.value = true;
     }
 
-    // ── Log ───────────────────────────────────────────────────────
+    // ── Log ───────────────────────────────────────────────────
     function addLog(msg, cls = '') {
       const ts = new Date().toLocaleTimeString();
       eventLog.value.push({ ts, msg, cls });
@@ -735,62 +1004,22 @@ createApp({
       nextTick(() => { if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight; });
     }
 
-    // ── Toasts ───────────────────────────────────────────────────
+    // ── Toasts ────────────────────────────────────────────────
     let toastSeq = 0;
     function showToast(kind, title, body) {
       const id = ++toastSeq;
       toasts.value.push({ id, kind, title, body });
-      setTimeout(() => removeToast(id), 7000);
+      setTimeout(() => removeToast(id), 6000);
     }
-    function removeToast(id) {
-      const i = toasts.value.findIndex(t => t.id === id);
-      if (i >= 0) toasts.value.splice(i, 1);
-    }
+    function removeToast(id) { toasts.value = toasts.value.filter(t => t.id !== id); }
 
-    // ── Contacts ─────────────────────────────────────────────────
-    function addContact() {
-      const name = newCName.value.trim(), number = newCNum.value.trim();
-      if (!name || !number) return;
-      contacts.value.push({ name, number });
-      localStorage.setItem('ab-contacts', JSON.stringify(contacts.value));
-      newCName.value = ''; newCNum.value = '';
-    }
-    function removeContact(i) {
-      contacts.value.splice(i, 1);
-      localStorage.setItem('ab-contacts', JSON.stringify(contacts.value));
-    }
-    function dialContact(c) {
-      phoneNum.value = c.number;
-      if (selectedId.value) dial();
-    }
-
-    // ── Dial pad ─────────────────────────────────────────────────
-    function pressKey(d) {
-      phoneNum.value += d;
-    }
-    function delChar() { phoneNum.value = phoneNum.value.slice(0, -1); }
-    function dialNumber(num) { phoneNum.value = num; if (selectedId.value) dial(); }
-
-    // ── Call history ──────────────────────────────────────────────
-    let _callNum = '', _callDir = '', _callStart = 0;
-    function recordCall(number, dir, dur) {
-      callHistory.value.unshift({ number, dir, ts: Date.now(), dur });
-      if (callHistory.value.length > 20) callHistory.value.pop();
-      localStorage.setItem('ab-callhist', JSON.stringify(callHistory.value));
-    }
-    function fmtDur(ms) {
-      if (!ms) return '';
-      const s = Math.round(ms / 1000);
-      return Math.floor(s / 60) + 'm' + (s % 60) + 's';
-    }
-
-    // ── Timer ────────────────────────────────────────────────────
+    // ── Timer ─────────────────────────────────────────────────
     let timerHandle = null;
     function startTimer(startMs) {
       stopTimer();
       const tick = () => {
         const s = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
-        timerDisplay.value = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+        timerDisplay.value = String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
       };
       tick(); timerHandle = setInterval(tick, 500);
     }
@@ -799,319 +1028,326 @@ createApp({
       timerDisplay.value = '00:00';
     }
 
-    // ── WS send ──────────────────────────────────────────────────
+    // ── WS send ───────────────────────────────────────────────
     let ws = null;
     function cmd(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
 
-    // ── Call control ─────────────────────────────────────────────
+    // ── Call control ──────────────────────────────────────────
     function dial() {
       const num = phoneNum.value.trim();
       if (!num || !selectedId.value) return;
-      cmd({ command: 'dial', device_id: selectedId.value, number: num });
+      cmd({ command:'dial', device_id:selectedId.value, number:num });
       addLog('dial → ' + num, 'ev');
     }
-    function hangup() {
-      if (!selectedId.value) return;
-      cmd({ command: 'hangup', device_id: selectedId.value });
-    }
-    function answer() {
-      if (!selectedId.value) return;
-      cmd({ command: 'answer', device_id: selectedId.value });
-    }
+    function hangup()  { if (!selectedId.value) return; cmd({ command:'hangup', device_id:selectedId.value }); }
+    function answer()  { if (!selectedId.value) return; cmd({ command:'answer', device_id:selectedId.value }); }
     function toggleMute() {
       if (!selectedId.value) return;
-      const muted = selectedDevice.value?.call?.muted;
-      cmd({ command: 'mute', device_id: selectedId.value, on: !muted });
+      cmd({ command:'mute', device_id:selectedId.value, on: !selectedDevice.value?.call?.muted });
     }
     function toggleSpeaker() {
       speakerOn.value = !speakerOn.value;
       if (!selectedId.value) return;
-      cmd({ command: 'audio_route', device_id: selectedId.value, route: speakerOn.value ? 'speaker' : 'earpiece' });
+      cmd({ command:'audio_route', device_id:selectedId.value, route: speakerOn.value ? 'speaker' : 'earpiece' });
     }
     function applyVolume() {
       if (!selectedId.value) return;
-      cmd({ command: 'volume', device_id: selectedId.value, level: callVolume.value });
+      cmd({ command:'volume', device_id:selectedId.value, level:callVolume.value });
     }
     function sendDtmf(digit) {
       if (!selectedId.value) return;
-      cmd({ command: 'dtmf', device_id: selectedId.value, digit });
+      cmd({ command:'dtmf', device_id:selectedId.value, digit });
       addLog('dtmf: ' + digit, 'ev');
     }
+    function pressKey(d) { phoneNum.value += d; }
+    function delChar()   { phoneNum.value = phoneNum.value.slice(0,-1); }
 
-    // ── SIM filter ───────────────────────────────────────────────
+    // ── SIM filter ────────────────────────────────────────────
     function applySimFilter() {
       if (!selectedId.value) return;
-      let allowed;
-      if (simFilter.value === 'all')  allowed = [0, 1];
-      else if (simFilter.value === '0') allowed = [0];
-      else if (simFilter.value === '1') allowed = [1];
-      else allowed = [];  // 'none' → reject all
-      cmd({ command: 'set_sim_filter', device_id: selectedId.value, allowed_sims: allowed });
-      addLog('sim filter → ' + (allowed.length ? 'SIM ' + allowed.map(x => x + 1).join('+') : 'reject all'), 'ev');
+      const allowed = simFilter.value === 'all' ? [0,1] : simFilter.value === 'none' ? [] : [parseInt(simFilter.value)];
+      cmd({ command:'set_sim_filter', device_id:selectedId.value, allowed_sims:allowed });
     }
 
-    // ── Signal bar helper ─────────────────────────────────────────
-    // signal_bars: 0..4 (bars filled). Each bar b (1..4) is colored if b <= level.
-    function sigBarColor(level, bar) {
-      const lvl = typeof level === 'number' ? level : 0;
-      if (bar > lvl) return 'var(--muted)';
-      if (lvl >= 3) return 'var(--good)';
-      if (lvl === 2) return 'var(--warn)';
-      return 'var(--danger)';
+    // ── Call history ──────────────────────────────────────────
+    function recordCall(number, dir, dur) {
+      callHistory.value.unshift({ number, dir, ts: Date.now(), dur, notes: callNote.value.trim() });
+      callNote.value = '';
+      if (callHistory.value.length > 50) callHistory.value.length = 50;
+      localStorage.setItem('ab-callhist', JSON.stringify(callHistory.value));
+    }
+    function clearHistory() {
+      callHistory.value = [];
+      localStorage.removeItem('ab-callhist');
+    }
+    function dialNumber(num) { phoneNum.value = num; activeTab.value = 'call'; if (selectedId.value) dial(); }
+    function dialContact(c)  { dialNumber(c.number); }
+
+    // ── Contacts ──────────────────────────────────────────────
+    function addContact() {
+      if (!newCName.value || !newCNum.value) return;
+      contacts.value.push({ name:newCName.value.trim(), number:newCNum.value.trim() });
+      newCName.value = ''; newCNum.value = '';
+      localStorage.setItem('ab-contacts', JSON.stringify(contacts.value));
+    }
+    function removeContact(i) {
+      contacts.value.splice(i,1);
+      localStorage.setItem('ab-contacts', JSON.stringify(contacts.value));
     }
 
-    // ── SMS ──────────────────────────────────────────────────────
+    // ── SMS ───────────────────────────────────────────────────
     function sendSms() {
       const to = smsTo.value.trim(), body = smsBody.value.trim();
       if (!to || !body || !selectedId.value) return;
-      cmd({ command: 'send_sms', device_id: selectedId.value, number: to, message: body });
+      cmd({ command:'send_sms', device_id:selectedId.value, number:to, message:body });
       smsBody.value = '';
-      addLog('sms → ' + to + ': ' + body.slice(0, 50), 'sm');
+      addLog('sms → ' + to + ': ' + body.slice(0,50), 'sm');
     }
-
     function addSmsToFeed(payload) {
-      // Server sends: {"from":"...","body":"...","sim_slot":N,"sim_carrier":"...","timestamp":N}
-      const from     = escHtml(payload.from || payload.sender || 'unknown');
-      const body     = escHtml(payload.body || payload.message || '');
-      const slot     = payload.sim_slot != null ? payload.sim_slot : null;
-      const carrier  = payload.sim_carrier || '';
-      const ts       = payload.timestamp ? payload.timestamp * (payload.timestamp < 1e11 ? 1000 : 1) : Date.now();
-      const simLabel = slot != null
-        ? 'SIM ' + (slot + 1) + (carrier ? ' · ' + escHtml(carrier) : '')
-        : (carrier ? escHtml(carrier) : 'SIM ?');
-      // Prepend (newest first), cap at 50
-      smsFeed.value.unshift({ from, simLabel, bodyHtml: body, ts });
+      const from    = escHtml(payload.from || payload.sender || 'unknown');
+      const body    = escHtml(payload.body || payload.message || '');
+      const slot    = payload.sim_slot != null ? payload.sim_slot : null;
+      const carrier = payload.sim_carrier || '';
+      const ts      = payload.timestamp ? payload.timestamp*(payload.timestamp<1e11?1000:1) : Date.now();
+      const simLabel= slot!=null ? 'SIM'+(slot+1)+(carrier?' · '+escHtml(carrier):'') : (carrier?escHtml(carrier):'SIM?');
+      smsFeed.value.unshift({ from, simLabel, bodyHtml:body, ts });
       if (smsFeed.value.length > 50) smsFeed.value.length = 50;
       if (!smsTo.value) smsTo.value = payload.from || payload.sender || '';
     }
-
     function clearSms() { smsFeed.value = []; }
 
-    // ── Event dispatch ────────────────────────────────────────────
+    // ── Config ────────────────────────────────────────────────
+    function saveConfig() {
+      if (!selectedId.value) return;
+      cmd({ command:'save_config', device_id:selectedId.value, config:{ ...cfgEdit.value } });
+      showToast('ev', 'config saved', 'restart device to apply');
+    }
+
+    // ── Events ────────────────────────────────────────────────
     function handleEvent(kind, deviceId, payload) {
       switch (kind) {
         case 'call': {
-          const s = payload.state || 'IDLE', n = payload.number || '', d = payload.direction || '';
-          addLog('call · ' + s + (d ? ' (' + d + ')' : '') + (n ? ' · ' + n : ''), 'ev');
-          if (s === 'ACTIVE') {
-            _callNum = n; _callDir = d; _callStart = payload.started_at || Date.now();
+          const s = payload.state||'IDLE', n = payload.number||'', d = payload.direction||'';
+          addLog('call · '+s+(d?' ('+d+')':'')+(n?' · '+n:''), 'ev');
+          if (s==='ACTIVE') {
+            _callNum=n; _callDir=d; _callStart=payload.started_at||Date.now();
             startTimer(_callStart);
-          } else if (s === 'IDLE') {
-            if (_callNum) recordCall(_callNum, _callDir, _callStart > 0 ? Date.now() - _callStart : 0);
-            _callNum = ''; _callDir = ''; _callStart = 0;
-            stopTimer(); stopAudio(); speakerOn.value = false;
-          } else if (s === 'RINGING' && d === 'incoming') {
-            if (deviceId !== selectedId.value) {
-              // Not the selected device — show toast
-              showToast('ev', 'incoming call', (n || 'unknown') + ' · ' + (deviceId || ''));
+            if (deviceId===selectedId.value) activeTab.value='call';
+          } else if (s==='IDLE') {
+            if (_callNum) recordCall(_callNum, _callDir, _callStart>0?Date.now()-_callStart:0);
+            _callNum=''; _callDir=''; _callStart=0;
+            stopTimer(); stopAudio(); speakerOn.value=false;
+          } else if (s==='RINGING' && d==='incoming') {
+            if (deviceId===selectedId.value) {
+              activeTab.value='call';
+            } else {
+              showToast('ev', 'incoming call', (n||'unknown')+' · '+(deviceId||''));
             }
-            // Selected device gets the full-screen modal (driven by callPanel computed)
-            if (Notification.permission === 'granted') {
-              new Notification('Incoming call', { body: (n || 'unknown') + ' · ' + (deviceId || ''), tag: 'ab-ring' });
+            if (Notification.permission==='granted') {
+              new Notification('Incoming call', { body:(n||'unknown')+' · '+(deviceId||''), tag:'ab-ring' });
             }
           }
           break;
         }
         case 'sms': {
-          // Server always broadcasts with kind="sms"; payload has 'from', 'body', 'sim_slot', 'sim_carrier', 'timestamp'
-          const from = payload.from || payload.sender || 'unknown';
-          const body = payload.body || payload.message || '';
+          const from = payload.from||payload.sender||'unknown';
+          const body = payload.body||payload.message||'';
           addSmsToFeed(payload);
-          addLog('sms · ' + from + ': ' + body.slice(0, 60), 'sm');
-          showToast('sm', 'SMS from ' + from, body.length > 80 ? body.slice(0, 80) + '…' : body);
-          if (Notification.permission === 'granted') new Notification('SMS from ' + from, { body: body.slice(0, 100) });
+          addLog('sms · '+from+': '+body.slice(0,60), 'sm');
+          if (deviceId===selectedId.value) {
+            showToast('sm', 'SMS from '+from, body.length>80?body.slice(0,80)+'…':body);
+          }
+          if (Notification.permission==='granted') new Notification('SMS from '+from, { body:body.slice(0,100) });
           break;
         }
         case 'device_info': {
-          // Merge into the device's device_info field (state_update will overwrite on next broadcast)
-          const dev = devices.value.find(d => d.id === deviceId);
-          if (dev) dev.device_info = payload;
-          addLog('device_info · ' + deviceId + ': model=' + (payload.model || '?'), '');
+          const dev = devices.value.find(d=>d.id===deviceId);
+          if (dev) dev.device_info=payload;
+          addLog('device_info · '+deviceId+': model='+(payload.model||'?'),'');
           break;
         }
         case 'device_status': {
-          const dev = devices.value.find(d => d.id === deviceId);
-          if (dev) dev.device_status = payload;
-          const batt = payload.battery_pct != null ? payload.battery_pct + '%' : '';
-          addLog('device_status · ' + deviceId + (batt ? ' · batt ' + batt : ''), '');
+          const dev = devices.value.find(d=>d.id===deviceId);
+          if (dev) dev.device_status=payload;
+          const batt = payload.battery_pct!=null?payload.battery_pct+'%':'';
+          addLog('device_status · '+deviceId+(batt?' · batt '+batt:''),'');
           break;
         }
         case 'sms_sent': {
-          const ok = payload.result_code === -1 || payload.result === 'sent';
-          addLog('sms ' + (ok ? 'sent ok' : 'send failed (code ' + payload.result_code + ')'), 'sm');
-          if (!ok) showToast('er', 'SMS failed', 'code: ' + payload.result_code);
+          const ok = payload.result_code===-1||payload.result==='sent';
+          addLog('sms '+(ok?'sent ok':'send failed (code '+payload.result_code+')'),'sm');
+          if (!ok) showToast('er','SMS failed','code: '+payload.result_code);
           break;
         }
-        case 'sms_delivered': addLog('sms delivered', 'sm'); break;
+        case 'sms_delivered': addLog('sms delivered','sm'); break;
         case 'error': {
-          const msg = (payload.op || 'op') + ' failed · ' + (payload.code || '?') + ': ' + (payload.message || '');
-          addLog(msg, 'er');
-          showToast('er', (payload.op || 'error') + ' failed', payload.message || payload.code || '');
+          const msg=(payload.op||'op')+' failed · '+(payload.code||'?')+': '+(payload.message||'');
+          addLog(msg,'er');
+          showToast('er',(payload.op||'error')+' failed',payload.message||payload.code||'');
           break;
         }
-        default: addLog('event · ' + kind + ': ' + JSON.stringify(payload).slice(0, 100), '');
+        default: addLog('event · '+kind+': '+JSON.stringify(payload).slice(0,100),'');
       }
     }
 
-    // ── WebSocket ────────────────────────────────────────────────
+    // ── WebSocket ─────────────────────────────────────────────
     let reconnectTimer = null;
     function connectWS() {
       if (!token.value) return;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      authFailed.value = false;
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(proto + '://' + location.host + '/ws/ui?token=' + encodeURIComponent(token.value));
-      ws.onopen = () => {
-        connected.value = true;
-        authFailed.value = false;
-        addLog('control channel connected', 'ev');
-      };
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer=null; }
+      authFailed.value=false;
+      const proto = location.protocol==='https:'?'wss':'ws';
+      ws = new WebSocket(proto+'://'+location.host+'/ws/ui?token='+encodeURIComponent(token.value));
+      ws.onopen = () => { connected.value=true; authFailed.value=false; addLog('connected','ev'); };
       ws.onclose = ev => {
-        connected.value = false;
-        if (ev.code === 4401) {
-          authFailed.value = true;
-          addLog('auth failed (4401) · check token', 'er');
-          showToast('er', 'auth failed', 'invalid or missing token');
-          return;  // do not auto-reconnect on auth failure
+        connected.value=false;
+        if (ev.code===4401) {
+          authFailed.value=true;
+          addLog('auth failed (4401)','er');
+          showToast('er','auth failed','invalid or missing token');
+          return;
         }
-        addLog('connection lost · retrying…', 'er');
-        reconnectTimer = setTimeout(connectWS, 3000);
+        addLog('connection lost · retrying…','er');
+        reconnectTimer=setTimeout(connectWS,3000);
       };
-      ws.onerror = () => {};  // onclose fires after onerror; log there
-      ws.onmessage = ev => {
-        let d; try { d = JSON.parse(ev.data); } catch(_) { return; }
-        if (d.type === 'state_update') {
-          devices.value = d.devices || [];
-          if (!selectedId.value && devices.value.length) selectedId.value = devices.value[0].id;
-          if (selectedId.value && !devices.value.find(x => x.id === selectedId.value))
-            selectedId.value = devices.value[0]?.id || null;
-          // Sync timer with ACTIVE call started_at
-          const sel = devices.value.find(x => x.id === selectedId.value);
-          if (sel?.call?.state === 'ACTIVE' && !timerHandle)
-            startTimer(sel.call.started_at || Date.now());
-        } else if (d.type === 'event') {
-          handleEvent(d.kind, d.device_id, d.data || {});
+      ws.onerror=()=>{};
+      ws.onmessage=ev=>{
+        let d; try { d=JSON.parse(ev.data); } catch(_){return;}
+        if (d.type==='state_update') {
+          devices.value=d.devices||[];
+          if (!selectedId.value && devices.value.length) selectedId.value=devices.value[0].id;
+          if (selectedId.value && !devices.value.find(x=>x.id===selectedId.value))
+            selectedId.value=devices.value[0]?.id||null;
+          const sel=devices.value.find(x=>x.id===selectedId.value);
+          if (sel?.call?.state==='ACTIVE' && !timerHandle) startTimer(sel.call.started_at||Date.now());
+        } else if (d.type==='event') {
+          handleEvent(d.kind, d.device_id, d.data||{});
         }
       };
     }
 
-    // ── Audio ────────────────────────────────────────────────────
-    let audioWs = null, audioCtx = null, playNode = null, micStream = null, micNode = null, playHead = 0;
+    // ── Audio ─────────────────────────────────────────────────
+    let audioWs=null, audioCtx=null, playNode=null, micStream=null, micNode=null, playHead=0;
 
     function peakMeter(which, pcm16) {
-      let p = 0;
-      for (let i = 0; i < pcm16.length; i++) { const v = Math.abs(pcm16[i]); if (v > p) p = v; }
-      const pct = Math.min(100, (p / 32768) * 200);
-      if (which === 'rx') meterRx.value = pct; else meterTx.value = pct;
+      let p=0;
+      for (let i=0;i<pcm16.length;i++){const v=Math.abs(pcm16[i]);if(v>p)p=v;}
+      const pct=Math.min(100,(p/32768)*200);
+      if (which==='rx') meterRx.value=pct; else meterTx.value=pct;
     }
-
     async function ensureAudioCtx(rate) {
-      if (audioCtx && audioCtx.sampleRate === rate) return;
+      if (audioCtx && audioCtx.sampleRate===rate) return;
       if (audioCtx) await audioCtx.close();
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: rate });
-      playNode = audioCtx.createGain(); playNode.connect(audioCtx.destination);
+      audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:rate});
+      playNode=audioCtx.createGain(); playNode.connect(audioCtx.destination);
     }
-
     async function loadWorklet() {
       if (!audioCtx.audioWorklet) throw new Error('AudioWorklet not available — use HTTPS or localhost for mic');
-      const src = `class P extends AudioWorkletProcessor{process(i){const c=i[0][0];if(!c)return true;const o=new Int16Array(c.length);for(let j=0;j<c.length;j++){let s=Math.max(-1,Math.min(1,c[j]));o[j]=s<0?s*0x8000:s*0x7fff;}this.port.postMessage(o.buffer,[o.buffer]);return true;}}registerProcessor('mp',P);`;
-      await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+      const src=`class P extends AudioWorkletProcessor{process(i){const c=i[0][0];if(!c)return true;const o=new Int16Array(c.length);for(let j=0;j<c.length;j++){let s=Math.max(-1,Math.min(1,c[j]));o[j]=s<0?s*0x8000:s*0x7fff;}this.port.postMessage(o.buffer,[o.buffer]);return true;}}registerProcessor('mp',P);`;
+      await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([src],{type:'application/javascript'})));
     }
-
     function schedPCM(pcm16, rate) {
       if (!audioCtx) return;
-      const buf = audioCtx.createBuffer(1, pcm16.length, rate);
-      const d = buf.getChannelData(0);
-      for (let i = 0; i < pcm16.length; i++) d[i] = pcm16[i] / 32768;
-      const s = audioCtx.createBufferSource();
-      s.buffer = buf; s.connect(playNode);
-      const now = audioCtx.currentTime;
-      if (playHead < now + 0.05) playHead = now + 0.05;
-      s.start(playHead); playHead += buf.duration;
+      const buf=audioCtx.createBuffer(1,pcm16.length,rate);
+      const data=buf.getChannelData(0);
+      for (let i=0;i<pcm16.length;i++) data[i]=pcm16[i]/32768;
+      const s=audioCtx.createBufferSource();
+      s.buffer=buf; s.connect(playNode);
+      const now=audioCtx.currentTime;
+      if (playHead<now+0.05) playHead=now+0.05;
+      s.start(playHead); playHead+=buf.duration;
     }
-
     async function startAudio(withMic) {
       if (!selectedId.value) return;
-      const rate = 48000;
+      const rate=48000;
       try {
         await ensureAudioCtx(rate);
-        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        if (audioCtx.state==='suspended') await audioCtx.resume();
         if (withMic) await loadWorklet();
       } catch(err) {
-        addLog('audio init failed: ' + (err.message || String(err)), 'er');
-        if (withMic && !window.isSecureContext) addLog('mic requires HTTPS or localhost — listen-only will still work', 'er');
-        if (withMic) { stopAudio(); return; }
+        addLog('audio init failed: '+(err.message||String(err)),'er');
+        if (withMic && !window.isSecureContext) addLog('mic requires HTTPS or localhost','er');
+        if (withMic){stopAudio();return;}
       }
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const dir = withMic ? 'both' : 'listen';
+      const proto=location.protocol==='https:'?'wss':'ws';
+      const dir=withMic?'both':'listen';
       try {
-        audioWs = new WebSocket(proto + '://' + location.host + '/ws/audio/' + selectedId.value + '?rate=' + rate + '&dir=' + dir + '&token=' + encodeURIComponent(token.value));
-      } catch(err) {
-        addLog('audio ws failed: ' + (err.message || String(err)), 'er');
-        stopAudio(); return;
-      }
-      audioWs.binaryType = 'arraybuffer';
-      audioWs.onopen  = () => { audioActive.value = true; addLog('audio open @ ' + rate + 'Hz · ' + dir, 'au'); };
-      audioWs.onclose = () => { addLog('audio closed', 'au'); stopAudio(); };
-      audioWs.onerror = () => addLog('audio ws error', 'er');
-      audioWs.onmessage = ev => { const p = new Int16Array(ev.data); peakMeter('rx', p); schedPCM(p, rate); };
+        audioWs=new WebSocket(proto+'://'+location.host+'/ws/audio/'+selectedId.value+'?rate='+rate+'&dir='+dir+'&token='+encodeURIComponent(token.value));
+      } catch(err) { addLog('audio ws failed: '+(err.message||String(err)),'er'); stopAudio(); return; }
+      audioWs.binaryType='arraybuffer';
+      audioWs.onopen =()=>{ audioActive.value=true; addLog('audio open @ '+rate+'Hz · '+dir,'au'); };
+      audioWs.onclose=()=>{ addLog('audio closed','au'); stopAudio(); };
+      audioWs.onerror=()=>addLog('audio ws error','er');
+      audioWs.onmessage=ev=>{ const p=new Int16Array(ev.data); peakMeter('rx',p); schedPCM(p,rate); };
       if (withMic) {
         try {
-          micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: rate, channelCount: 1 } });
-          const msrc = audioCtx.createMediaStreamSource(micStream);
-          micNode = new AudioWorkletNode(audioCtx, 'mp');
-          micNode.port.onmessage = ev => {
-            const p = new Int16Array(ev.data);
-            peakMeter('tx', p);
-            if (audioWs && audioWs.readyState === 1) audioWs.send(ev.data);
-          };
+          micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,sampleRate:rate,channelCount:1}});
+          const msrc=audioCtx.createMediaStreamSource(micStream);
+          micNode=new AudioWorkletNode(audioCtx,'mp');
+          micNode.port.onmessage=ev=>{ const p=new Int16Array(ev.data); peakMeter('tx',p); if(audioWs&&audioWs.readyState===1)audioWs.send(ev.data); };
           msrc.connect(micNode);
-        } catch(err) {
-          addLog('mic failed: ' + (err.message || String(err)), 'er');
-        }
+        } catch(err) { addLog('mic failed: '+(err.message||String(err)),'er'); }
       }
     }
-
     function stopAudio() {
-      if (audioWs)   { try { audioWs.close(); } catch(_) {} audioWs = null; }
-      if (micNode)   { try { micNode.disconnect(); } catch(_) {} micNode = null; }
-      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-      playHead = 0; audioActive.value = false; meterRx.value = 0; meterTx.value = 0;
+      if (audioWs)  {try{audioWs.close();}catch(_){}audioWs=null;}
+      if (micNode)  {try{micNode.disconnect();}catch(_){}micNode=null;}
+      if (micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
+      playHead=0; audioActive.value=false; meterRx.value=0; meterTx.value=0;
     }
 
-    // ── Keyboard shortcuts ────────────────────────────────────────
+    // ── Keyboard shortcuts ────────────────────────────────────
     function onKey(e) {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-      const p = callPanel.value;
-      if (p === 'idle') {
-        if ('0123456789*#'.includes(e.key)) { e.preventDefault(); pressKey(e.key); }
-        if (e.key === 'Backspace') { e.preventDefault(); delChar(); }
-        if (e.key === 'Enter') { e.preventDefault(); dial(); }
-        if (e.key === 'Escape') { e.preventDefault(); phoneNum.value = ''; }
-      } else if (p === 'active') {
-        if ('0123456789*#'.includes(e.key)) { e.preventDefault(); sendDtmf(e.key); }
-        if (e.key === 'm') toggleMute();
-        if (e.key === 'Escape') hangup();
-      } else if (p === 'ringing-in') {
-        if (e.key === 'Enter') answer();
-        if (e.key === 'Escape') hangup();
-      } else if (p === 'dialing' || p === 'ringing-out') {
-        if (e.key === 'Escape') hangup();
+      if (e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
+      const p=callPanel.value;
+      if (p==='idle'&&activeTab.value==='call') {
+        if ('0123456789*#'.includes(e.key)){e.preventDefault();pressKey(e.key);}
+        if (e.key==='Backspace'){e.preventDefault();delChar();}
+        if (e.key==='Enter'){e.preventDefault();dial();}
+        if (e.key==='Escape'){e.preventDefault();phoneNum.value='';}
+      } else if (p==='active') {
+        if ('0123456789*#'.includes(e.key)){e.preventDefault();sendDtmf(e.key);}
+        if (e.key==='m') toggleMute();
+        if (e.key==='Escape') hangup();
+      } else if (p==='ringing-in') {
+        if (e.key==='Enter') answer();
+        if (e.key==='Escape') hangup();
+      } else if (p==='dialing'||p==='ringing-out') {
+        if (e.key==='Escape') hangup();
       }
     }
 
-    // ── Utils ────────────────────────────────────────────────────
+    // ── Utils ─────────────────────────────────────────────────
     function fmtClock(ts) {
       if (!ts) return '';
-      try { return new Date(ts).toLocaleTimeString(); } catch(_) { return ''; }
+      try { return new Date(ts).toLocaleTimeString(); } catch(_){ return ''; }
+    }
+    function fmtDur(ms) {
+      if (!ms) return '';
+      const s=Math.floor(ms/1000);
+      return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+    }
+    function fmtRelTime(ts) {
+      if (!ts) return '';
+      const d=Date.now()-ts, m=Math.floor(d/60000), h=Math.floor(m/60), day=Math.floor(h/24);
+      if (day>0) return day+'d ago';
+      if (h>0)   return h+'h ago';
+      if (m>0)   return m+'m ago';
+      return 'just now';
+    }
+    function sigBarColor(level, bar) {
+      const lvl=typeof level==='number'?level:0;
+      if (bar>lvl) return 'var(--muted)';
+      if (lvl>=3) return 'var(--good)';
+      if (lvl===2) return 'var(--warn)';
+      return 'var(--danger)';
     }
 
-    // ── Mount ────────────────────────────────────────────────────
+    // ── Mount ─────────────────────────────────────────────────
     onMounted(() => {
-      document.body.setAttribute('data-theme', theme.value);
       if (token.value) connectWS();
       document.addEventListener('keydown', onKey);
-      if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+      if ('Notification' in window && Notification.permission==='default') Notification.requestPermission();
     });
     onUnmounted(() => {
       document.removeEventListener('keydown', onKey);
@@ -1121,17 +1357,17 @@ createApp({
     });
 
     return {
-      token, tokenInput, tokenErr,
-      theme, connected, authFailed, connClass, connLabel,
-      devices, selectedId, selectedDevice, callPanel, callLbl, headerSub,
+      token, tokenInput, tokenErr, connected, authFailed, connClass, connLabel,
+      devices, selectedId, selectedDevice, callPanel, activeTab, tabs, showConnectForm,
       dialKeys, phoneNum, smsTo, smsBody, eventLog, logEl, toasts, timerDisplay,
       speakerOn, callVolume, meterRx, meterTx, audioActive,
       contacts, newCName, newCNum, smsFeed, callHistory, simFilter,
-      submitToken, clearToken,
-      toggleTheme, addContact, removeContact, dialContact, dialNumber,
+      callNote, expandedHist, showDtmf, openSection, cfgEdit,
+      submitToken, clearToken, addContact, removeContact, dialContact, dialNumber,
       pressKey, delChar, dial, hangup, answer, toggleMute, toggleSpeaker,
-      applyVolume, sendDtmf, sendSms, clearSms, applySimFilter, sigBarColor,
-      startAudio, stopAudio, removeToast, fmtClock, fmtDur,
+      applyVolume, sendDtmf, sendSms, clearSms, applySimFilter, saveConfig,
+      startAudio, stopAudio, removeToast, fmtClock, fmtDur, fmtRelTime, sigBarColor,
+      clearHistory,
     };
   }
 }).mount('#app');

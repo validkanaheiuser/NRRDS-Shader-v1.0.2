@@ -371,6 +371,7 @@ struct DaemonConfig {
     char server_cert_sha256[65] = {};
     int  pcm_card               = 0;
     int  pcm_tx_device          = 27;
+    int  pcm_tx_rate            = 8000;
     int  pcm_rx_device          = 0;
     int  pcm_rx_rate            = 16000;
 };
@@ -436,6 +437,7 @@ static void load_config_json(const char* path) {
                        sizeof(g_cfg.server_cert_sha256));
     g_cfg.pcm_card      = json_get_int_field(buf, "pcm_card", 0);
     g_cfg.pcm_tx_device = json_get_int_field(buf, "pcm_tx_injection_device", 27);
+    g_cfg.pcm_tx_rate   = json_get_int_field(buf, "pcm_tx_rate", 8000);
     g_cfg.pcm_rx_device = json_get_int_field(buf, "pcm_rx_capture_device", 0);
     g_cfg.pcm_rx_rate   = json_get_int_field(buf, "pcm_rx_capture_rate", 16000);
 
@@ -534,6 +536,22 @@ static struct pcm* open_pcm_with_retry(int card, int dev, int flags,
     return nullptr;
 }
 
+// Linear interpolation downsampler: SAMPLE_RATE (48000) → out_rate
+static std::vector<int16_t> downsample_from_48k(const int16_t* src, int n_src_48, int out_rate) {
+    if (out_rate == SAMPLE_RATE) return std::vector<int16_t>(src, src + n_src_48);
+    int n_out = out_rate * FRAME_MS / 1000;
+    std::vector<int16_t> out(n_out);
+    for (int i = 0; i < n_out; i++) {
+        float pos  = (float)i * SAMPLE_RATE / out_rate;
+        int   idx  = (int)pos;
+        float frac = pos - idx;
+        int16_t a  = (idx     < n_src_48) ? src[idx]     : 0;
+        int16_t b  = (idx + 1 < n_src_48) ? src[idx + 1] : a;
+        out[i]     = (int16_t)(a + (b - a) * frac);
+    }
+    return out;
+}
+
 // Linear interpolation upsampler: in_rate → SAMPLE_RATE (48000)
 static std::vector<int16_t> resample_to_48k(const int16_t* src, int n_src, int in_rate) {
     if (in_rate == SAMPLE_RATE) return std::vector<int16_t>(src, src + n_src);
@@ -610,8 +628,8 @@ static bool attempt_reopen_tx_pcm() {
 
         struct pcm_config cfg = {};
         cfg.channels    = 1;
-        cfg.rate        = SAMPLE_RATE;
-        cfg.period_size = FRAME_SAMPLES;
+        cfg.rate        = (unsigned)g_cfg.pcm_tx_rate;
+        cfg.period_size = (unsigned)(g_cfg.pcm_tx_rate * FRAME_MS / 1000);
         cfg.period_count = 4;
         cfg.format      = PCM_FORMAT_S16_LE;
 
@@ -679,10 +697,20 @@ static void voice_tx_thread() {
             memset(pcm_buf.data(), 0, FRAME_SAMPLES * 2);
         }
 
+        // Downsample from 48kHz to the TX PCM device's native rate
+        const int16_t* write_src = pcm_buf.data();
+        int write_n = FRAME_SAMPLES;
+        std::vector<int16_t> tx_resampled;
+        if (g_cfg.pcm_tx_rate != SAMPLE_RATE) {
+            tx_resampled = downsample_from_48k(pcm_buf.data(), FRAME_SAMPLES, g_cfg.pcm_tx_rate);
+            write_src = tx_resampled.data();
+            write_n   = (int)tx_resampled.size();
+        }
+
         {
             std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
             if (!g_voice.tx_pcm) continue;
-            int r = pcm_write(g_voice.tx_pcm, pcm_buf.data(), FRAME_SAMPLES * 2);
+            int r = pcm_write(g_voice.tx_pcm, write_src, write_n * 2);
             if (r != 0) {
                 const char* errmsg = pcm_get_error(g_voice.tx_pcm);
                 if (errmsg && strstr(errmsg, "Broken pipe")) {
@@ -794,8 +822,8 @@ static void voice_call_start(int sim_slot) {
 
     struct pcm_config tx_cfg = {};
     tx_cfg.channels    = 1;
-    tx_cfg.rate        = SAMPLE_RATE;
-    tx_cfg.period_size = FRAME_SAMPLES;
+    tx_cfg.rate        = (unsigned)g_cfg.pcm_tx_rate;
+    tx_cfg.period_size = (unsigned)(g_cfg.pcm_tx_rate * FRAME_MS / 1000);
     tx_cfg.period_count = 4;
     tx_cfg.format      = PCM_FORMAT_S16_LE;
 
