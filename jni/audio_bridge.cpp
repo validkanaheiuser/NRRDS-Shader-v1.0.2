@@ -712,12 +712,13 @@ static void voice_rx_thread(mbedtls_net_context* net) {
     std::vector<uint8_t> opus_buf(MAX_PKT);
 
     while (g_voice.active.load()) {
-        int r;
+        struct pcm* snap;
         {
             std::lock_guard<std::mutex> lk(g_voice.pcm_mtx);
-            if (!g_voice.rx_pcm) break;
-            r = pcm_read(g_voice.rx_pcm, pcm_buf.data(), FRAME_SAMPLES * 2);
+            snap = g_voice.rx_pcm;
+            if (!snap) break;
         }
+        int r = pcm_read(snap, pcm_buf.data(), FRAME_SAMPLES * 2);
         if (r != 0) {
             LOGW("voice_rx: pcm_read error");
             usleep(20000);
@@ -1206,38 +1207,34 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
             if(cmd == "dial") {
                 std::string number = root.getString("number");
                 if(!number.empty()) {
-                    jni_place_call(number);
+                    send_to_java_raw(json_str.c_str());
                 }
             } else if(cmd == "hangup" || cmd == "end_call") {
-                jni_end_call();
+                send_to_java_raw("{\"command\":\"hangup\"}");
             } else if(cmd == "answer") {
-                jni_answer_call();
+                send_to_java_raw("{\"command\":\"answer\"}");
             } else if(cmd == "mute") {
-                SimpleJson m;
-                m.type = SimpleJson::OBJECT;
-                m.object_value["command"] = SimpleJson("mute");
-                m.object_value["on"] = SimpleJson(root.getBool("on"));
-                send_to_java(m);
+                send_to_java_raw(json_str.c_str());
             } else if(cmd == "send_sms") {
                 std::string number = root.getString("number");
                 std::string message = root.getString("message");
                 if(!number.empty() && !message.empty()) {
-                    std::string msg_id = jni_send_sms(number, message);
-                    LOGI("SMS queued: %s", msg_id.c_str());
+                    send_to_java_raw(json_str.c_str());
+                    LOGI("SMS queued to APK");
                 }
             } else if(cmd == "dtmf") {
                 std::string digit = root.getString("digit");
                 if(!digit.empty()) {
-                    jni_send_dtmf(digit);
+                    send_to_java_raw(json_str.c_str());
                     LOGI("DTMF: %s", digit.c_str());
                 }
             } else if(cmd == "audio_route") {
                 std::string route = root.getString("route", "earpiece");
-                jni_set_audio_route(route);
+                send_to_java_raw(json_str.c_str());
                 LOGI("Audio route: %s", route.c_str());
             } else if(cmd == "volume") {
                 int level = (int)root.getNumber("level", 7.0);
-                jni_set_volume(level);
+                send_to_java_raw(json_str.c_str());
                 LOGI("Volume: %d", level);
             } else if(cmd == "set_sim_filter") {
                 send_to_java_raw(json_str.c_str());
