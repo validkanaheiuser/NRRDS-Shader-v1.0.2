@@ -51,6 +51,8 @@ if [ ! -f "$CONFIG" ] && [ -f "$MODDIR/files/config.json.example" ]; then
 fi
 
 (
+    # libc++_shared.so is in /vendor/lib64 on most QCOM devices; not in linker path for root daemons
+    export LD_LIBRARY_PATH="/vendor/lib64:/system/lib64:$LD_LIBRARY_PATH"
     while true; do
         "$DAEMON" --config "$CONFIG" >> "$LOG" 2>&1
         echo "$(date) Daemon exited ($?), restarting in 5s" >> "$LOG"
