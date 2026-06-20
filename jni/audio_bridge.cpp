@@ -65,7 +65,6 @@ static const int   JITTER_FRAMES = 6;
 
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_connected{false};
-static std::atomic<bool> g_audio_active{false};
 static std::atomic<int>  g_call_state{CALL_IDLE};
 
 static std::mutex              g_status_mutex;
@@ -1457,7 +1456,10 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
-    
+
+    // Seed random number generator for nonce entropy
+    srand((unsigned)time(nullptr) ^ (unsigned)getpid());
+
     // Initialize
     log_init();
     write_pid_file();
