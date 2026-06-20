@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║           Audio Bridge - Full Build Script v3.0              ║${NC}"
+echo -e "${GREEN}║           Audio Bridge - Full Build Script v4.0              ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
 # Configuration
@@ -23,7 +23,7 @@ API_LEVEL=28
 # Check NDK
 if [ ! -d "$ANDROID_NDK_HOME" ]; then
     echo -e "${RED}Error: Android NDK not found at $ANDROID_NDK_HOME${NC}"
-    echo "Set ANDROID_NDK_HOME environment variable or install NDK r25+"
+    echo "Set ANDROID_NDK_HOME environment variable or install NDK r27c (27.2.12479018)"
     exit 1
 fi
 
