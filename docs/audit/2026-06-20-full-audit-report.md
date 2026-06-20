@@ -1307,3 +1307,368 @@ The KernelSU Module Guide defines the following requirements. Each deviation is 
 ---
 
 *End of Phase 3 — KernelSU Analysis*
+
+---
+
+## Phase 4 — Zygisk Analysis
+
+**Files read:**
+- `zygisk/src/zygisk_module.cpp` (595 lines, read in three chunks: lines 0–199, 200–399, 400–595)
+- `config/audio_policy.conf` (30 lines)
+- `java/com/audiobridge/AudioCapture.java` (103 lines)
+
+---
+
+### 1. Module Class Hierarchy
+
+**File:** `zygisk/src/zygisk_module.cpp`
+
+| Element | Value | Line |
+|---------|-------|------|
+| Class name | `AudioBridgeModule` | 536 |
+| Base class | `zygisk::ModuleBase` | 536 |
+| `onLoad()` | Implemented | 538 |
+| `preAppSpecialize()` | Implemented | 543 |
+| `postAppSpecialize()` | Implemented | 564 |
+| `preServerSpecialize()` | **NOT implemented** | — |
+| `postServerSpecialize()` | **NOT implemented** | — |
+
+**Class definition (lines 536–592):**
+```cpp
+class AudioBridgeModule : public zygisk::ModuleBase {
+public:
+    void onLoad(zygisk::Api* api, JNIEnv* env) override { ... }        // line 538
+    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override { ... }   // line 543
+    void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override { ... } // line 564
+private:
+    zygisk::Api* api      = nullptr;  // line 588
+    JNIEnv*      env      = nullptr;  // line 589
+    bool         skip     = false;    // line 590
+    bool         sh_loaded = false;   // line 591
+};
+```
+
+The module uses **no server-side callbacks** (`preServerSpecialize` / `postServerSpecialize` are absent). It does not hook the `system_server` process.
+
+---
+
+### 2. REGISTER_ZYGISK_MODULE
+
+**Location:** `zygisk/src/zygisk_module.cpp`, line 594 (last line of file).
+
+```cpp
+REGISTER_ZYGISK_MODULE(AudioBridgeModule)
+```
+
+Registers the `AudioBridgeModule` class as the single Zygisk module entry point. This macro (defined in `zygisk.hpp`) installs the module into the Zygisk loader's module table so that `onLoad`, `preAppSpecialize`, and `postAppSpecialize` are called at the appropriate Zygote lifecycle points.
+
+---
+
+### 3. Process Filter Analysis
+
+**Function:** `app_should_hook()`, lines 349–365; called inside `preAppSpecialize()`, line 548.
+
+#### Allow-list (lines 351–360)
+
+The `kAllow[]` array is a null-terminated list of exact process names (`nice_name`):
+
+| Index | Package name | Purpose |
+|-------|-------------|---------|
+| 0 | `com.audiobridge` | The Audio Bridge APK itself |
+| 1 | `com.android.phone` | AOSP/OEM telephony app |
+| 2 | `com.android.dialer` | AOSP dialer |
+| 3 | `com.google.android.dialer` | Google dialer (Pixel / GMS) |
+| 4 | `com.android.systemui` | System UI process |
+| 5 | `org.codeaurora.ims` | Qualcomm IMS — VoLTE audio path |
+| 6 | `com.qti.phone` | Qualcomm telephony service |
+
+Matching logic (lines 361–364): simple linear scan with `strcmp` (exact match, no prefix/wildcard). Returns `true` on the first match, `false` if no entry matches.
+
+#### `preAppSpecialize()` logic (lines 543–562)
+
+```
+1. Read nice_name from args->nice_name via GetStringUTFChars (lines 545–547)
+2. Call app_should_hook(nice_name)                                  (line 548)
+3. Release JNI string                                               (line 549)
+4. If !want_hook:
+       api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY)              (line 552)
+       skip = true                                                  (line 553)
+       return                                                       (line 554)
+5. If want_hook:
+       sh_loaded = load_shadowhook()                               (line 561)
+```
+
+**Conditions checked:**
+- `nice_name` exact match against allow-list: YES (line 348–365)
+- uid check: **NO** — no `args->uid` inspection anywhere
+- `is_child_zygote` check: **NO** — no check for the secondary Zygote (webview/app-zygote child)
+- Other args fields: none inspected
+
+**Non-target processes:** `api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY)` is called at line 552. This instructs ZygiskNext to unload the module `.so` from the process immediately after `preAppSpecialize` returns, minimizing the module's footprint in unrelated processes.
+
+**Important timing note (comment at lines 557–560):** `load_shadowhook()` is intentionally called in `preAppSpecialize` (not `postAppSpecialize`) because `preAppSpecialize` still runs with the Zygote's SELinux context, which can read `/data/adb/`. After specialization the process drops to `phone`/`priv_app` domain and cannot read the shadowhook `.so` from `/data/adb/modules/audio_bridge/zygisk/`.
+
+---
+
+### 4. Hook Framework Identification
+
+**Framework:** ByteDance **shadowhook** (`android-inline-hook`), version `1.0.10` (version sourced from Phase 1: `build.sh` line 429 fetches Maven artifact `com.bytedance.android:shadowhook:1.0.10`).
+
+**Runtime loading strategy:** shadowhook is NOT linked at build time. It is `dlopen()`'d at runtime so the Zygisk module `.so` has no direct dependency on `libshadowhook.so` — this avoids linker errors if the library is absent and allows graceful failure.
+
+#### `dlopen()` calls
+
+| Call site | Library path | Flags | Line |
+|-----------|-------------|-------|------|
+| Primary | `/data/adb/modules/audio_bridge/zygisk/libshadowhook.so` (= `kShadowhookPath`) | `RTLD_NOW \| RTLD_GLOBAL` | 370 |
+| Fallback | `libshadowhook.so` (linker search path) | `RTLD_NOW \| RTLD_GLOBAL` | 374 |
+| `libaudioclient.so` (force-load for hook visibility) | `libaudioclient.so` | `RTLD_NOW \| RTLD_GLOBAL` | 573 |
+| `resolve_sym()` — RTLD_NOLOAD probe | any `lib` arg | `RTLD_NOW \| RTLD_NOLOAD` | 412 |
+| `resolve_sym()` — full load fallback | any `lib` arg | `RTLD_NOW` | 413 |
+
+#### `dlsym()` calls (all in `load_shadowhook()`, lines 380–385)
+
+| Symbol | Type stored into | Line |
+|--------|----------------|------|
+| `shadowhook_init` | `sh_init` (shadowhook_init_t) | 380 |
+| `shadowhook_hook_sym_name` | `sh_hook_sym_name` (shadowhook_hook_sym_name_t) | 381 |
+| `shadowhook_get_errno` | `sh_get_errno` (shadowhook_get_errno_t) | 382 |
+| `shadowhook_to_errmsg` | `sh_to_errmsg` (shadowhook_to_errmsg_t) | 383 |
+| `shadowhook_dlopen` | `sh_dlopen` (shadowhook_dlopen_t) | 384 |
+| `shadowhook_dlsym_symtab` | `sh_dlsym_symtab` (shadowhook_dlsym_symtab_t) | 385 |
+
+Only `sh_init` and `sh_hook_sym_name` are checked for null before proceeding (line 386); the other four are used only when non-null.
+
+**Mode:** `SHADOWHOOK_MODE_SHARED` — called as `sh_init(SHADOWHOOK_MODE_SHARED, false)` at line 390. In SHARED mode, shadowhook allows multiple hooks on the same function to coexist (each gets a trampoline). This is the correct choice for an audio HAL where the system itself or other Zygisk modules might also hook the same symbols.
+
+The `false` second argument disables shadowhook's internal debug logging.
+
+---
+
+### 5. Complete Hook Table
+
+All hooks are installed by `install_inline_hooks()` (lines 437–481), called from `postAppSpecialize()` line 578.
+
+The `try_hook()` helper (lines 417–435) iterates a null-terminated symbol array and calls `sh_hook_sym_name(lib, sym, new_fn, orig_out)` for each candidate, stopping at the first success. It also treats `SHADOWHOOK_ERRNO_PENDING` (errno==1) as success — meaning the hook will be applied when the library loads.
+
+#### Hook 1 — AudioRecord::read (lines 460–462)
+
+| Attribute | Value |
+|-----------|-------|
+| Library hooked | `libaudioclient.so` |
+| Symbol candidates | `_ZN7android11AudioRecord4readEPvmb` (Android 12–16, `size_t size`) [index 0] |
+| | `_ZN7android11AudioRecord4readEPvj` (legacy, `uint32_t size`) [index 1] |
+| Replacement function | `hooked_audio_record_read` (line 215) |
+| Original pointer stored | `original_audio_record_read` (AudioRecord_read_t, line 97) |
+| `try_hook()` call line | 460 |
+
+**Behavior of replacement (lines 215–268):** When `g_active` is true, completely bypasses the hardware microphone — never calls `original_audio_record_read`. Instead, pulls PCM data from `g_shm->mic_frames` ring buffer (virtual mic injection). If `g_active` is false, passes through to `original_audio_record_read`. Includes sample-rate conversion via `LinearSRC g_mic_src` for non-48kHz apps.
+
+#### Hook 2 — AudioTrack::write (lines 463–465)
+
+| Attribute | Value |
+|-----------|-------|
+| Library hooked | `libaudioclient.so` |
+| Symbol candidates | `_ZN7android10AudioTrack5writeEPKvmb` (Android 12–16, `size_t size`) [index 0] |
+| | `_ZN7android10AudioTrack5writeEPKvj` (legacy, `uint32_t size`) [index 1] |
+| Replacement function | `hooked_audio_track_write` (line 311) |
+| Original pointer stored | `original_audio_track_write` (AudioTrack_write_t, line 98) |
+| `try_hook()` call line | 463 |
+
+**Behavior of replacement (lines 311–345):** Always calls `original_audio_track_write` (passthrough — speaker audio is NOT suppressed). Additionally, when `g_active` is true, captures speaker PCM and pushes frames to `g_shm->speaker_frames` ring buffer. Includes sample-rate conversion via `LinearSRC g_spk_src` for non-48kHz apps.
+
+#### Non-hook symbol resolutions (getSampleRate accessors)
+
+These are **NOT hooks** — they are direct function pointer lookups via `resolve_sym()` (lines 468–475) using `shadowhook_dlsym_symtab` (walks `.symtab` for non-exported symbols) with `dlsym` fallback.
+
+| Symbol | Stored into | Line |
+|--------|------------|------|
+| `_ZNK7android11AudioRecord13getSampleRateEv` | `g_ar_get_sample_rate` (AudioRecord_getSampleRate_t) | 469–471 |
+| `_ZNK7android10AudioTrack13getSampleRateEv` | `g_at_get_sample_rate` (AudioTrack_getSampleRate_t) | 472–475 |
+
+These are called inside the hook replacements to determine the app's actual sample rate for SRC configuration.
+
+**Summary:** 2 inline hooks installed; 2 symbol pointers resolved (no hook). All 4 targets are in `libaudioclient.so`. No hooks in any other library.
+
+---
+
+### 6. SHM Connection Analysis
+
+**Function:** `connect_to_daemon_loop()`, lines 485–532.  
+**Called from:** `postAppSpecialize()` line 583 — spawned as a detached `pthread`.
+
+#### Connection sequence
+
+| Step | Code | Line |
+|------|------|------|
+| Create AF_UNIX SOCK_STREAM socket | `socket(AF_UNIX, SOCK_STREAM, 0)` | 487 |
+| Construct abstract socket address | `addr.sun_path[0] = '\0'; strcpy(addr.sun_path + 1, "audio_bridge")` | 492–493 |
+| Address length | `offsetof(sockaddr_un, sun_path) + 1 + strlen("audio_bridge")` = 15 bytes | 494–495 |
+| Connect | `connect(fd, &addr, addr_len)` | 497 |
+| Send command | `send(fd, "GET_SHM_FD", 10, 0)` | 498 |
+| Receive fd via SCM_RIGHTS | `recvmsg()` with `cmsg->cmsg_type == SCM_RIGHTS` | 510–513 |
+| `mmap()` call | `mmap(nullptr, sizeof(SharedMemoryLayout), PROT_READ\|PROT_WRITE, MAP_SHARED, shm_fd, 0)` | 514–516 |
+| Set `module_active` flag | `g_shm->module_active.store(true)` | 518 |
+| Set `g_active` flag | `g_active.store(true, std::memory_order_release)` | 519 |
+| Send status confirmation | `send(fd, "STATUS:ACTIVE", 13, 0)` | 521 |
+| Close shm_fd | `close(shm_fd)` | 525 |
+| Close connection fd | `close(fd)` | 529 |
+
+**Socket path:** Abstract Unix socket `@audio_bridge` — the leading `\0` byte is set at line 492 and the name `"audio_bridge"` is copied to `sun_path+1` at line 493. This matches the daemon's socket name per `CLAUDE.md`.
+
+**SCM_RIGHTS fd receive:** The control message buffer is sized exactly `CMSG_SPACE(sizeof(int))` (line 501). `CMSG_FIRSTHDR(&msg)` retrieves the first control message (line 511); `cmsg_type == SCM_RIGHTS` is verified (line 512) before extracting the fd via `*(int*)CMSG_DATA(cmsg)` (line 513).
+
+**mmap() parameters:**
+- `addr`: `nullptr` (kernel chooses address)
+- `length`: `sizeof(SharedMemoryLayout)` — the full shared memory struct (includes two 64-frame ring buffers of `AudioFrame` each, plus 6 atomic counters and padding)
+- `prot`: `PROT_READ | PROT_WRITE`
+- `flags`: `MAP_SHARED` (changes visible to daemon process)
+- `fd`: `shm_fd` received via SCM_RIGHTS
+- `offset`: `0`
+
+**`module_active` flag:** Set at line 518 (`g_shm->module_active.store(true)`) immediately after a successful `mmap()`. This is a field in `SharedMemoryLayout` (line 66) with type `std::atomic<bool>`. It signals the daemon that a Zygisk module instance has connected and mapped the shared memory. `g_active` (line 75, `std::atomic<bool>`) is the module-local flag checked in all hook replacements.
+
+**Retry loop (lines 486, 530):** The outer `while (!g_active.load())` loop retries every 1 second (`usleep(1000000)` at lines 488 and 530) if the socket connect, recvmsg, or mmap fails. The loop exits only when `g_active` is set to `true` (line 519).
+
+---
+
+### 7. TLS Avoidance
+
+**`thread_local` usage:** ZERO instances in `zygisk_module.cpp`. The comment at lines 80–82 explicitly explains: "not thread_local — ZygiskNext's builtin linker rejects TLS relocations. Phone call audio uses one capture and one playback thread per process, so plain globals are safe in practice."
+
+**`std::atomic` usage:**
+- `SharedMemoryLayout::write_index` — `std::atomic<uint32_t>` (line 62)
+- `SharedMemoryLayout::read_index` — `std::atomic<uint32_t>` (line 63)
+- `SharedMemoryLayout::speaker_write_idx` — `std::atomic<uint32_t>` (line 64)
+- `SharedMemoryLayout::speaker_read_idx` — `std::atomic<uint32_t>` (line 65)
+- `SharedMemoryLayout::module_active` — `std::atomic<bool>` (line 66)
+- `SharedMemoryLayout::audio_capturing` — `std::atomic<bool>` (line 67)
+- `SharedMemoryLayout::last_activity` — `std::atomic<uint64_t>` (line 68)
+- `g_active` — `std::atomic<bool>` (line 75)
+
+ARM64 `std::atomic` for primitive types uses inline LDXR/STXR/LDAPR/STLR instructions; it does **not** require `libstdc++` TLS runtime support. This is safe with `-nostdlib++`.
+
+**`std::mutex` usage:** NONE. No mutex anywhere in the file.
+
+**`std::vector` usage:** NONE.
+
+**`std::string` usage:** NONE.
+
+**`std::min` usage:** Lines 125, 179, 330 — this is a header-only inline template; safe with `-nostdlib++` (it does not link any C++ runtime symbol).
+
+The module's C++ standard library usage is deliberately minimal: only `std::atomic`, `std::min`, and `memcpy`/`memset`/`memmove`/`usleep`/`pthread_create`/`pthread_detach` (all from libc). This is consistent with the `-nostdlib++` linker flag used in `build.sh` (Phase 1 analysis).
+
+---
+
+### 8. Companion Process
+
+**`connectCompanion()`:** NOT called anywhere in `zygisk_module.cpp`.
+
+**`REGISTER_ZYGISK_COMPANION`:** NOT present anywhere in `zygisk_module.cpp`.
+
+The module has **no companion process**. All privileged operations (reading `libshadowhook.so` from `/data/adb/`) are performed directly inside `preAppSpecialize()` while the process still holds Zygote's SELinux context, as documented in the comment at lines 557–560. The daemon IPC connection (to the abstract socket `@audio_bridge`) is performed from the app process itself after specialization.
+
+---
+
+### 9. AudioCapture.java Cross-Reference
+
+`java/com/audiobridge/AudioCapture.java` is the Java-side audio capture path — a separate, complementary mechanism to the Zygisk hooks:
+
+| Aspect | Value | Line |
+|--------|-------|------|
+| Audio source | `MediaRecorder.AudioSource.VOICE_CALL` (fallback: `VOICE_COMMUNICATION`) | 43–46 |
+| Sample rate | `8000 Hz` | 19 |
+| Frame size | `160 samples` (20ms at 8kHz) | 20 |
+| Frame bytes | `320 bytes` (16-bit PCM) | 21 |
+| IPC path | `IPCClient.getInstance().sendAudio(buf, 0, n)` | 90 |
+| Thread priority | `Thread.MAX_PRIORITY - 1` | 61 |
+
+**Sample rate mismatch:** `AudioCapture.java` operates at **8000 Hz** while the Zygisk module's SHM ring buffer and the daemon both use **48000 Hz** (`SAMPLE_RATE = 48000` at `zygisk_module.cpp` line 49). These are **two independent audio paths**:
+
+- `AudioCapture.java` (Java path): captures via `AudioRecord` with `VOICE_CALL` source at 8kHz, sends raw PCM to the daemon via IPC socket.
+- Zygisk hooks (native path): intercepts `AudioRecord::read()` / `AudioTrack::write()` in the phone process at the native layer; operates at 48kHz with SRC for other rates.
+
+The two paths are not coordinated. If both are active simultaneously, the hooked `AudioRecord::read()` in `hooked_audio_record_read()` **suppresses the real microphone** (does NOT call `original_audio_record_read` when `g_active` is true, lines 225–227), which means the `AudioCapture.java` path's `AudioRecord` instance in the same process would also receive injected data (not real mic audio) when the Zygisk hook is active and the processes overlap. However, `AudioCapture.java` runs in `com.audiobridge` process, while the Zygisk hook targets telephony processes (`com.android.phone`, etc.) — so in practice they operate in different processes and do not interfere.
+
+**`config/audio_policy.conf` cross-reference:** All values in `audio_policy.conf` match compile-time constants. The file is not read at runtime by any discovered code path — it is documentation only (confirmed from Phase 1 analysis; unchanged in Phase 4).
+
+---
+
+### 10. Issues Found
+
+#### D1 — No `is_child_zygote` check in process filter
+**Severity:** LOW  
+**Evidence:** `preAppSpecialize()` lines 543–562; `AppSpecializeArgs` members not checked.
+
+The module does not check `args->is_child_zygote`. ZygiskNext passes `preAppSpecialize()` for all app process forks, including the secondary "app zygote" / WebView zygote. If one of the allow-listed package names (`com.android.systemui`, etc.) happens to be spawned as a child zygote variant, the module would attempt to load shadowhook and install hooks in a secondary zygote — which may have a more restricted linker environment. The standard Zygisk practice is to check `is_child_zygote` and skip early if true. Low risk in practice since the child zygote only spawns renderer processes.
+
+#### D2 — `g_mic_leftover`, `g_spk_accum`, `g_mic_src`, `g_spk_src` are per-module-load globals, not per-hook-instance
+**Severity:** MEDIUM  
+**Evidence:** Lines 88, 156–163.
+
+These are static globals, not per-process state. The module is loaded once per matched process (DLCLOSE_MODULE_LIBRARY ensures it is only present in matched processes). Within a single matched process, if more than one `AudioRecord` or `AudioTrack` instance calls `read()`/`write()` from different threads simultaneously, the shared `g_mic_leftover`, `g_mic_src`, and `g_spk_src`/`g_spk_accum` globals are accessed without any mutex protection. Since there is no `std::mutex` (and none is possible with `-nostdlib++` without a POSIX wrapper), concurrent access from two threads would cause data races on `LeftoverBuf::offset`/`valid` and `LinearSRC::phase`/`last_in`.
+
+The comment at line 81 acknowledges this: "Phone call audio uses one capture and one playback thread per process, so plain globals are safe in practice." This holds for normal telephony (one `AudioRecord` + one `AudioTrack`), but if `com.android.systemui` or `com.audiobridge` spawns multiple audio tracks simultaneously, races are possible. The mitigation is the comment's assertion about actual usage; no code enforcement exists.
+
+#### D3 — `hooked_audio_record_read` ignores original when `g_active`; creates a HAL drain problem
+**Severity:** LOW  
+**Evidence:** Lines 218–228.
+
+When `g_active` is true, `original_audio_record_read` is **never called**. The comment at lines 225–227 explains this is intentional to prevent real mic leakage. However, the Android Audio HAL uses `AudioRecord::read()` as a flow-control mechanism — the HAL's input buffer must be drained regularly or it may overflow (leading to EPIPE / buffer flush). By not calling `original_audio_record_read`, the HAL's input pipeline is not drained. The `usleep` at lines 261–264 (cap 40ms) attempts to pace the caller to avoid CPU-spin, but does not drain the HAL buffer. On some HAL implementations this can cause input pipeline stalls or audio glitches visible to other audio clients. This is a known trade-off of the "completely replace mic" approach.
+
+#### D4 — SCM_RIGHTS buffer assumes exactly one fd; no iteration over control messages
+**Severity:** LOW  
+**Evidence:** Lines 500–513.
+
+The control message buffer is `CMSG_SPACE(sizeof(int))` — space for exactly one file descriptor. `CMSG_FIRSTHDR(&msg)` retrieves only the first `cmsghdr`. If the daemon sends more than one ancillary message (unlikely but possible if the socket protocol evolves), only the first is examined and subsequent messages are silently dropped. This is not a current bug (the daemon sends exactly one fd) but creates a fragile assumption.
+
+#### D5 — No hook cleanup / unhook path
+**Severity:** LOW  
+**Evidence:** Entire file — no `shadowhook_unhook` calls present.
+
+Once installed, the inline hooks on `AudioRecord::read` and `AudioTrack::write` are never removed. If the daemon disconnects (e.g., the daemon process exits while the phone process remains alive), `g_active` returns to false (via the while-loop in `connect_to_daemon_loop` — actually `g_active` is only set to true, never reset to false), which means `g_active` would remain true even after the daemon exits. The `g_shm` pointer would remain valid (the `mmap`'d region persists until the process exits, since the fd is closed but the mapping is retained), but `last_activity`/`audio_capturing` fields would be stale. The hook replacement functions would continue to serve stale SHM data (zeroed after ring underrun) rather than falling back to real hardware audio. A `g_active` reset on daemon disconnect and a clean unhook path would be needed for production quality.
+
+**More critically:** `g_active` is set to `true` at line 519 and **never set back to false** — the `connect_to_daemon_loop` function's outer `while (!g_active.load())` loop exits after the first successful connection and never re-enters. If the daemon crashes, the module cannot reconnect in the current design.
+
+#### D6 — `LeftoverBuf::offset`/`valid` initialized to zero implicitly but `valid` comment says "total valid"
+**Severity:** INFORMATIONAL  
+**Evidence:** Lines 83–87.
+
+```cpp
+struct LeftoverBuf {
+    int16_t samples[FRAME_SAMPLES];
+    size_t  offset = 0;
+    size_t  valid  = 0;
+};
+static LeftoverBuf g_mic_leftover{};
+```
+
+`g_mic_leftover` is a static global, zero-initialized by the C++ runtime (`.bss` section). The `= 0` in-class initializers are redundant but harmless. No bug here; INFORMATIONAL note only.
+
+#### D7 — `AudioCapture.java` vs Zygisk hook sample rate mismatch (documentation gap)
+**Severity:** INFORMATIONAL  
+**Evidence:** `AudioCapture.java` line 19 (`SAMPLE_RATE = 8000`); `zygisk_module.cpp` line 49 (`SAMPLE_RATE = 48000`).
+
+The two audio capture paths operate at different sample rates. This inconsistency is not documented in `CLAUDE.md`, `INSTRUCTION.md`, or any in-code comment. The daemon must handle both 8kHz PCM (from Java path via IPC) and 48kHz frames (from Zygisk SHM path) as separate data streams. Without reading the daemon source, it is unclear whether the daemon correctly bridges both rates or assumes one. **CHƯA ĐỦ BẰNG CHỨNG ĐỂ KẾT LUẬN** from the Zygisk module source alone — requires Phase 5 (daemon analysis) to resolve.
+
+---
+
+### 11. Phase 4 Summary
+
+| Finding | ID | Severity |
+|---------|----|----------|
+| No `is_child_zygote` check — module could activate in WebView zygote | D1 | LOW |
+| Shared SRC/leftover globals not mutex-protected — potential data race with multi-thread audio | D2 | MEDIUM |
+| `original_audio_record_read` never called when active — HAL buffer not drained | D3 | LOW |
+| SCM_RIGHTS assumes exactly one ancillary message | D4 | LOW |
+| `g_active` never reset to false after daemon disconnect — no reconnect path | D5 | LOW |
+| `LeftoverBuf` default initializers redundant (style, no bug) | D6 | INFORMATIONAL |
+| Java capture (8kHz) vs Zygisk SHM (48kHz) rate mismatch undocumented | D7 | INFORMATIONAL |
+
+**Architecture is sound:** The module correctly uses `DLCLOSE_MODULE_LIBRARY` for non-target processes, loads shadowhook during `preAppSpecialize` to exploit the wider SELinux context window, and completely avoids `thread_local` / heavy C++ runtime dependencies that would cause TLS linker failures with ZygiskNext. The SHARED mode shadowhook choice is appropriate. The `connect_to_daemon_loop` design — a detached background pthread that retries until the SHM fd is received — cleanly handles the timing gap between app process start and daemon availability.
+
+**Most significant finding:** D5 — once connected, the module has no mechanism to detect daemon death and re-establish the SHM connection or fall back to real hardware audio. A reconnected or restarted daemon would not be seen by an already-running phone process.
+
+---
+
+*End of Phase 4 — Zygisk Analysis*
