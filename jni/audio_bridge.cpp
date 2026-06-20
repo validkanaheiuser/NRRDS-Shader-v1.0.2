@@ -1147,7 +1147,8 @@ static void status_sender_thread(mbedtls_net_context* net) {
             // JNI callbacks produce "type":"sms_received" / "type":"sms_status" — check "type",
             // not "event" (which never appears in any callback output).
             uint8_t frame_type = T_CALL_STATUS;
-            if (json_str.find("\"type\":\"sms") != std::string::npos) {
+            if (json_str.find("\"type\":\"sms") != std::string::npos ||
+                json_str.find("\"event\":\"sms") != std::string::npos) {
                 frame_type = T_SMS;
             } else if (json_str.find("\"type\":\"device_info\"") != std::string::npos) {
                 frame_type = T_DEVICE_INFO;
@@ -1206,12 +1207,14 @@ static void receive_virtual_mic_thread(mbedtls_net_context* net) {
             if(cmd == "dial") {
                 std::string number = root.getString("number");
                 if(!number.empty()) {
-                    send_to_java_raw(json_str.c_str());
+                    // APK expects "place_call", not "dial"
+                    std::string msg = "{\"command\":\"place_call\",\"number\":\"" + number + "\"}";
+                    send_to_java_raw(msg.c_str());
                 }
             } else if(cmd == "hangup" || cmd == "end_call") {
-                send_to_java_raw("{\"command\":\"hangup\"}");
+                send_to_java_raw("{\"command\":\"end_call\"}");
             } else if(cmd == "answer") {
-                send_to_java_raw("{\"command\":\"answer\"}");
+                send_to_java_raw("{\"command\":\"answer_call\"}");
             } else if(cmd == "mute") {
                 send_to_java_raw(json_str.c_str());
             } else if(cmd == "send_sms") {

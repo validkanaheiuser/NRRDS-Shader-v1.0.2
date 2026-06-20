@@ -233,6 +233,18 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
 .t-bod{color:var(--dim);font-size:.72rem;font-family:'JetBrains Mono',monospace;}
 @keyframes tslide{from{transform:translateX(14px);opacity:0}to{transform:translateX(0);opacity:1}}
 
+/* ── Incoming call modal ── */
+.incall-overlay{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:1000;display:flex;align-items:center;justify-content:center;animation:fadeIn .18s ease-out;}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.incall-modal{background:var(--card);border:1px solid rgba(255,85,85,.35);border-radius:18px;padding:2rem 2.2rem 1.6rem;min-width:260px;text-align:center;box-shadow:0 0 40px rgba(255,85,85,.18);}
+.incall-label{font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--danger);font-weight:600;animation:pulse 1s ease-in-out infinite;margin-bottom:.7rem;}
+.incall-num{font-size:2rem;font-weight:700;letter-spacing:.02em;margin-bottom:.3rem;}
+.incall-via{font-size:.78rem;color:var(--muted);margin-bottom:1.4rem;}
+.incall-btns{display:flex;gap:.8rem;justify-content:center;}
+.incall-btns button{flex:1;padding:.7rem 0;font-size:.85rem;border-radius:10px;font-weight:600;cursor:pointer;border:none;}
+.btn-incall-answer{background:var(--good);color:#000;}
+.btn-incall-reject{background:var(--danger);color:#fff;}
+
 /* ── Call panel transitions ── */
 .cpanel-enter-active,.cpanel-leave-active{transition:opacity .18s,transform .18s;}
 .cpanel-enter-from{opacity:0;transform:translateY(6px);}
@@ -245,6 +257,19 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
 </head>
 <body data-theme="dark">
 <div id="app" v-cloak>
+
+<!-- Incoming call modal (shown only for selected device) -->
+<div v-if="callPanel === 'ringing-in'" class="incall-overlay" @click.self="/* dismiss on backdrop click is intentional */">
+  <div class="incall-modal">
+    <div class="incall-label">incoming call</div>
+    <div class="incall-num">{{ selectedDevice?.call?.number || 'unknown' }}</div>
+    <div class="incall-via">via {{ selectedDevice?.name || selectedDevice?.id || 'device' }}</div>
+    <div class="incall-btns">
+      <button class="btn-incall-reject" @click="hangup">reject</button>
+      <button class="btn-incall-answer" @click="answer">answer</button>
+    </div>
+  </div>
+</div>
 
 <!-- Toasts -->
 <div class="toasts">
@@ -741,7 +766,7 @@ createApp({
 
     // ── Dial pad ─────────────────────────────────────────────────
     function pressKey(d) {
-      phoneNum.value += (d === '0' && phoneNum.value === '') ? '+' : d;
+      phoneNum.value += d;
     }
     function delChar() { phoneNum.value = phoneNum.value.slice(0, -1); }
     function dialNumber(num) { phoneNum.value = num; if (selectedId.value) dial(); }
@@ -876,7 +901,11 @@ createApp({
             _callNum = ''; _callDir = ''; _callStart = 0;
             stopTimer(); stopAudio(); speakerOn.value = false;
           } else if (s === 'RINGING' && d === 'incoming') {
-            showToast('ev', 'incoming call', n || 'unknown number');
+            if (deviceId !== selectedId.value) {
+              // Not the selected device — show toast
+              showToast('ev', 'incoming call', (n || 'unknown') + ' · ' + (deviceId || ''));
+            }
+            // Selected device gets the full-screen modal (driven by callPanel computed)
             if (Notification.permission === 'granted') {
               new Notification('Incoming call', { body: (n || 'unknown') + ' · ' + (deviceId || ''), tag: 'ab-ring' });
             }

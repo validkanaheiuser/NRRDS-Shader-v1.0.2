@@ -486,7 +486,9 @@ async function handleDevice(socket) {
         case T_SMS: {
           let sms;
           try { sms = JSON.parse(data.toString()); } catch (_) { break; }
-          mgr.broadcastEvent({ type: 'event', kind: sms.event || 'sms_event', device_id: device.id, data: sms });
+          // received SMS: type='sms'; sent/delivered result: event='sms_sent'/'sms_delivered'
+          const smsKind = sms.type === 'sms' ? 'sms' : (sms.event || 'sms');
+          mgr.broadcastEvent({ type: 'event', kind: smsKind, device_id: device.id, data: sms });
           break;
         }
 
