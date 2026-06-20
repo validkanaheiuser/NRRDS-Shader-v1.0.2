@@ -38,7 +38,8 @@ events and relays them to the daemon via IPC.
 - TLS minimum: TLSv1.2 (server and daemon)
 - Opus frame size: 960 samples (20 ms at 48 kHz) for TX; adaptive for RX
 - PCM card: 0 (`/dev/snd/card0`) — verified for sweet/sweetin
-- All ALSA mixer control names are SM6150/sweet-specific (verified from device tree)
+- PCM device numbers are config-driven (config.json); defaults from research; runtime probe at startup
+- Mixer control names validated at startup via `mixer_ctl_get_type()`; mute feature degrades gracefully if control absent
 - Frame protocol: `[1B type][4B len BE][payload]` — unchanged
 - IPC socket: abstract Unix `@audio_bridge` — unchanged
 
@@ -78,14 +79,29 @@ the voice TX PCM handle. A HAL wrapper hooking `in_read()` sees zero voice TX fr
 QCOM audio HAL has a built-in `USECASE_INCALL_MUSIC_UPLINK` that feeds audio from a
 PCM output device into the voice TX path inside the ADSP. This is the official mechanism.
 
-**Verified PCM device numbers on sweet/sweetin:**
+**PCM device numbers — research defaults (must be confirmed on device):**
 
-| Path | Device | ALSA node | Notes |
-|---|---|---|---|
-| Voice call SIM 1 (VOICEMMODE1) | PCM 2 | `/dev/snd/pcmC0D2` | XML override from compiled default 44 |
-| Voice call SIM 2 (VOICEMMODE2) | PCM 19 | `/dev/snd/pcmC0D19` | XML override from compiled default 45 |
-| **TX injection** | **PCM 27** | `/dev/snd/pcmC0D27` | No XML override — compiled default unchanged |
-| **RX capture (downlink tap)** | **PCM 0** | `/dev/snd/pcmC0D0` | No XML override |
+| Path | Default | ALSA node | Confidence | Notes |
+|---|---|---|---|---|
+| Voice call SIM 1 (VOICEMMODE1) | PCM 2 | `/dev/snd/pcmC0D2` | HIGH | XML override confirmed in sweet/sweetin device tree |
+| Voice call SIM 2 (VOICEMMODE2) | PCM 19 | `/dev/snd/pcmC0D19` | HIGH | XML override confirmed |
+| **TX injection** | **PCM 27** | `/dev/snd/pcmC0D27` | MEDIUM | Compiled default, no XML override found — needs `adb shell cat /proc/asound/pcm` to confirm MultiMedia9 = device 27 |
+| **RX capture (downlink tap)** | **PCM 0** | `/dev/snd/pcmC0D0` | LOW | Research-based; NOT tested on physical sweet device — must verify with `tinycap` during live call |
+
+**Runtime PCM discovery (required):**
+At daemon startup, parse `/proc/asound/pcm` and log all devices. All PCM device numbers
+are read from `config.json` with research-based defaults:
+```json
+{
+  "pcm_card": 0,
+  "pcm_tx_injection_device": 27,
+  "pcm_rx_capture_device": 0,
+  "pcm_rx_capture_rate": 16000
+}
+```
+Daemon logs: `"PCM devices from /proc/asound/pcm: ..."` at startup so device can be verified
+before first call. If `pcm_open()` fails for TX or RX, daemon logs device number and
+suggests checking `config.json`.
 
 **Full audio flow:**
 
@@ -108,8 +124,10 @@ SERVER ──(TCP 59100 TLS)──► DAEMON (root)
   REMOTE PARTY HEARS SERVER AUDIO        DAEMON → T_SPEAKER → SERVER
 ```
 
-**Mic blocking:** `"Voice Tx Device Mute" = [state=1, VSID=-1 (all sessions), ramp_ms=20]`
-cuts the ADC-to-ADSP-to-modem path at DSP level. Remote party hears zero from real mic.
+**Mic blocking:** Attempt `"Voice Tx Device Mute" = [1, -1, 20]` (array format per `platform_set_device_mute()`).
+Validated at startup with `mixer_ctl_get_type()` / `mixer_ctl_get_num_values()`. Fallback: try
+`"Voice Tx Mute"`. If neither control exists: log warning and continue — call still works but
+real mic is not muted (degraded mode, not failure).
 
 ### PCM configs
 
@@ -387,11 +405,15 @@ private void notifyCallState(int state, String number) {
 ```cpp
 struct VoiceCallContext {
     // PCM handles — only touch after join()
-    struct pcm*  pcm_tx_out = nullptr;   // PCM 27
-    struct pcm*  pcm_rx_in  = nullptr;   // PCM 0
+    struct pcm*  pcm_tx_out = nullptr;   // PCM 27 (config-driven)
+    struct pcm*  pcm_rx_in  = nullptr;   // PCM 0  (config-driven, unconfirmed)
     std::mutex   pcm_mtx;                // guards both pointers AND pcm_write/read
 
+    // active: CAS-set true at start of voice_call_start(); false = stop threads
     std::atomic<bool>       active{false};
+    // reconnecting: true while attempt_reopen is running; pauses enqueue + clears queue
+    std::atomic<bool>       reconnecting{false};
+
     std::condition_variable queue_cv;
     std::mutex              queue_mtx;
     std::deque<std::vector<uint8_t>> tx_queue;  // Opus frames
@@ -402,6 +424,10 @@ struct VoiceCallContext {
     std::thread tx_thread, rx_thread;
     unsigned    rx_rate  = 16000;
     int         sim_slot = 0;
+
+    // Mixer control availability — set during init_mixer_controls()
+    bool has_device_mute_ctl = false;   // "Voice Tx Device Mute"
+    bool has_tx_mute_ctl     = false;   // "Voice Tx Mute" (fallback)
 };
 ```
 
@@ -491,6 +517,13 @@ void voice_tx_thread() {
 
 ```cpp
 bool attempt_reopen_tx_pcm() {
+    // Fix #4: signal enqueue to stop + clear stale audio before reconnect
+    g_voice.reconnecting.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(g_voice.queue_mtx);
+        g_voice.tx_queue.clear();
+    }
+
     for (int i = 0; i < 5; i++) {
         if (!g_voice.active.load()) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -514,8 +547,10 @@ bool attempt_reopen_tx_pcm() {
             g_voice.pcm_tx_out = p;
         }
         if (old) pcm_close(old);  // outside mutex
+        g_voice.reconnecting.store(false, std::memory_order_release);
         return true;
     }
+    g_voice.reconnecting.store(false, std::memory_order_release);
     return false;
 }
 ```
@@ -534,15 +569,20 @@ struct pcm* open_pcm_with_retry(int device, int flags, const struct pcm_config* 
 }
 ```
 
-### TX queue — drop oldest
+### TX queue — drop oldest + reconnecting guard
 
 ```cpp
 void enqueue_tx_opus_frame(const uint8_t* data, int len) {
-    std::lock_guard<std::mutex> lk(g_voice.queue_mtx);
-    if ((int)g_voice.tx_queue.size() >= VoiceCallContext::TX_MAX_FRAMES)
-        g_voice.tx_queue.pop_front();   // drop oldest, keep freshness
-    g_voice.tx_queue.emplace_back(data, data + len);
-    g_voice.queue_cv.notify_one();
+    // Fix #4: don't fill queue during modem SSR reconnect — stale audio is useless
+    if (g_voice.reconnecting.load(std::memory_order_relaxed)) return;
+
+    {
+        std::lock_guard<std::mutex> lk(g_voice.queue_mtx);
+        if ((int)g_voice.tx_queue.size() >= VoiceCallContext::TX_MAX_FRAMES)
+            g_voice.tx_queue.pop_front();   // drop oldest, keep freshness
+        g_voice.tx_queue.emplace_back(data, data + len);
+    }
+    g_voice.queue_cv.notify_one();   // Fix #5: notify AFTER unlock
 }
 ```
 
@@ -561,7 +601,7 @@ void heartbeat_thread_func() {
         std::this_thread::sleep_for(std::chrono::seconds(15));
         if (!g_connected.load()) break;
         time_t last = g_last_pong.load();
-        if (time(nullptr) - last > 45) {
+        if (time(nullptr) - last > 90) {   // Fix #6: 90s — tolerates GC/TLS renegotiation
             g_connected.store(false);
             shutdown(g_server_fd, SHUT_RDWR);
             break;
@@ -582,7 +622,7 @@ These are referenced in Section 5 code and must be implemented:
 - `setup_incall_mixer(int sim_slot)` — opens mixer 0, sets incall music + downlink rec + mic mute controls
 - `set_ctl(mixer*, name, int)` — thin wrapper: `mixer_get_ctl_by_name` + `mixer_ctl_set_value`
 - `set_ctl_array(mixer*, name, int[])` — thin wrapper: `mixer_get_ctl_by_name` + `mixer_ctl_set_array`
-- `voice_call_start(int sim_slot)` — sets `g_voice.sim_slot`, calls `setup_incall_mixer`, calls `open_pcm_with_retry` for both PCM 27 and PCM 0, sets `g_voice.active = true`, starts threads
+- `voice_call_start(int sim_slot)` — CAS `active` false→true at entry (returns immediately if already true, prevents double-start from TelephonyManager event spam); sets `g_voice.sim_slot`; calls `setup_incall_mixer`; calls `open_pcm_with_retry` for both TX and RX PCM; starts threads. On any setup failure, resets `active = false` so future calls can retry.
 - `open_rx_pcm_with_retry()` — tries `kRxRates[]` in order (16000, 8000), stores chosen rate in `g_voice.rx_rate`
 
 Existing globals from `jni/opus_wrapper.cpp` (unchanged): `g_opus_dec_48k`, `g_opus_enc`.
@@ -593,21 +633,29 @@ Rate for RX encoder matches `g_voice.rx_rate` (set at pcm_open time).
 ## Known Limitations
 
 1. **PLC without sequence numbers:** Wait-for-30ms timeout triggers PLC before
-   checking if the frame arrives late vs truly lost. A delayed frame arriving after
+   confirming packet is truly lost vs just late. A delayed frame arriving after
    PLC will be played twice (minor audio artifact). VoIP-grade fix requires adding
    `seq` + `ts` fields to T_VIRTUAL_MIC payload (v2 scope, not this release).
 
-2. **Daemon never drops root:** Required for `/dev/snd/*` access. No seccomp/chroot
+2. **PCM 27 (TX injection) unconfirmed on physical device:** Research shows no XML
+   override for `INCALL_MUSIC_UPLINK_PCM_DEVICE` on sweet/sweetin — compiled default
+   of 27 should hold. Must verify: `adb shell cat /proc/asound/pcm` during call
+   and confirm MultiMedia9 = device 27. If wrong, update `config.json`.
+
+3. **PCM 0 (RX capture) is lowest-confidence assumption:** Not tested on physical sweet
+   device. Must verify with `tinymix` + `tinycap` during live call. If PCM 0 yields
+   silence, try candidates 8, 1. Override in `config.json`.
+
+4. **Mixer control names device-specific:** `"Voice Tx Device Mute"` format (array vs bool)
+   validated at startup. If absent, mic mute silently degrades — real mic stays live
+   during injection. Feature flag `has_device_mute_ctl` tracks availability.
+
+5. **Daemon never drops root:** Required for `/dev/snd/*` access. No seccomp/chroot
    in this release. Documented in audit report as accepted risk.
 
-3. **PCM rates runtime-only:** RX capture rate (16 kHz vs 8 kHz) is detected at
-   pcm_open time. If detection fails, daemon logs error and disables RX path for
-   that call.
-
-4. **SSR reconnect best-effort:** After modem SSR, `attempt_reopen_*_pcm()` does
-   full mixer teardown + re-setup + pcm_open. If modem is still restarting after
-   5 × 200 ms = 1 s, reconnect gives up and audio dies for that call. Call state
-   events from APK will re-trigger `voice_call_start()` if a new call is made.
+6. **SSR reconnect best-effort:** 5 × 200 ms = 1 s max wait. If modem still restarting,
+   audio dies for that call. Next call re-triggers `voice_call_start()` cleanly.
+   During reconnect `reconnecting=true` clears TX queue and pauses enqueue.
 
 ---
 
