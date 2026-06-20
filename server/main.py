@@ -95,10 +95,50 @@ logging.basicConfig(
 
 # ─── Protocol constants ──────────────────────────────────────────────────────
 T_SPEAKER, T_VIRTUAL_MIC, T_CONTROL, T_CALL_STATUS, T_SMS, T_PING, T_PONG = range(1, 8)
+T_DEVICE_INFO   = 8
+T_DEVICE_STATUS = 9
 
-AUTH_TOKEN = os.environ.get("AUDIO_BRIDGE_TOKEN", "default_secure_token_123")
+AUTH_TOKEN = os.environ.get("AUDIO_BRIDGE_TOKEN", "")
+if not AUTH_TOKEN:
+    raise RuntimeError(
+        "AUDIO_BRIDGE_TOKEN environment variable is required. "
+        "Generate one with: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
+    )
 TCP_PORT = int(os.environ.get("AUDIO_BRIDGE_TCP_PORT", "59100"))
 HTTP_PORT = int(os.environ.get("AUDIO_BRIDGE_HTTP_PORT", "8000"))
+
+import time as _time
+
+_nonce_cache: dict = {}   # nonce_hex → expiry float
+
+
+def _purge_nonces() -> None:
+    now = _time.time()
+    expired = [k for k, v in _nonce_cache.items() if v < now]
+    for k in expired:
+        del _nonce_cache[k]
+
+
+def verify_handshake_hmac(dev_id: str, date: str, recv_hmac: str, nonce: str) -> bool:
+    """Verify HMAC and reject replayed nonces."""
+    if not nonce:
+        return False
+    _purge_nonces()
+    if nonce in _nonce_cache:
+        log.warning("HMAC replay detected: nonce=%s", nonce)
+        return False
+    _nonce_cache[nonce] = _time.time() + 60.0
+    msg = f"{dev_id}-{date}-{nonce}".encode()
+    expected = hmac.new(AUTH_TOKEN.encode(), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(recv_hmac, expected)
+
+
+def verify_ws_token(token: str) -> bool:
+    """Verify bearer token for WebSocket connections."""
+    if not token or not AUTH_TOKEN:
+        return False
+    return hmac.compare_digest(token, AUTH_TOKEN)
+
 
 NATIVE_RATE = 48000
 FRAME_MS = 20
@@ -284,6 +324,8 @@ class Device:
         self.call_started_at: int = 0         # ms epoch
         self.call_muted: bool = False
         self.connected: bool = True
+        self.device_info: dict = {}   # latest T_DEVICE_INFO payload
+        self.device_status: dict = {} # latest T_DEVICE_STATUS payload
         self.audio = AudioHub(self)
         self._write_lock = asyncio.Lock()
 
@@ -368,6 +410,8 @@ class DeviceManager:
                         "started_at": d.call_started_at,
                         "muted": d.call_muted,
                     },
+                    "device_info": d.device_info,
+                    "device_status": d.device_status,
                 }
                 for d in self.devices.values()
             ],
@@ -381,13 +425,12 @@ mgr = DeviceManager()
 async def do_handshake(reader: asyncio.StreamReader) -> Optional[dict]:
     line = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=10.0)
     info = json.loads(line.decode())
-    dev_id = info.get("id", "")
-    date = info.get("date", "")
+    dev_id    = info.get("id", "")
+    date      = info.get("date", "")
+    nonce     = info.get("nonce", "")
     recv_hmac = info.get("hmac", "")
-    expected = hmac.new(
-        AUTH_TOKEN.encode(), f"{dev_id}-{date}".encode(), hashlib.sha256
-    ).hexdigest()
-    if not hmac.compare_digest(recv_hmac, expected):
+    if not verify_handshake_hmac(dev_id, date, recv_hmac, nonce):
+        log.warning("Handshake HMAC failed for device %s (nonce=%s)", dev_id, nonce)
         return None
     return info
 
@@ -461,10 +504,11 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             elif t == T_SMS:
                 try:
                     sms = json.loads(data.decode())
-                    kind = sms.get("event", "sms_event")
+                    # APK v4 sends {"type":"sms","ver":1,"from":"...","body":"...","sim_slot":N,...}
+                    kind = sms.get("type", sms.get("event", "sms_event"))
                     await mgr.broadcast_event({
                         "type": "event",
-                        "kind": kind,
+                        "kind": "sms",
                         "device_id": device.id,
                         "data": sms,
                     })
@@ -473,6 +517,32 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             elif t == T_PING:
                 await device.send_frame(T_PONG, b"")
             # T_PONG: silently accepted
+            elif t == T_DEVICE_INFO:
+                try:
+                    info = json.loads(data.decode())
+                    device.device_info = info
+                    await mgr.broadcast_event({
+                        "type": "event",
+                        "kind": "device_info",
+                        "device_id": device.id,
+                        "data": info,
+                    })
+                    log.info("Device info from %s: model=%s android=%s",
+                             device.id, info.get("model"), info.get("android_version"))
+                except Exception as e:
+                    log.debug("device_info parse: %s", e)
+            elif t == T_DEVICE_STATUS:
+                try:
+                    status = json.loads(data.decode())
+                    device.device_status = status
+                    await mgr.broadcast_event({
+                        "type": "event",
+                        "kind": "device_status",
+                        "device_id": device.id,
+                        "data": status,
+                    })
+                except Exception as e:
+                    log.debug("device_status parse: %s", e)
     except asyncio.TimeoutError:
         log.info("handshake timeout from %s", addr)
     except asyncio.IncompleteReadError:
@@ -497,8 +567,17 @@ async def handle_device(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def start_tcp() -> None:
-    srv = await asyncio.start_server(handle_device, "0.0.0.0", TCP_PORT)
-    log.info("TCP on :%d (HMAC auth, Opus@48k)", TCP_PORT)
+    ssl_ctx = None
+    cert_file = os.environ.get("SSL_CERT_FILE")
+    key_file  = os.environ.get("SSL_KEY_FILE")
+    if cert_file and key_file:
+        import ssl as _ssl
+        ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(cert_file, key_file)
+        log.info("TLS enabled on TCP port %d (cert=%s)", TCP_PORT, cert_file)
+
+    srv = await asyncio.start_server(handle_device, "0.0.0.0", TCP_PORT, ssl=ssl_ctx)
+    log.info("TCP on :%d (HMAC auth + nonce, Opus@48k)", TCP_PORT)
     async with srv:
         await srv.serve_forever()
 
@@ -524,6 +603,11 @@ app = FastAPI(title="Audio Bridge Server", lifespan=lifespan)
 
 @app.websocket("/ws/ui")
 async def ws_ui(ws: WebSocket) -> None:
+    token = ws.query_params.get("token", "") or \
+            ws.headers.get("authorization", "").removeprefix("Bearer ")
+    if not verify_ws_token(token):
+        await ws.close(code=4401, reason="Unauthorized")
+        return
     await mgr.connect_ui(ws)
     try:
         while True:
@@ -554,6 +638,11 @@ async def ws_ui(ws: WebSocket) -> None:
                     await d.send_control("audio_route", route=str(data.get("route", "earpiece")))
                 elif cmd == "volume":
                     await d.send_control("volume", level=int(data.get("level", 7)))
+                elif cmd == "set_sim_filter":
+                    allowed = data.get("allowed_sims", [0, 1])
+                    await d.send_control("set_sim_filter", allowed_sims=allowed)
+                elif cmd == "get_device_info":
+                    await d.send_control("get_device_info")
             except Exception as e:
                 log.warning("send_control %s → %s: %s", cmd, did, e)
     except WebSocketDisconnect:
