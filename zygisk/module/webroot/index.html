@@ -252,10 +252,13 @@ const DEFAULTS = {
 
 async function loadConfig() {
   let cfg = { ...DEFAULTS };
+  // Try ksu.exec() first; fall back to status.json if exec returns null/empty
+  let loaded = false;
   if (ksuAvail) {
     const r = await sh('cat ' + CFG + ' 2>/dev/null');
-    if (r.ok && r.out) try { cfg = { ...DEFAULTS, ...JSON.parse(r.out) }; } catch {}
-  } else {
+    if (r.ok && r.out) { try { cfg = { ...DEFAULTS, ...JSON.parse(r.out) }; loaded = true; } catch {} }
+  }
+  if (!loaded) {
     const txt = await fetchText('./status.json');
     if (txt) try { const s = JSON.parse(txt); if (s.config) cfg = { ...DEFAULTS, ...s.config }; } catch {}
   }
@@ -319,23 +322,33 @@ async function refreshStatus() {
 
   let running = false, pid = '', conn = '';
 
+  // Always read status.json as baseline (written every 30s by service.sh)
+  const statusTxt = await fetchText('./status.json');
+  let sj = null;
+  if (statusTxt) try { sj = JSON.parse(statusTxt); } catch {}
+
   if (ksuAvail) {
     const pidR = await sh('pidof audio-bridge 2>/dev/null || true');
-    pid = (pidR.out.trim().split(/\s+/)[0]) || '';
-    running = pid !== '';
+    if (pidR.out.trim()) {
+      pid = pidR.out.trim().split(/\s+/)[0];
+      running = true;
+    } else if (sj) {
+      // ksu.exec returned null/empty — fall back to status.json
+      pid = sj.pid || ''; running = !!sj.running;
+    }
     if (running) {
       const logR = await sh('grep -aoE "Connected to [^,]+|Disconnected|No config" ' + SVCLOG + ' 2>/dev/null | tail -1');
-      conn = logR.out || 'running';
+      conn = logR.out || (sj && sj.conn) || 'running';
     }
     const cfgR = await sh('[ -f ' + CFG + ' ] && echo yes || echo no');
-    document.getElementById('st-cfg').textContent = cfgR.out.trim() === 'yes' ? 'present ✓' : 'missing ✗';
+    if (cfgR.out.trim()) {
+      document.getElementById('st-cfg').textContent = cfgR.out.trim() === 'yes' ? 'present ✓' : 'missing ✗';
+    } else {
+      document.getElementById('st-cfg').textContent = (sj && sj.config) ? 'present ✓' : '—';
+    }
   } else {
-    const txt2 = await fetchText('./status.json');
-    if (txt2) try {
-      const s = JSON.parse(txt2);
-      running = !!s.running; pid = s.pid || ''; conn = s.conn || '';
-    } catch {}
-    document.getElementById('st-cfg').textContent = '—';
+    if (sj) { running = !!sj.running; pid = sj.pid || ''; conn = sj.conn || ''; }
+    document.getElementById('st-cfg').textContent = (sj && sj.config) ? 'present ✓' : '—';
   }
 
   pill.className = 'conn-pill ' + (running ? 'running' : 'stopped');
