@@ -659,6 +659,312 @@ Rate for RX encoder matches `g_voice.rx_rate` (set at pcm_open time).
 
 ---
 
+---
+
+## Section 6: Dashboard Features — SIM Filter, Device Info, Status
+
+---
+
+### 6.1 Frame Protocol — New Types
+
+Two new frame types added (existing types 0x01–0x07 unchanged):
+
+| Type | Hex | Direction | Payload | When |
+|---|---|---|---|---|
+| T_DEVICE_INFO   | 0x08 | device → server | Device model, SIM list, active filter | On TCP connect |
+| T_DEVICE_STATUS | 0x09 | device → server | Battery %, signal bars, network type | Every 30 s (on PING) |
+
+---
+
+### 6.2 SIM Routing Filter
+
+**Goal:** Dashboard configures which SIM slot(s) are allowed to receive calls.
+Incoming calls on disallowed SIM are rejected before ringing. Config persists across
+reboots.
+
+**Control flow:**
+
+```
+Dashboard → T_CONTROL {"cmd":"set_sim_filter","allowed_sims":[0]}
+  → Server → TCP → Daemon → IPC @audio_bridge
+  → APK stores filter in SharedPreferences + /data/adb/modules/audio_bridge/files/config.json
+  → TelephonyHelper: next incoming call checks filter before forwarding to daemon
+```
+
+**T_CONTROL commands (server → device):**
+
+```json
+{"cmd": "set_sim_filter", "allowed_sims": [0]}        // SIM 1 only
+{"cmd": "set_sim_filter", "allowed_sims": [0, 1]}     // both SIMs
+{"cmd": "get_device_info"}                             // request fresh T_DEVICE_INFO
+```
+
+**APK: Call rejection when SIM not in filter**
+
+```java
+// TelephonyHelper.java — on CALL_STATE_RINGING:
+@Override
+public void onCallStateChanged(int state, String number) {
+    if (state == TelephonyManager.CALL_STATE_RINGING) {
+        int simSlot = getIncomingCallSimSlot();
+        if (!mSimFilter.contains(simSlot)) {
+            rejectCall();   // see below
+            notifyCallState("rejected_filter", number, simSlot);
+            return;
+        }
+    }
+    // ... normal flow
+}
+
+private void rejectCall() {
+    try {
+        // API 28+ deprecated but works on rooted priv-app
+        TelecomManager tm = (TelecomManager)
+            mContext.getSystemService(Context.TELECOM_SERVICE);
+        tm.endCall();
+    } catch (SecurityException e) {
+        // Fallback for Android 16: reflection on TelephonyManager
+        try {
+            Method m = TelephonyManager.class.getDeclaredMethod("endCall");
+            m.setAccessible(true);
+            m.invoke(mContext.getSystemService(TelephonyManager.class));
+        } catch (Exception ex) {
+            Log.e(TAG, "rejectCall failed: " + ex);
+        }
+    }
+}
+```
+
+**Detecting which SIM an incoming call is on (DSDS):**
+
+```java
+private int getIncomingCallSimSlot() {
+    SubscriptionManager sm = (SubscriptionManager)
+        mContext.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+    List<SubscriptionInfo> subs = sm.getActiveSubscriptionInfoList();
+    for (SubscriptionInfo info : subs) {
+        TelephonyManager tm =
+            mContext.getSystemService(TelephonyManager.class)
+                    .createForSubscriptionId(info.getSubscriptionId());
+        if (tm.getCallState() == TelephonyManager.CALL_STATE_RINGING) {
+            return info.getSimSlotIndex();   // 0 = SIM1, 1 = SIM2
+        }
+    }
+    return 0;   // fallback: assume SIM1
+}
+```
+
+**Filter stored in SharedPreferences AND config.json** so it survives APK restart and
+daemon restart independently. On boot, APK reads from SharedPreferences; daemon reads
+from config.json (shared source of truth for filter restoration).
+
+---
+
+### 6.3 SMS SIM Indicator
+
+SMS IPC already includes `sim_slot` field (Section 4). Server broadcasts as-is.
+Dashboard renders SIM badge: slot 0 → "SIM 1", slot 1 → "SIM 2".
+
+**T_SMS payload (updated):**
+
+```json
+{
+  "type": "sms",
+  "ver": 1,
+  "from": "+84901234567",
+  "body": "Hello",
+  "sim_slot": 0,
+  "sim_carrier": "Viettel",
+  "timestamp": 1750000000000
+}
+```
+
+`sim_carrier` added — from `SubscriptionInfo.getCarrierName()`. Zero extra permission
+needed (already has `READ_PHONE_STATE`).
+
+---
+
+### 6.4 T_DEVICE_INFO (0x08) — Sent on Connect
+
+APK collects and sends once when TCP connection to server is established. Server caches
+and serves to newly connected dashboard WebSocket clients.
+
+**Payload:**
+
+```json
+{
+  "model":           "Redmi Note 10 Pro",
+  "manufacturer":    "Xiaomi",
+  "android_version": "16",
+  "sdk_int":         36,
+  "rom":             "lineage_sweet-userdebug 16 ...",
+  "sims": [
+    {
+      "slot":         0,
+      "carrier":      "Viettel",
+      "display_name": "SIM 1",
+      "country_iso":  "vn",
+      "number":       "+84901234567"
+    },
+    {
+      "slot":         1,
+      "carrier":      "Mobifone",
+      "display_name": "SIM 2",
+      "country_iso":  "vn",
+      "number":       ""
+    }
+  ],
+  "active_sim_filter": [0, 1],
+  "module_version":    "v4.0.0"
+}
+```
+
+**APK collection:**
+
+```java
+// On TCP connect (IPCClient notifies AudioBridgeService):
+private JSONObject buildDeviceInfo() {
+    JSONObject info = new JSONObject();
+    info.put("model",           Build.MODEL);
+    info.put("manufacturer",    Build.MANUFACTURER);
+    info.put("android_version", Build.VERSION.RELEASE);
+    info.put("sdk_int",         Build.VERSION.SDK_INT);
+    info.put("rom",             Build.DISPLAY);
+    info.put("module_version",  BuildConfig.VERSION_NAME);
+
+    JSONArray simsArr = new JSONArray();
+    SubscriptionManager sm = getSystemService(SubscriptionManager.class);
+    for (SubscriptionInfo sub : sm.getActiveSubscriptionInfoList()) {
+        JSONObject s = new JSONObject();
+        s.put("slot",         sub.getSimSlotIndex());
+        s.put("carrier",      sub.getCarrierName());
+        s.put("display_name", sub.getDisplayName());
+        s.put("country_iso",  sub.getCountryIso());
+        s.put("number",       sub.getNumber() != null ? sub.getNumber() : "");
+        simsArr.put(s);
+    }
+    info.put("sims", simsArr);
+    info.put("active_sim_filter", simFilterToJsonArray(mSimFilter));
+    return info;
+}
+```
+
+**Daemon wraps in frame:**
+
+```c
+// When APK sends {"type":"device_info", ...} over IPC:
+case IPC_DEVICE_INFO:
+    send_frame(T_DEVICE_INFO, payload.data(), payload.size());
+    break;
+```
+
+---
+
+### 6.5 T_DEVICE_STATUS (0x09) — Periodic via PING
+
+Sent by daemon/APK **every time it receives T_PING** from server. Co-locates status
+update with existing heartbeat — no new timer needed.
+
+**Payload:**
+
+```json
+{
+  "battery_pct":     85,
+  "battery_charging": true,
+  "sims": [
+    {
+      "slot":         0,
+      "signal_bars":  3,
+      "signal_dbm":  -75,
+      "network_type": "LTE",
+      "carrier":      "Viettel"
+    },
+    {
+      "slot":         1,
+      "signal_bars":  2,
+      "signal_dbm":  -90,
+      "network_type": "WCDMA",
+      "carrier":      "Mobifone"
+    }
+  ]
+}
+```
+
+**APK collection:**
+
+```java
+// Battery:
+Intent battery = mContext.registerReceiver(null,
+    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+int level    = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+int scale    = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+int pct      = (int)(level * 100f / scale);
+boolean charging = battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+    == BatteryManager.BATTERY_STATUS_CHARGING;
+
+// Signal — per SIM (requires READ_PHONE_STATE):
+for (SubscriptionInfo sub : sm.getActiveSubscriptionInfoList()) {
+    TelephonyManager tm = telephonyManager
+        .createForSubscriptionId(sub.getSubscriptionId());
+    SignalStrength ss = tm.getSignalStrength();
+    int bars = 0, dbm = -120;
+    if (ss != null && !ss.getCellSignalStrengths().isEmpty()) {
+        CellSignalStrength css = ss.getCellSignalStrengths().get(0);
+        bars = css.getLevel();    // 0–4
+        dbm  = css.getDbm();
+    }
+    // getNetworkType() → TelephonyManager.NETWORK_TYPE_LTE etc.
+}
+```
+
+---
+
+### 6.6 Dashboard UI Requirements
+
+**Device info panel** (shown at top of dashboard, populated from T_DEVICE_INFO):
+
+```
+┌─────────────────────────────────────────────────┐
+│ Redmi Note 10 Pro · Android 16 · LineageOS 23.2 │
+│ Module v4.0.0                                    │
+│                                                  │
+│ SIM 1: Viettel · +84901234567 · ████░ · LTE    │ ← signal bars
+│ SIM 2: Mobifone · (no number) · ███░░ · 3G     │
+│                                                  │
+│ 🔋 85% ⚡ charging          [SIM filter: SIM1▼] │
+└─────────────────────────────────────────────────┘
+```
+
+**SIM filter control:** Dropdown in device panel. Options:
+- "Accept all SIMs" → `allowed_sims: [0, 1]`
+- "SIM 1 only" → `allowed_sims: [0]`
+- "SIM 2 only" → `allowed_sims: [1]`
+- "Reject all" → `allowed_sims: []` (DND mode)
+
+On change → server sends T_CONTROL to device → APK saves filter.
+
+**SMS feed** shows "SIM 1" or "SIM 2" badge beside each message with carrier name:
+
+```
+[SIM 1 · Viettel] From: +84901234567 — "Hello" — 14:32
+[SIM 2 · Mobifone] From: +84912345678 — "OK" — 14:35
+```
+
+---
+
+### 6.7 Files Added/Modified for Section 6
+
+| File | Change |
+|---|---|
+| `jni/audio_bridge.h` | Add `T_DEVICE_INFO = 0x08`, `T_DEVICE_STATUS = 0x09` |
+| `jni/audio_bridge.cpp` | Handle `IPC_DEVICE_INFO`, `IPC_DEVICE_STATUS` → forward as frames; forward T_CONTROL `set_sim_filter` → APK |
+| `java/com/audiobridge/TelephonyHelper.java` | Add SIM filter check on ringing, `rejectCall()`, `buildDeviceStatus()`, `buildDeviceInfo()` |
+| `java/com/audiobridge/AudioBridgeService.java` | Collect + send T_DEVICE_INFO on connect; send T_DEVICE_STATUS on PING receipt |
+| `server/main.py` | Cache T_DEVICE_INFO per device; broadcast T_DEVICE_STATUS to UI WebSocket; handle `set_sim_filter` T_CONTROL forwarding |
+| `server/dashboard.html` | Device info panel, SIM filter dropdown, SMS SIM badges, battery/signal display |
+
+---
+
 ## Files Modified / Created
 
 | File | Action | Reason |
