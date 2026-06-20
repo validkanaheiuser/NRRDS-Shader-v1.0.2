@@ -259,7 +259,7 @@ textarea{resize:vertical;min-height:70px;font-size:.78rem;}
 <div id="app" v-cloak>
 
 <!-- Incoming call modal (shown only for selected device) -->
-<div v-if="callPanel === 'ringing-in'" class="incall-overlay" @click.self="/* dismiss on backdrop click is intentional */">
+<div v-if="callPanel === 'ringing-in'" class="incall-overlay">
   <div class="incall-modal">
     <div class="incall-label">incoming call</div>
     <div class="incall-num">{{ selectedDevice?.call?.number || 'unknown' }}</div>
