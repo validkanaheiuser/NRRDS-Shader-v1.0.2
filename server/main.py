@@ -664,6 +664,11 @@ async def ws_audio(
     dir=speak   client → server (phone virtual mic)
     dir=both    full duplex
     """
+    token = ws.query_params.get("token", "") or \
+            ws.headers.get("authorization", "").removeprefix("Bearer ")
+    if not verify_ws_token(token):
+        await ws.close(code=4401, reason="Unauthorized")
+        return
     if device_id not in mgr.devices:
         await ws.close(code=4404)
         return

@@ -46,6 +46,11 @@ def test_ws_token_invalid():
 
 def test_token_missing_env(monkeypatch):
     monkeypatch.delenv("AUDIO_BRIDGE_TOKEN", raising=False)
-    import importlib, server.main as m
-    # Should raise on import or have a None/empty token
-    # Exact behavior depends on implementation
+    import importlib
+    import sys
+    # Remove the cached module so it re-executes module-level code on reload
+    sys.modules.pop("server.main", None)
+    with pytest.raises(RuntimeError, match="AUDIO_BRIDGE_TOKEN"):
+        import server.main  # noqa: F401
+    # Restore for subsequent tests
+    sys.modules.pop("server.main", None)
