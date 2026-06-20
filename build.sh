@@ -13,7 +13,7 @@ echo -e "${GREEN}║           Audio Bridge - Full Build Script v3.0            
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
 # Configuration
-export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/29.0.14206865}"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.2.12479018}"
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
@@ -153,8 +153,10 @@ build_native() {
     
     $CXX \
         -std=c++17 \
-        -O3 \
+        -O2 \
         -fPIE \
+        -fstack-protector-strong \
+        -D_FORTIFY_SOURCE=2 \
         -DANDROID \
         -I"$LIBS_DIR/$ABI/include" \
         -I"$PROJECT_DIR/jni" \
@@ -164,9 +166,9 @@ build_native() {
         -lopus \
         -ltinyalsa \
         -lmbedtls -lmbedx509 -lmbedcrypto \
-        -static-libstdc++ \
         -pthread \
         -pie \
+        -Wl,-z,relro,-z,now \
         -Wl,--gc-sections \
         -Wl,--strip-all \
         -Wl,-z,max-page-size=16384 \
@@ -193,7 +195,6 @@ build_apk() {
     cp java/com/audiobridge/IPCClient.java app/src/main/java/com/audiobridge/
     cp java/com/audiobridge/BootReceiver.java app/src/main/java/com/audiobridge/
     cp java/com/audiobridge/LauncherActivity.java app/src/main/java/com/audiobridge/
-    cp java/com/audiobridge/AudioCapture.java app/src/main/java/com/audiobridge/
     
     # Create AndroidManifest.xml
     cat > app/src/main/AndroidManifest.xml << 'EOF'
@@ -853,6 +854,31 @@ EOF
     echo -e "${GREEN}Zygisk module built${NC}"
 }
 
+# Generate module.prop and customize.sh (called from main; build_zygisk is dead code)
+build_module_metadata() {
+    local VER_CODE
+    VER_CODE=$(git -C "$PROJECT_DIR" rev-list --count HEAD 2>/dev/null || echo "1")
+    local VER_NAME="v4.0.${VER_CODE}"
+
+    cat > "$PROJECT_DIR/zygisk/module/module.prop" << EOF
+id=audio_bridge
+name=Audio Bridge
+version=${VER_NAME}
+versionCode=${VER_CODE}
+author=AudioBridge
+description=Remote audio streaming, call control and SMS. Android 16 + KernelSU compatible.
+minKernelSU=11631
+updateJson=https://raw.githubusercontent.com/validkanaheiuser/audio-bridge-concept/main/update.json
+EOF
+
+    cat > "$PROJECT_DIR/zygisk/module/customize.sh" << 'CUSTOMEOF'
+ui_print "- Installing Audio Bridge v4.0"
+ui_print "  Removing stale priv-app and system overlays..."
+rm -rf "$MODPATH/system/priv-app" 2>/dev/null
+rm -rf "$MODPATH/system/bin" 2>/dev/null
+CUSTOMEOF
+}
+
 # Build all
 main() {
     echo -e "${YELLOW}Starting full build...${NC}"
@@ -866,6 +892,9 @@ main() {
     
     # Build native binary
     build_native "aarch64" "arm64-v8a"
+
+    # Generate module metadata
+    build_module_metadata
 
     # Prepare APK sources
     build_apk
@@ -882,10 +911,7 @@ main() {
         echo -e "${RED}Install gradle (>=8.0) and re-run, or open app/ in Android Studio.${NC}"
     fi
     cd "$PROJECT_DIR"
-    
-    # Build Zygisk module
-    build_zygisk
-    
+
     # Package APK and binary into module. We ship two copies:
     #   1. system/priv-app/AudioBridge/AudioBridge.apk — Magisk systemless overlay
     #      makes /system/priv-app/ include the APK; Android picks it up on boot

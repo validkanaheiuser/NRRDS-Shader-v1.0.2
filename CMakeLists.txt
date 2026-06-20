@@ -1,30 +1,18 @@
 cmake_minimum_required(VERSION 3.18)
-project(AudioBridge VERSION 3.0.0 LANGUAGES C CXX)
+project(AudioBridge VERSION 4.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Android NDK settings
 if(ANDROID)
     set(CMAKE_ANDROID_API 28)
-    set(CMAKE_ANDROID_STL c++_shared)
+    set(CMAKE_ANDROID_STL c++_static)
 endif()
 
-# ──────────────────────────────────────────────────────────────────────────
-# Find dependencies
-# ──────────────────────────────────────────────────────────────────────────
-
-# Opus
 find_library(OPUS_LIB opus PATHS ${CMAKE_SOURCE_DIR}/libs/${ANDROID_ABI})
 find_path(OPUS_INCLUDE opus/opus.h PATHS ${CMAKE_SOURCE_DIR}/libs/${ANDROID_ABI}/include)
-
-# TinyALSA
 find_library(TINYALSA_LIB tinyalsa PATHS ${CMAKE_SOURCE_DIR}/libs/${ANDROID_ABI})
 find_path(TINYALSA_INCLUDE tinyalsa/asoundlib.h PATHS ${CMAKE_SOURCE_DIR}/libs/${ANDROID_ABI}/include)
-
-# ──────────────────────────────────────────────────────────────────────────
-# Main native binary
-# ──────────────────────────────────────────────────────────────────────────
 
 add_executable(audio-bridge
     jni/audio_bridge.cpp
@@ -43,53 +31,9 @@ target_link_libraries(audio-bridge
     pthread
 )
 
-target_compile_options(audio-bridge PRIVATE -O3 -fPIE)
+target_compile_options(audio-bridge PRIVATE
+    -O2 -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2
+)
 set_target_properties(audio-bridge PROPERTIES
-    LINK_FLAGS "-pie -Wl,--gc-sections -Wl,--strip-all"
-)
-
-# ──────────────────────────────────────────────────────────────────────────
-# JNI shared library
-# ──────────────────────────────────────────────────────────────────────────
-
-add_library(audiobridge SHARED
-    jni/jni_bridge.cpp
-)
-
-target_include_directories(audiobridge PRIVATE
-    ${CMAKE_SOURCE_DIR}/jni
-)
-
-target_link_libraries(audiobridge
-    log
-)
-
-target_compile_options(audiobridge PRIVATE -O3 -fPIC)
-
-# ──────────────────────────────────────────────────────────────────────────
-# Zygisk module
-# ──────────────────────────────────────────────────────────────────────────
-
-add_library(zygisk_module SHARED
-    zygisk/src/zygisk_module.cpp
-)
-
-target_include_directories(zygisk_module PRIVATE
-    ${CMAKE_SOURCE_DIR}/zygisk
-    ${CMAKE_SOURCE_DIR}/jni
-)
-
-target_link_libraries(zygisk_module
-    log
-    # Do NOT link c++_static / c++_shared here.
-    # NDK 29's libc++_static introduces TLS relocations that ZygiskNext's
-    # restricted linker inside zygote cannot handle → zygote crash → bootloop.
-    # All C++ features used by this module (std::atomic, std::min) are
-    # header-only on ARM64; operator new/delete come from bionic libc.so.
-)
-
-target_compile_options(zygisk_module PRIVATE
-    -O3 -fPIC
-    -fno-exceptions -fno-rtti -fno-threadsafe-statics
-    -fvisibility=hidden -fvisibility-inlines-hidden
+    LINK_FLAGS "-pie -Wl,-z,relro,-z,now -Wl,--gc-sections -Wl,--strip-all -Wl,-z,max-page-size=16384"
 )
