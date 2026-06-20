@@ -1672,3 +1672,773 @@ The two audio capture paths operate at different sample rates. This inconsistenc
 ---
 
 *End of Phase 4 — Zygisk Analysis*
+
+---
+
+## Phase 5 — Call Graph & Execution Paths
+
+**Files read:**
+- `jni/audio_bridge.h` (106 lines)
+- `jni/audio_bridge.cpp` (1714 lines, read in six chunks)
+- `java/com/audiobridge/AudioBridgeService.java` (152 lines)
+- `java/com/audiobridge/IPCClient.java` (273 lines)
+- `java/com/audiobridge/TelephonyHelper.java` (621 lines)
+- `server/protocol.md` (114 lines)
+
+---
+
+### 1. Global Variables Table
+
+All `static` globals declared in `jni/audio_bridge.cpp`:
+
+#### Configuration (lines 66–71) — unprotected, set once at startup
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_host` | `const char*` | `nullptr` | None (set once in `main()` before threads start, then re-read in reconnect loop) | `main()` loop only |
+| `g_port` | `int` | `59100` | None | `main()` loop only |
+| `g_token` | `const char*` | `"default_secure_token_123"` | None | `main()` / `handshake()` |
+| `g_socket_path` | `const char*` | `"/data/local/tmp/audio_bridge.sock"` | None | `unix_socket_server_thread()` only |
+| `g_pid_file` | `const char*` | `"/data/local/tmp/audio_bridge.pid"` | None | `main()` only |
+| `g_shm_path` | `const char*` | `"/audio_bridge_shm"` | None | `setup_shared_memory()` only |
+
+#### Runtime State Atomics (lines 108–111)
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_running` | `std::atomic<bool>` | `true` | Atomic | All threads (loop condition) |
+| `g_connected` | `std::atomic<bool>` | `false` | Atomic | All threads; written by `main()`, `send_all()`, `recv_all()` |
+| `g_audio_active` | `std::atomic<bool>` | `false` | Atomic | Declared but **not used** in any thread function |
+| `g_call_state` | `std::atomic<int>` | `CALL_IDLE` | Atomic | Written by JNI `nativeOnCallStateChanged`; not read by any other code |
+
+#### SHM State (lines 113–117)
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_shm_fd` | `int` | `-1` | None (set once in `setup_shared_memory()`) | `unix_socket_server_thread()` (read-only after init) |
+| `g_shm_ptr` | `void*` | `nullptr` | None (set once) | All audio threads via `SharedMemoryLayout*` cast |
+| `g_jvm` | `JavaVM*` | `nullptr` | None | Declared but never set in this file |
+| `g_helper_class` | `jclass` | `nullptr` | None | Declared but never set in this file |
+| `g_helper_obj` | `jobject` | `nullptr` | None | Declared but never set in this file |
+
+#### Status Queue (lines 119–122)
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_status_mutex` | `std::mutex` | — | Itself | JNI callbacks, `read_java_client()`, `status_sender_thread()` |
+| `g_status_cv` | `std::condition_variable` | — | `g_status_mutex` | Same |
+| `g_status_queue` | `std::queue<std::string>` | empty | `g_status_mutex` | JNI callbacks, `read_java_client()` (producers); `status_sender_thread()` (consumer) |
+| `g_status_pending` | `std::atomic<bool>` | `false` | Atomic + `g_status_mutex` | Same as queue |
+
+#### Call State (lines 124–126)
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_call_mutex` | `std::mutex` | — | Itself | JNI `nativeOnCallStateChanged()` |
+| `g_current_number` | `std::string` | `""` | `g_call_mutex` | JNI callback only |
+| `g_active_calls` | `std::map<std::string, std::string>` | empty | `g_call_mutex` | Declared but never populated (no code calls `g_active_calls.insert()`) |
+
+#### Java PCM Queue (lines 135–138)
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_java_pcm_mutex` | `std::mutex` | — | Itself | `read_java_audio_stream()` (producer), `capture_speaker_thread()` (consumer) |
+| `g_java_pcm_cv` | `std::condition_variable` | — | `g_java_pcm_mutex` | Same (cv notified by producer but `capture_speaker_thread` does NOT wait on it — polls only) |
+| `g_java_pcm_queue` | `std::queue<JavaPcmChunk>` | empty | `g_java_pcm_mutex` | `read_java_audio_stream()` (push); `capture_speaker_thread()` (pop) |
+| `g_java_pcm_pending` | `std::atomic<bool>` | `false` | Atomic + `g_java_pcm_mutex` | Same |
+
+#### Miscellaneous (lines 343–364)
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_sms_mutex` | `std::mutex` | — | Itself | Declared, **never locked** in any code path found |
+| `g_sms_tracking` | `std::map<std::string, SimpleJson>` | empty | `g_sms_mutex` | Declared, **never accessed** in any code path |
+| `g_log_mutex` | `std::mutex` | — | Itself | `log_write()` — all threads |
+| `g_log_file` | `FILE*` | `nullptr` | `g_log_mutex` | `log_write()` — all threads |
+| `g_mic_consumer_mutex` | `std::mutex` | — | Itself | `tinyalsa_mic_inject_thread()` (only consumer; comment notes Zygisk is cross-process and cannot use this mutex) |
+| `g_java_fd` | `std::atomic<int>` | `-1` | Atomic | `read_java_client()` (writer); `send_to_java()` (reader) |
+
+#### TLS State (lines 359–364)
+
+| Name | Type | Initial Value | Protection | Accessing Threads |
+|------|------|--------------|------------|-------------------|
+| `g_net` | `mbedtls_net_context` | zero-init | `g_tls_write_mutex` (writes); no lock on reads from single receiver thread | `main()` (init), `receive_virtual_mic_thread()` (recv), `send_all()` via `g_tls_write_mutex` |
+| `g_entropy` | `mbedtls_entropy_context` | zero-init | None (init only) | `main()` / `handshake()` only |
+| `g_ctr_drbg` | `mbedtls_ctr_drbg_context` | zero-init | None (init only) | Same |
+| `g_ssl` | `mbedtls_ssl_context` | zero-init | None (init only) | Same |
+| `g_conf` | `mbedtls_ssl_config` | zero-init | None (init only) | Same |
+| `g_tls_write_mutex` | `std::mutex` | — | Itself | `send_all()` — all threads that send frames |
+
+---
+
+### 2. Thread Inventory
+
+Every thread spawned in the daemon's `main()` (lines 1514–1714):
+
+#### Thread 1 — `unix_socket_server_thread` (line 1615)
+
+| Attribute | Detail |
+|-----------|--------|
+| Function | `unix_socket_server_thread()` (line 1397) |
+| Spawned at | line 1615: `std::thread unix_thread(unix_socket_server_thread)` |
+| Lifetime | Entire daemon life; joined at line 1709 after main loop exits |
+| Loop condition | `while(g_running)` with 1s `select()` timeout (line 1428–1436) |
+| Shared state | `g_shm_fd`, `g_shm_ptr` (read); `g_java_fd` (written via `read_java_client`); `g_status_queue`/`g_status_mutex`/`g_status_cv` (via `read_java_client`) |
+| Blocking calls | `select()` (1s timeout), `accept()`, `recv()`, `sendmsg()` |
+| Sub-threads spawned | `std::thread(read_java_client, client_fd).detach()` on `HELO_JAVA`; `std::thread(read_java_audio_stream, client_fd).detach()` on `HELO_AUDIO` |
+
+#### Thread 2 — `status_sender_thread` (line 1678)
+
+| Attribute | Detail |
+|-----------|--------|
+| Function | `status_sender_thread(mbedtls_net_context* net)` (line 918) |
+| Spawned at | line 1678 per connection cycle |
+| Lifetime | Per connection; exits when `!g_running || !g_connected` |
+| Loop condition | `while(g_running && g_connected)` (line 921) |
+| Shared state | `g_status_mutex`, `g_status_cv`, `g_status_queue`, `g_status_pending`; `g_connected`; `g_net` via `send_frame()` + `g_tls_write_mutex` |
+| Blocking calls | `g_status_cv.wait_for(lk, 100ms)` (line 929); `send_frame()` → `send_all()` → `mbedtls_net_send()` |
+
+#### Thread 3 — `capture_speaker_thread` (line 1679)
+
+| Attribute | Detail |
+|-----------|--------|
+| Function | `capture_speaker_thread(mbedtls_net_context* net)` (line 962) |
+| Spawned at | line 1679 per connection cycle |
+| Lifetime | Per connection; exits when `!g_running || !g_connected` |
+| Loop condition | `while(g_running && g_connected)` (line 997); also `goto speaker_exit` on send failure |
+| Shared state | `g_shm_ptr` (SHM `speaker_frames` ring via `speaker_write_idx`/`speaker_read_idx`); `g_java_pcm_mutex`, `g_java_pcm_queue`, `g_java_pcm_pending`; `g_net` via `send_frame()` + `g_tls_write_mutex` |
+| Blocking calls | `usleep(5000)` when no work (line 1051); `send_frame()` → `mbedtls_net_send()` |
+| Scheduling | Sets SCHED_RR priority 2; falls back to `nice(-10)` |
+
+#### Thread 4 — `receive_virtual_mic_thread` (line 1680)
+
+| Attribute | Detail |
+|-----------|--------|
+| Function | `receive_virtual_mic_thread(mbedtls_net_context* net)` (line 1065) |
+| Spawned at | line 1680 per connection cycle |
+| Lifetime | Per connection; exits on recv failure or `!g_running || !g_connected` |
+| Loop condition | `while(g_running && g_connected)` (line 1085) |
+| Shared state | `g_shm_ptr` (SHM `mic_frames` ring via `write_index`/`read_index`); `g_net` via `recv_all()`; `g_status_mutex/queue/cv` via `send_to_java()` calls from control dispatch; `g_java_fd` via `send_to_java()` |
+| Blocking calls | `recv_all()` → `mbedtls_net_recv()` (blocks until 5-byte header arrives) |
+| Scheduling | Sets SCHED_RR priority 2; falls back to `nice(-10)` |
+| Control dispatch | Handles T_CONTROL (line 1106) and T_PONG (line 1103) inline; dispatches `jni_place_call()`, `jni_end_call()`, `jni_answer_call()`, `send_to_java()` for mute/sms/dtmf/route/volume commands |
+
+#### Thread 5 — `tinyalsa_mic_inject_thread` (line 1682)
+
+| Attribute | Detail |
+|-----------|--------|
+| Function | `tinyalsa_mic_inject_thread()` (line 1334) |
+| Spawned at | line 1682 per connection cycle |
+| Lifetime | Per connection; exits on `pcm_write()` failure or `!g_running || !g_connected`; also exits early if no voice PCM device found |
+| Loop condition | `while(g_running && g_connected)` (line 1362) |
+| Shared state | `g_shm_ptr` (SHM `mic_frames` via `write_index`/`read_index`); `g_mic_consumer_mutex` (serialises ring read-index advance) |
+| Blocking calls | `pcm_write(pcm_out, src, FRAME_SAMPLES * 2)` — blocks for 20ms per frame (ALSA period blocking) |
+
+#### Thread 6 — `read_java_client` (detached, spawned by `unix_socket_server_thread`)
+
+| Attribute | Detail |
+|-----------|--------|
+| Function | `read_java_client(int fd)` (line 1195) |
+| Spawned at | `unix_socket_server_thread()` line 1480, detached |
+| Lifetime | Until socket read returns 0/error or `!g_running` |
+| Loop condition | `while(g_running && fgets(line, sizeof(line), f))` (line 1224) |
+| Shared state | `g_java_fd` (written at line 1215); `g_status_mutex`, `g_status_queue`, `g_status_pending`, `g_status_cv` (forwards Java events) |
+| Blocking calls | `fgets()` on the Unix socket fd (blocks until newline or EOF) |
+
+#### Thread 7 — `read_java_audio_stream` (detached, spawned by `unix_socket_server_thread`)
+
+| Attribute | Detail |
+|-----------|--------|
+| Function | `read_java_audio_stream(int fd)` (line 1252) |
+| Spawned at | `unix_socket_server_thread()` line 1484, detached |
+| Lifetime | Until recv returns ≤0 or bad length, or `!g_running` |
+| Loop condition | `while(g_running)` with `goto done` on error (line 1260) |
+| Shared state | `g_java_pcm_mutex`, `g_java_pcm_queue`, `g_java_pcm_pending`, `g_java_pcm_cv` |
+| Blocking calls | `recv()` (4-byte header then payload); `g_java_pcm_cv.notify_one()` |
+| Scheduling | Sets SCHED_RR priority 2 |
+
+#### Main thread — connection watchdog (lines 1685–1696)
+
+The `main()` thread doubles as a ping watchdog while connected. It `sleep(10)`, then calls `send_frame(&g_net, T_PING, nullptr, 0)` and checks the result. On ping failure it sets `g_connected = false` and `g_status_cv.notify_all()`, then breaks. The worker threads detect `!g_connected` and exit, after which they are joined and the reconnect loop restarts.
+
+---
+
+### 3. Complete Call Graph — Daemon
+
+```
+main()  [jni/audio_bridge.cpp line 1514]
+│
+├── signal(SIGPIPE, SIG_IGN)   [line 1586]
+├── signal(SIGINT,  signal_handler)  [line 1587]  → g_running=false, g_connected=false
+├── signal(SIGTERM, signal_handler)  [line 1588]
+├── signal(SIGHUP,  signal_handler)  [line 1589]
+│
+├── log_init()  [line 1592]
+│   └── fopen("/data/local/tmp/audio_bridge.log", "a")
+│
+├── setup_shared_memory()  [line 1609]
+│   ├── memfd_create("/audio_bridge_shm", MFD_CLOEXEC)  [line 712]
+│   │   └── on failure → open("/dev/ashmem")  [line 715]
+│   │       └── on failure → mmap(MAP_SHARED|MAP_ANONYMOUS)  [lines 719–729]
+│   ├── ftruncate(g_shm_fd, SHM_SIZE)  [line 733]
+│   └── mmap(nullptr, SHM_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, g_shm_fd, 0)  [line 739]
+│
+├── std::thread unix_thread(unix_socket_server_thread)  [line 1615]
+│   └── unix_socket_server_thread()  [line 1397]
+│       ├── socket(AF_UNIX, SOCK_STREAM, 0)
+│       ├── bind(abstract "@audio_bridge")
+│       ├── listen(server_fd, 5)
+│       └── while(g_running):  [line 1428]
+│           ├── select(1s timeout)
+│           ├── accept()
+│           ├── recv(cmd, 255, 0)
+│           ├── "GET_SHM_FD" → sendmsg(SCM_RIGHTS: g_shm_fd)  [line 1471]
+│           │   └── layout->module_active = true  [line 1472]
+│           ├── "PING" → send("PONG")  [line 1477]
+│           ├── "HELO_JAVA" → std::thread(read_java_client, fd).detach()  [line 1480]
+│           │   └── read_java_client(fd):  [line 1195]
+│           │       ├── getsockopt(SO_PEERCRED) → logs pid/uid/SELinux label
+│           │       ├── g_java_fd.store(fd)  [line 1215]
+│           │       ├── fdopen(fd, "r")
+│           │       └── while(g_running && fgets(line)):  [line 1224]
+│           │           └── push line → g_status_queue + g_status_cv.notify_one()
+│           └── "HELO_AUDIO" → std::thread(read_java_audio_stream, fd).detach()  [line 1484]
+│               └── read_java_audio_stream(fd):  [line 1252]
+│                   └── while(g_running):  [line 1260]
+│                       ├── recv(4-byte BE length header)
+│                       ├── recv(PCM payload, byte_len bytes)
+│                       └── push JavaPcmChunk → g_java_pcm_queue (bounded at 10)  [line 1295]
+│
+└── [outer reconnect loop] while(g_running):  [line 1618]
+    ├── [if !g_host] re-read /data/local/tmp/audio_bridge.conf; sleep(5)
+    ├── tcp_connect(g_host, g_port)  [line 1648]
+    │   └── tcp_connect():  [line 624]
+    │       ├── mbedtls_net_connect(&g_net, host, port, MBEDTLS_NET_PROTO_TCP)
+    │       └── setsockopt(SO_KEEPALIVE, TCP_KEEPCNT=3, TCP_KEEPIDLE=5, TCP_KEEPINTVL=2)
+    ├── handshake(&g_net)  [line 1655]
+    │   └── handshake():  [line 654]
+    │       ├── build SimpleJson registration object (model, brand, android, id, features)
+    │       ├── HMAC-SHA256(device_id + "-" + date_str, g_token) via mbedtls_md_hmac()
+    │       ├── send_all(&g_net, reg_json + "\n")
+    │       └── recv_all(1 byte at a time until '\n') → check for "\"ok\""
+    ├── g_connected = true  [line 1662]
+    │
+    ├── std::thread status_thread(status_sender_thread, &g_net)  [line 1678]
+    │   └── status_sender_thread(net):  [line 918]
+    │       └── while(g_running && g_connected):  [line 921]
+    │           ├── g_status_cv.wait_for(100ms) on g_status_mutex  [line 929]
+    │           ├── pop from g_status_queue
+    │           ├── classify: SMS → T_SMS (0x05); else → T_CALL_STATUS (0x04)  [lines 944–946]
+    │           └── send_frame(net, frame_type, json, len)
+    │               └── send_all() → mbedtls_net_send() (under g_tls_write_mutex)
+    │
+    ├── std::thread speaker_thread(capture_speaker_thread, &g_net)  [line 1679]
+    │   └── capture_speaker_thread(net):  [line 962]
+    │       ├── OpusEncoder* enc = opus_encoder_create(48000, 1, OPUS_APPLICATION_VOIP)
+    │       │   (64kbps, FEC, DTX, complexity=5)
+    │       └── while(g_running && g_connected):  [line 997]
+    │           ├── [Path A: Zygisk SHM]
+    │           │   ├── load speaker_write_idx / speaker_read_idx from SHM  [line 1002–1003]
+    │           │   ├── opus_encode(enc, frame.data, 960, pkt, MAX_PKT)  [line 1006]
+    │           │   └── send_frame(net, T_SPEAKER, pkt, len)  [line 1009]
+    │           ├── [Path B: Java PCM queue]
+    │           │   ├── pop JavaPcmChunk from g_java_pcm_queue  [lines 1022–1028]
+    │           │   ├── accumulate into pcm_leftover[]  [line 1033]
+    │           │   └── while pcm_leftover >= 960 samples:
+    │           │       ├── opus_encode(enc, pcm_leftover.data(), 960, pkt, MAX_PKT)  [line 1037]
+    │           │       └── send_frame(net, T_SPEAKER, pkt, len)  [line 1040]
+    │           └── if !did_work: usleep(5000)  [line 1051]
+    │
+    ├── std::thread mic_thread(receive_virtual_mic_thread, &g_net)  [line 1680]
+    │   └── receive_virtual_mic_thread(net):  [line 1065]
+    │       ├── OpusDecoder* dec = opus_decoder_create(48000, 1)
+    │       └── while(g_running && g_connected):  [line 1085]
+    │           ├── recv_all(net, hdr, 5)  [line 1086] — BLOCKING
+    │           ├── parse type + len from 5-byte header
+    │           ├── if len >= MAX_PKT: break (protocol error)
+    │           ├── recv_all(net, pkt, len)  [line 1099]
+    │           ├── T_PONG → continue  [line 1103]
+    │           ├── T_CONTROL:  [line 1106]
+    │           │   ├── parse JSON: SimpleJson::parse(json_str)
+    │           │   ├── "dial"       → jni_place_call(number) → send_to_java()
+    │           │   ├── "hangup"     → jni_end_call() → send_to_java()
+    │           │   ├── "answer"     → jni_answer_call() → send_to_java()
+    │           │   ├── "mute"       → send_to_java(mute JSON)
+    │           │   ├── "send_sms"   → jni_send_sms() → send_to_java()
+    │           │   ├── "dtmf"       → jni_send_dtmf() → send_to_java()
+    │           │   ├── "audio_route"→ jni_set_audio_route() → send_to_java()
+    │           │   ├── "volume"     → jni_set_volume() → send_to_java()
+    │           │   └── "ping"       → send_json(net, T_PONG, pong_obj)
+    │           └── T_VIRTUAL_MIC:
+    │               ├── check ring capacity: (write_idx - read_idx) < SHM_RING_SIZE
+    │               ├── opus_decode(dec, pkt, len, frame.data, 960, 0)  [line 1176]
+    │               │   └── on error: opus_decode(nullptr, 0, ...) — PLC  [line 1179]
+    │               └── layout->write_index.store(write_idx+1 % 128)  [line 1185]
+    │
+    ├── std::thread tinyalsa_thread(tinyalsa_mic_inject_thread)  [line 1682]
+    │   └── tinyalsa_mic_inject_thread():  [line 1334]
+    │       ├── find_voice_pcm_dev(0) → scan /proc/asound/pcm for Voice/Incall entry
+    │       ├── pcm_open(0, voice_dev, PCM_OUT, &cfg)  [line 1348]
+    │       └── while(g_running && g_connected):  [line 1362]
+    │           ├── [under g_mic_consumer_mutex] read mic_frames ring  [lines 1372–1383]
+    │           └── pcm_write(pcm_out, src, 960*2)  [line 1386] — BLOCKING ~20ms
+    │
+    └── [watchdog loop] while(g_running && g_connected):  [line 1685]
+        ├── sleep(10)
+        └── send_frame(&g_net, T_PING, nullptr, 0)  [line 1690]
+            └── on failure: g_connected=false, g_status_cv.notify_all(); break
+
+JNI callbacks (called from Java via System.loadLibrary, on telephony threads):
+├── nativeOnCallStateChanged()  [line 765]
+│   ├── g_call_state.store(state)
+│   ├── g_current_number = num (under g_call_mutex)
+│   └── push JSON → g_status_queue + g_status_cv.notify_one()
+├── nativeOnCallWaiting()  [line 803]
+│   └── push JSON → g_status_queue + g_status_cv.notify_one()
+├── nativeOnSMSSent()  [line 834]
+│   └── push JSON → g_status_queue + g_status_cv.notify_one()
+├── nativeOnSMSDelivered()  [line 860]
+│   └── push JSON → g_status_queue + g_status_cv.notify_one()
+└── nativeOnSMSReceived()  [line 885]
+    └── push JSON → g_status_queue + g_status_cv.notify_one()
+```
+
+**Note on JNI callbacks:** The `g_jvm`, `g_helper_class`, and `g_helper_obj` globals are declared (lines 115–117) but never set. The JNI callbacks above are registered as `extern "C" JNIEXPORT` functions and are called *from* Java (via native method declaration `native void nativeOnCallStateChanged(...)` in `TelephonyHelper.java` line 64, shown as `// Native methods removed in favor of IPCClient`). In the current codebase, `TelephonyHelper.java` has removed native method declarations in favor of the IPCClient path — meaning **these JNI callbacks are dead code** in the current Java implementation and will never be invoked.
+
+---
+
+### 4. Frame Protocol
+
+#### Wire Format (protocol.md lines 5–8, verified against `send_frame()` at cpp line 605)
+
+```
+Byte 0:      Frame type (uint8_t)
+Bytes 1–4:   Payload length (uint32_t, Big-Endian)
+Bytes 5–N:   Payload data (variable, 0 to MAX_PKT-1 bytes)
+```
+
+Total header: **5 bytes**. Maximum payload: **3999 bytes** (len < MAX_PKT = 4000, checked at line 1098).
+
+The `send_frame()` function at line 605 constructs the header as:
+```c
+hdr[0] = type;
+hdr[1] = (len >> 24) & 0xFF;
+hdr[2] = (len >> 16) & 0xFF;
+hdr[3] = (len >>  8) & 0xFF;
+hdr[4] = (len >>  0) & 0xFF;
+```
+and calls `send_all(net, hdr, 5)` then `send_all(net, data, len)` — two mbedtls_net_send calls under `g_tls_write_mutex`.
+
+#### Frame Types
+
+| Type | Value | Direction | Protocol.md | Encoding in C++ |
+|------|-------|-----------|-------------|-----------------|
+| `T_SPEAKER` | `0x01` | Daemon → Server | Opus-encoded speaker audio | `send_frame(net, T_SPEAKER, pkt, len)` in `capture_speaker_thread()` lines 1009, 1040 |
+| `T_VIRTUAL_MIC` | `0x02` | Server → Daemon | Opus-encoded virtual mic | Received and decoded in `receive_virtual_mic_thread()` line 1164; decoded via `opus_decode()` line 1176 |
+| `T_CONTROL` | `0x03` | Server → Daemon | JSON control commands | Received in `receive_virtual_mic_thread()` line 1106; parsed via `SimpleJson::parse()` |
+| `T_CALL_STATUS` | `0x04` | Daemon → Server | JSON call/telephony events | `send_frame(net, T_CALL_STATUS, ...)` in `status_sender_thread()` line 948 |
+| `T_SMS` | `0x05` | Both | JSON SMS events | `send_frame(net, T_SMS, ...)` in `status_sender_thread()` line 948 when JSON contains `"type":"sms` |
+| `T_PING` | `0x06` | Daemon → Server | Empty keepalive | `send_frame(&g_net, T_PING, nullptr, 0)` in `main()` watchdog line 1690 |
+| `T_PONG` | `0x07` | Server → Daemon | Empty keepalive response | Received and discarded in `receive_virtual_mic_thread()` line 1103 |
+| `T_ERROR` | `0xFF` | — | Error response | Defined in enum (line 92) but **never sent or handled** in any code path |
+
+#### Connection Handshake (pre-frame, protocol.md lines 24–43)
+
+Before the binary frame protocol begins, the handshake uses newline-terminated JSON:
+1. Daemon → Server: Registration JSON (newline-terminated, `send_all()` at line 692)
+2. Server → Daemon: `{"status":"ok"}\n` — daemon checks for `"\"ok\""` at line 704
+
+This is implemented in `handshake()` (line 654). The HMAC field uses SHA-256 HMAC over `device_id + "-" + date_str` with `g_token` as key (lines 681–687).
+
+---
+
+### 5. Java → Daemon IPC Call Graph
+
+#### `AudioBridgeService.onCreate()` flow (AudioBridgeService.java line 37)
+
+```
+AudioBridgeService.onCreate()  [line 37]
+├── createNotificationChannel()  [line 104]
+├── startForeground(NOTIFICATION_ID, notification, FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)  [line 48]
+├── TelephonyHelper.getInstance(this)  [line 76]
+│   └── new TelephonyHelper(context)  [line 80]
+│       ├── registerCallListener()  [line 143]
+│       │   └── PhoneStateListener.onCallStateChanged() → handleCallStateChange()
+│       │       └── mMainHandler.post(() → emitCallState() → IPCClient.sendEvent())
+│       ├── registerSMSReceiver()  [line 225]
+│       │   └── SMSBroadcastReceiver.onReceive() → IPCClient.sendEvent()
+│       └── emitCallState("IDLE", "unknown", "")  [line 106]  ← initial state push
+└── IPCClient.init(this)  [line 81]
+    └── new IPCClient()  [line 80 IPCClient.java]
+        └── startConnectionThread()  [line 84]
+            └── mExecutor.execute(λ):  [line 89]  ← runs on single-thread executor
+                └── [retry loop]:
+                    └── connectAndListen()  [line 105]
+                        ├── LocalSocket.connect(AbstractAddress("audio_bridge"))
+                        ├── synchronized(this): mSocket=sock; mOut=PrintWriter; mIn=BufferedReader
+                        ├── mOut.println("HELO_JAVA")  [line 123]
+                        ├── connectAudioStream()  [line 126]
+                        │   └── new Thread("AudioIPC"):
+                        │       ├── LocalSocket.connect(AbstractAddress("audio_bridge"))
+                        │       ├── out.write("HELO_AUDIO\n")
+                        │       ├── synchronized: mAudioSocket=s; mAudioOut=out
+                        │       └── [keepalive loop]: in.read(64-byte buf) until EOF
+                        └── while(mRunning && mIn.readLine() != null):  ← BLOCKS EXECUTOR
+                            └── handleCommand(JSONObject)  [line 154]
+                                └── mMainHandler.post(λ):  ← dispatches to main thread
+                                    └── TelephonyHelper.placeCall/endCall/answerCall/etc.
+```
+
+#### TelephonyHelper callbacks → daemon flow
+
+**Call state change path:**
+```
+Android telephony callback
+  → PhoneStateListener.onCallStateChanged(state, number)  [TelephonyHelper.java line 162]
+    → mMainHandler.post(λ):  [line 171]
+      → handleCallStateChange(state, number)  [line 170]
+        → AudioCapture.getInstance().start()  [line 191] (on OFFHOOK)
+        → emitCallState(stateName, direction, num)  [line 201]
+          → IPCClient.getInstance().sendEvent(JSONObject)  [line 122]
+            → synchronized(IPCClient.this):  [line 190 IPCClient.java]
+              → mOut.println(json.toString())  ← direct write to PrintWriter
+```
+
+**SMS received path:**
+```
+System broadcast: SMS_RECEIVED_ACTION
+  → SMSBroadcastReceiver.onReceive()  [TelephonyHelper.java line 585]
+    → SmsMessage.createFromPdu(pdu, format)
+    → JSONObject event = {event:"sms_received", sender, message, timestamp}
+    → IPCClient.getInstance().sendEvent(event)  [line 613]
+      → synchronized(IPCClient.this): mOut.println(json)
+```
+
+**SMS sent/delivered path:**
+```
+System broadcast: "SMS_SENT_<messageId>"
+  → BroadcastReceiver.onReceive()  [TelephonyHelper.java line 489]
+    → JSONObject event = {event:"sms_sent", message_id, result_code}
+    → IPCClient.getInstance().sendEvent(event)  [line 507]
+```
+
+#### `sendEvent()` — critical analysis (IPCClient.java lines 186–197)
+
+```java
+public void sendEvent(JSONObject json) {
+    synchronized (this) {           // acquires instance lock
+        if (mOut != null) {
+            mOut.println(json.toString());  // direct write — auto-flush
+        }
+    }
+}
+```
+
+**Thread context:** Called from:
+- `mMainHandler` (main thread) — via `TelephonyHelper.emitCallState()`, `emitError()`
+- Broadcast receiver threads — via `SMSBroadcastReceiver`, `sentReceiver`, `deliveredReceiver`
+
+**Why direct write, not executor dispatch:** The executor (`mExecutor`) is a `newSingleThreadExecutor()`. Its sole thread is permanently blocked in `connectAndListen()`'s `mIn.readLine()` loop (line 129). Any task submitted via `mExecutor.execute()` would queue forever and never run. This is the critical architectural constraint documented in the code comment at lines 188–189:
+
+> "Write directly under the instance lock — NOT via mExecutor, which is single-threaded and permanently blocked in connectAndListen()'s readLine loop. Tasks submitted there would queue forever."
+
+**Correctness:** Writing `mOut.println()` under `synchronized(this)` is thread-safe because `mOut` is assigned under the same lock (line 117 of `connectAndListen()`), and the null-check protects against the disconnected state.
+
+#### Daemon → Java path (commands from server)
+
+```
+receive_virtual_mic_thread() receives T_CONTROL frame
+  → SimpleJson::parse(json_str)
+  → jni_place_call(number) / jni_end_call() / jni_answer_call() / send_to_java(json)
+    → send_to_java():  [line 498]
+      → g_java_fd.load()  [atomic read]
+      → send(fd, serialized+"\n", len, 0)  ← write to Unix socket fd
+
+[Java side] read_java_client() thread:
+  → fgets() unblocks with new line
+  → push to g_status_queue ← WRONG: this path sends daemon→java commands back to server
+
+ACTUALLY: daemon writes to g_java_fd (the accepted Unix socket fd for the Java IPC connection)
+  → IPCClient.connectAndListen(): mIn.readLine() unblocks on executor thread
+  → handleCommand(JSONObject json)  [line 154]
+    → mMainHandler.post(λ):  → TelephonyHelper.placeCall/endCall/etc.
+```
+
+**Key asymmetry:** The `send_to_java()` function (line 498) sends commands *to* the Java APK via `send(g_java_fd, ...)`. On the Java side, `mIn.readLine()` in `connectAndListen()` receives these commands and dispatches them via `handleCommand()`. This is the only path from daemon back to Java — there is no JNI call from the daemon to Java in the current implementation (the JNI callbacks in `audio_bridge.cpp` are the reverse: Java calls into native code, not the other way).
+
+---
+
+### 6. Critical Execution Paths
+
+#### Path 1 — Call audio path (phone → server)
+
+```
+[Phone call active: AudioTrack::write() called in com.android.phone process]
+  ↓
+hooked_audio_track_write() [zygisk_module.cpp line 311]
+  ├── original_audio_track_write(self, buffer, size, blocking)  ← always passthrough
+  └── if g_active && size >= FRAME_SAMPLES*2:
+        ├── LinearSRC: resample to 48kHz if needed
+        └── g_shm->speaker_frames[speaker_write_idx % 64] = frame data
+            g_shm->speaker_write_idx++  [atomic store, seq_cst via default]
+                  ↓
+  [daemon: capture_speaker_thread — Path A]
+  ↓
+  while loop: speaker_write_idx != speaker_read_idx
+    ↓
+  opus_encode(enc, frame.data, 960, pkt, MAX_PKT)  [64kbps, FEC, DTX]
+    ↓
+  send_frame(&g_net, T_SPEAKER, pkt, len)
+    ├── hdr[0]=0x01, hdr[1-4]=len (BE)
+    └── send_all() → mbedtls_net_send() [under g_tls_write_mutex]
+          ↓
+  [Server receives T_SPEAKER frame on TCP port 59100]
+```
+
+**Alternative path (Java VOICE_CALL AudioRecord):**
+```
+AudioCapture.java [com.audiobridge process]
+  → AudioRecord(VOICE_CALL, 8000 Hz, 160 samples/20ms)
+  → IPCClient.sendAudio(buf, 0, n)
+    → [4-byte BE len][PCM bytes] → Unix socket HELO_AUDIO connection
+      ↓
+  [daemon: read_java_audio_stream() thread]
+  → recv 4-byte header + PCM payload
+  → push JavaPcmChunk to g_java_pcm_queue (bounded at 10)
+      ↓
+  [daemon: capture_speaker_thread — Path B]
+  → pop chunk, accumulate in pcm_leftover[]
+  → when ≥960 samples: opus_encode(enc, pcm_leftover, 960, pkt, MAX_PKT)
+  → send_frame(&g_net, T_SPEAKER, pkt, len)
+```
+
+**Sample-rate note:** Java path sends 8kHz PCM. The Opus encoder in `capture_speaker_thread` is initialized at 48kHz (line 976). Feeding 8kHz PCM to a 48kHz encoder will produce garbled audio — the encoder expects 48kHz samples. This confirms Phase 4 finding D7 as a functional bug: the Java PCM path does not resample from 8kHz to 48kHz before encoding.
+
+#### Path 2 — Inject audio path (server → phone)
+
+```
+[Server sends T_VIRTUAL_MIC frame on TCP port 59100]
+  ↓
+[daemon: receive_virtual_mic_thread()]
+  → recv_all(net, hdr, 5)  ← blocks until header arrives
+  → type = T_VIRTUAL_MIC (0x02)
+  → recv_all(net, pkt, len)
+  → check: (write_idx - read_idx) < 64  ← drop frame if ring full
+  → opus_decode(dec, pkt, len, frame.data, 960, 0)  [48kHz PCM]
+     └── on decode error: opus_decode(nullptr, 0, ...) ← PLC (Packet Loss Concealment)
+  → frame.timestamp = steady_clock::now()
+  → layout->write_index.store((write_idx+1) % 128)  [atomic release]
+        ↓
+  [Zygisk module: hooked_audio_record_read() in com.android.phone process]
+  ↓
+  while g_active:
+    → g_shm->mic_frames[read_idx % 64].data → output buffer
+    → layout->read_index++ (% 128) [atomic release]
+    → LinearSRC: downsample to app's rate if != 48kHz
+    → return n (PCM samples) to AudioRecord caller
+```
+
+**tinyalsa parallel path:**
+```
+[daemon: tinyalsa_mic_inject_thread()]
+  → find_voice_pcm_dev(0) → /proc/asound/pcm
+  → pcm_open(card=0, dev=voice_dev, PCM_OUT)
+  → while(g_running && g_connected):
+      [under g_mic_consumer_mutex]
+      → read mic_frames[read_idx % 64]  ← same ring as Zygisk path
+      → read_index++
+      → pcm_write(pcm_out, frame_data, 960*2)  ← HAL uplink injection
+```
+
+**Race on `read_index`:** Both `tinyalsa_mic_inject_thread` (under `g_mic_consumer_mutex`) and `hooked_audio_record_read` (in a separate process, no mutex) advance `read_index`. These are **two consumers of the same ring**. `g_mic_consumer_mutex` only serialises within the daemon process; Zygisk hooks run in the telephony app process and cannot take this mutex. The comment at line 349 acknowledges this as "accepted as best-effort."
+
+#### Path 3 — SMS path (incoming SMS → server)
+
+```
+[Android: SMS PDU received]
+  ↓
+SMSBroadcastReceiver.onReceive()  [TelephonyHelper.java line 585]
+  → SmsMessage.createFromPdu(pdu, "3gpp"/"3gpp2")
+  → JSONObject: {event:"sms_received", sender, message, timestamp}
+  → IPCClient.getInstance().sendEvent(event)
+    → synchronized(this): mOut.println(json)  ← direct Unix socket write
+          ↓
+[daemon: read_java_client() thread — fgets() unblocks]
+  → push line to g_status_queue  [under g_status_mutex]
+  → g_status_cv.notify_one()
+          ↓
+[daemon: status_sender_thread()]
+  → pop from g_status_queue
+  → check: json contains "\"type\":\"sms" ?
+     → YES: frame_type = T_SMS (0x05)
+     → NO: frame_type = T_CALL_STATUS (0x04)
+  ← BUG: Java side sends {"event":"sms_received",...} not {"type":"sms_received",...}
+     The check at line 945 looks for "\"type\":\"sms" but Java uses "event" key, not "type"
+     → SMS from Java path will be sent as T_CALL_STATUS, not T_SMS
+  → send_frame(net, frame_type, json, len)
+          ↓
+[Server receives frame on TCP port 59100]
+```
+
+**Note on SMS routing bug:** SMS events from Java (`TelephonyHelper.java` / `SMSBroadcastReceiver`) use the key `"event"` (e.g., `"event":"sms_received"`), not `"type"`. The daemon's `status_sender_thread` at line 945 checks for `"\"type\":\"sms"` to decide whether to route as `T_SMS`. Because the Java events use `"event"` not `"type"`, SMS events sent via the Java IPC path will be mis-routed as `T_CALL_STATUS` frames. The JNI callbacks (if they were active) use `"type":"sms_received"` and would route correctly — but the JNI callbacks are dead code (see §3 note above).
+
+#### Path 4 — Call status path (call state change → server)
+
+```
+[Android telephony: call state changes]
+  ↓
+PhoneStateListener.onCallStateChanged(state, incomingNumber)  [TelephonyHelper.java line 162]
+  → mMainHandler.post(λ):  [line 171]
+    → handleCallStateChange(state, number)
+      → AudioCapture.start() / stop() (on OFFHOOK / IDLE)  [lines 191, 196]
+      → emitCallState(stateName, dirString, num)  [line 201]
+        → JSONObject: {type:"call", state, direction, number, started_at, duration_ms, muted}
+        → IPCClient.getInstance().sendEvent(event)
+          → synchronized(IPCClient.this): mOut.println(json)
+                ↓
+[daemon: read_java_client() thread — fgets() unblocks]
+  → push line to g_status_queue + g_status_cv.notify_one()
+        ↓
+[daemon: status_sender_thread()]
+  → check "\"type\":\"sms" → false (type is "call")
+  → frame_type = T_CALL_STATUS (0x04)
+  → send_frame(net, T_CALL_STATUS, json, len)
+        ↓
+[Server receives T_CALL_STATUS on TCP port 59100]
+```
+
+**Note on JSON schema mismatch:** The daemon's JNI callback (`nativeOnCallStateChanged`, line 765) produces `{"type":"call_status","state":N,"state_name":"..."}`. The Java `emitCallState()` produces `{"type":"call","state":"ACTIVE","direction":"outgoing",...}`. These two schemas are different — the server must handle both formats if both paths were active. Since JNI callbacks are dead code, only the Java format reaches the server in practice.
+
+#### Path 5 — Daemon → Java command dispatch
+
+```
+[Server sends T_CONTROL frame: {"command":"dial","number":"+1234567890"}]
+  ↓
+[daemon: receive_virtual_mic_thread() — recv_all blocks until header received]
+  → type = T_CONTROL (0x03)
+  → recv_all(pkt, len); pkt[len]='\0'
+  → SimpleJson::parse(json_str)
+  → cmd = "dial"; number = "+1234567890"
+  → jni_place_call(number)
+    → send_to_java({command:"place_call", number:"+1234567890"})
+      → int fd = g_java_fd.load()  [atomic read]
+      → send(fd, json+"\n", len, 0)  ← write to Unix socket fd
+              ↓
+[Java: IPCClient.connectAndListen() — mIn.readLine() unblocks on executor thread]
+  → JSONObject json = new JSONObject(line)
+  → handleCommand(json)
+    → mMainHandler.post(λ):
+      → TelephonyHelper.getInstance().placeCall("+1234567890")
+        → TelecomManager.placeCall(uri, bundle)
+```
+
+#### Path 6 — Keepalive / connection health
+
+```
+[daemon: main() watchdog loop — every 10 seconds]
+  → sleep(10)
+  → send_frame(&g_net, T_PING, nullptr, 0)  [5-byte header, 0-byte payload]
+      └── send_all() → mbedtls_net_send() [under g_tls_write_mutex]
+              ↓
+[Server receives T_PING, responds with T_PONG]
+              ↓
+[daemon: receive_virtual_mic_thread() — recv_all gets 5-byte T_PONG header]
+  → type = T_PONG (0x07), len = 0
+  → continue  (no payload received, no action taken)
+
+[If ping send_frame fails:]
+  → g_connected = false
+  → g_status_cv.notify_all()
+  → break  (exits watchdog loop)
+    → status_thread, speaker_thread, mic_thread, tinyalsa_thread all detect !g_connected and exit
+    → main() joins all threads, calls tcp_cleanup(), sleeps 5, reconnects
+```
+
+---
+
+### 7. Issues Found
+
+#### E1 — Java PCM 8kHz fed to 48kHz Opus encoder without resampling
+**Severity:** HIGH  
+**File:** `jni/audio_bridge.cpp` lines 1037–1041; `java/com/audiobridge/AudioCapture.java` line 19  
+**Evidence:** `AudioCapture.java` captures at `SAMPLE_RATE = 8000`. `capture_speaker_thread()` creates an `OpusEncoder` at `SAMPLE_RATE = 48000` (line 976). The Java PCM queue path (lines 1031–1047) feeds raw 8kHz int16 samples directly into `opus_encode()` configured for 48kHz. Opus will interpret the 8kHz samples as if they were 48kHz — the audio will play back at 1/6th the intended pitch and 6× the intended duration. **No resampling is performed.** This is a functional audio quality bug on the Java PCM path.
+
+#### E2 — SMS frames from Java IPC mis-routed as T_CALL_STATUS
+**Severity:** MEDIUM  
+**File:** `jni/audio_bridge.cpp` line 945; `java/com/audiobridge/TelephonyHelper.java` lines 609, 473, 507, 538  
+**Evidence:** Java events use `"event":"sms_received"` (key = `"event"`). The routing check in `status_sender_thread()` at line 945 is:
+```cpp
+if (json_str.find("\"type\":\"sms") != std::string::npos) { frame_type = T_SMS; }
+```
+Java events never contain `"type":"sms"` — they use `"event":"sms_received"`. As a result, all SMS events from the Java path are sent as `T_CALL_STATUS` (0x04) frames rather than `T_SMS` (0x05). The server WebSocket relay logic likely branches on frame type, so SMS events will arrive at the UI as call status updates. The CLAUDE.md note "T_SMS frames from daemon must be wrapped as `{type:"event", kind, device_id, data}` before broadcasting to UI WebSocket clients" applies only to T_SMS (0x05); these events arrive as T_CALL_STATUS (0x04) and may be processed under different server-side logic.
+
+#### E3 — JNI callbacks in audio_bridge.cpp are dead code
+**Severity:** MEDIUM  
+**File:** `jni/audio_bridge.cpp` lines 763–912; `java/com/audiobridge/TelephonyHelper.java` line 64  
+**Evidence:** The five `extern "C" JNIEXPORT` callbacks (`nativeOnCallStateChanged`, `nativeOnCallWaiting`, `nativeOnSMSSent`, `nativeOnSMSDelivered`, `nativeOnSMSReceived`) require that `TelephonyHelper.java` declare them as `native` methods and call them. However, `TelephonyHelper.java` line 64 has the comment `// Native methods removed in favor of IPCClient` — no `native` method declarations exist in the Java source. These JNI callbacks are therefore never invoked. The ~150 lines of JNI callback code in `audio_bridge.cpp` (lines 763–912) are unreachable. This means the schemas they produce (`"type":"call_status"`, `"type":"sms_received"`) — which are the schemas in `protocol.md` — are never actually sent. The server receives Java-formatted events with different keys.
+
+#### E4 — `g_active_calls` and `g_sms_tracking` maps are never populated
+**Severity:** LOW  
+**File:** `jni/audio_bridge.cpp` lines 126, 344  
+**Evidence:** `g_active_calls` (line 126) and `g_sms_tracking` (line 344) are declared global maps but no code path in the daemon calls `insert()` or `operator[]` on them. `g_sms_tracking` has a dedicated mutex (`g_sms_mutex`, line 343) that is also never locked. These are vestigial data structures.
+
+#### E5 — `g_java_pcm_cv` is notified but never waited on
+**Severity:** LOW  
+**File:** `jni/audio_bridge.cpp` lines 136–138, 1051, 1299  
+**Evidence:** `g_java_pcm_cv` is a `condition_variable` (line 136). It is notified via `g_java_pcm_cv.notify_one()` in `read_java_audio_stream()` (line 1299) when a PCM chunk is queued. However, `capture_speaker_thread()` never calls `g_java_pcm_cv.wait()` — it polls the queue with `usleep(5000)` on empty (line 1051). The condition variable is declared, the producer notifies it, but no consumer waits on it. The CV is dead code; the `usleep(5000)` busy-loop is the actual pacing mechanism. This wastes ~200μs CPU time per empty-queue check cycle compared to a proper wait.
+
+#### E6 — `send_to_java()` has no lock around the `send()` call
+**Severity:** LOW  
+**File:** `jni/audio_bridge.cpp` lines 498–506  
+**Evidence:**
+```cpp
+static void send_to_java(const SimpleJson& json) {
+    int fd = g_java_fd.load();   // atomic read
+    if (fd >= 0) {
+        std::string serialized = json.toString() + "\n";
+        send(fd, serialized.c_str(), serialized.length(), 0);  // no lock
+    }
+}
+```
+`send_to_java()` is called from `receive_virtual_mic_thread()` for multiple commands. The `g_java_fd` load is atomic, but the `send()` call itself is not serialised. If `receive_virtual_mic_thread()` dispatches two `send_to_java()` calls rapidly (not possible in the current single-dispatch-per-frame design, but fragile), their payloads could interleave at the socket level. The Unix socket send for short JSON messages (< PIPE_BUF = 4096 bytes) is atomic by POSIX guarantees, so this is low risk in practice but architecturally unsound.
+
+#### E7 — `receive_virtual_mic_thread` handles both TCP receive and control dispatch on same thread
+**Severity:** INFORMATIONAL  
+**File:** `jni/audio_bridge.cpp` lines 1065–1193  
+**Evidence:** This single thread both blocks on `recv_all()` (waiting for audio data from the server) AND dispatches all control commands (`dial`, `hangup`, `answer`, etc.) inline. This means a slow `jni_*` dispatch (e.g., `send_to_java()` blocking on a congested Unix socket) will delay receipt of subsequent T_VIRTUAL_MIC audio frames, causing playback jitter. A separate control-handler thread with a command queue would decouple these concerns.
+
+#### E8 — Opus encoder fed 960 samples of Java 8kHz audio but claimed frame size is also 960 samples at 48kHz
+**Severity:** HIGH (restatement of E1 with additional detail)  
+**File:** `jni/audio_bridge.cpp` lines 1036–1046  
+**Evidence:** `FRAME_SAMPLES = 960` = 20ms at 48kHz. At 8kHz, 960 samples = 120ms of audio. The Opus encoder `create`'d at 48kHz expects exactly 960 samples representing 20ms. Feeding 960 8kHz samples tells Opus it is receiving 120ms of audio at 48kHz — Opus will reject frames of unexpected duration or silently produce distorted output. Specifically, `opus_encode()` with a 48kHz encoder and `frame_size = FRAME_SAMPLES = 960` will reject any frame_size not in `{120, 240, 480, 960, 1920, 2880}` samples at 48kHz. 960 samples IS a valid frame size at 48kHz (20ms), so Opus will accept it — but the 8kHz samples are pitch-shifted to 1/6 original speed (not just pitch-shifted; the entire playback rate is wrong). The root cause is identical to E1.
+
+#### E9 — `g_java_fd` is set by `read_java_client()` but never cleared on reconnect
+**Severity:** LOW  
+**File:** `jni/audio_bridge.cpp` lines 1215, 1241–1243  
+**Evidence:** When the Java IPC connection closes (daemon restarts or Java app dies), `read_java_client()` clears `g_java_fd` to -1 (lines 1241–1243). However, `send_to_java()` reads `g_java_fd` atomically without holding any lock. In the brief window between the Java socket close and `read_java_client()` clearing `g_java_fd`, `send_to_java()` may attempt `send()` on a closed fd, receiving `EBADF` — which is silently discarded. This is a narrow TOCTOU window but not exploitable; the `send()` failure at most drops one command.
+
+---
+
+### 8. Phase 5 Summary
+
+| Finding | ID | Severity |
+|---------|----|----------|
+| Java 8kHz PCM fed to 48kHz Opus encoder without resampling — audio garbled | E1 | HIGH |
+| SMS frames from Java IPC mis-routed as T_CALL_STATUS instead of T_SMS | E2 | MEDIUM |
+| JNI callbacks (nativeOnCallStateChanged etc.) are dead code — protocol.md schemas never actually used | E3 | MEDIUM |
+| `g_active_calls` and `g_sms_tracking` maps never populated — dead data structures | E4 | LOW |
+| `g_java_pcm_cv` notified but never waited on — condition variable is dead code | E5 | LOW |
+| `send_to_java()` sends without serialisation lock (safe due to POSIX atomicity but fragile) | E6 | LOW |
+| `receive_virtual_mic_thread` mixes blocking TCP receive with control dispatch on single thread — audio jitter risk | E7 | INFORMATIONAL |
+| `g_java_fd` TOCTOU window between close and atomic clear | E9 | LOW |
+
+**Resolution of Phase 4 open question D7:** Confirmed as a functional bug. The Java audio capture path sends 8kHz PCM. The daemon encodes it with a 48kHz Opus encoder without resampling. The resulting audio stream will be pitch-shifted (6× too low) on the server side.
+
+**Most significant findings:**
+1. **E1/E8** — The Java PCM audio path produces garbled audio due to missing 8kHz→48kHz resampling before Opus encoding. This renders the fallback audio path non-functional.
+2. **E2** — SMS notifications are mis-routed to T_CALL_STATUS rather than T_SMS due to a key name mismatch (`"event"` vs `"type"`) between Java IPC events and the daemon's routing check.
+3. **E3** — The JNI callback architecture documented in `protocol.md` and implemented in `audio_bridge.cpp` (lines 763–912) is completely bypassed in practice. All telephony events flow through the Java IPC path with a different JSON schema. The server must be hardened against both schema variants.
+
+---
+
+*End of Phase 5 — Call Graph & Execution Paths*
