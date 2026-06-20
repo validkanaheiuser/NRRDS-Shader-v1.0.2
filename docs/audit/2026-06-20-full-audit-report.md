@@ -3635,3 +3635,364 @@ if (recvMac.length !== 64 || !crypto.timingSafeEqual(Buffer.from(recvMac), Buffe
 ---
 
 *End of Phase 8 — Network Analysis*
+
+---
+
+## Phase 9 — SELinux Analysis
+
+**Files analysed:**
+- `zygisk/module/service.sh` — runtime `apply_rule()` loop (lines 26–48)
+- `build.sh` — static `sepolicy.rule` generation (lines 559–589), `appops set` calls (lines 610–611)
+
+---
+
+### 9.1 SELinux Rules Table
+
+The module installs SELinux rules via two mechanisms: a static `sepolicy.rule` file (read by Magisk/KernelSU at mount time) and a dynamic `apply_rule()` shell function called at late_start by `service.sh`. Both target the same permission sets. The dynamic loop in `service.sh` extends the static set to include the `init` daemon domain and adds `radio` as a subject.
+
+#### Static rules (build.sh lines 565–588 → `sepolicy.rule`)
+
+| # | Subject | Object | Class | Permissions | Source Line | Risk Level |
+|---|---------|--------|-------|-------------|-------------|------------|
+| 1 | `priv_app` | `ksu` | `unix_stream_socket` | `connectto read write getattr` | build.sh:565 | Medium |
+| 2 | `priv_app` | `magisk` | `unix_stream_socket` | `connectto read write getattr` | build.sh:566 | Medium |
+| 3 | `priv_app` | `su` | `unix_stream_socket` | `connectto read write getattr` | build.sh:567 | Medium |
+| 4 | `priv_app` | `init` | `unix_stream_socket` | `connectto read write getattr` | build.sh:568 | High |
+| 5 | `system_app` | `ksu` | `unix_stream_socket` | `connectto read write getattr` | build.sh:569 | Medium |
+| 6 | `system_app` | `magisk` | `unix_stream_socket` | `connectto read write getattr` | build.sh:570 | Medium |
+| 7 | `system_app` | `su` | `unix_stream_socket` | `connectto read write getattr` | build.sh:571 | Medium |
+| 8 | `platform_app` | `ksu` | `unix_stream_socket` | `connectto read write getattr` | build.sh:572 | High |
+| 9 | `platform_app` | `magisk` | `unix_stream_socket` | `connectto read write getattr` | build.sh:573 | High |
+| 10 | `platform_app` | `su` | `unix_stream_socket` | `connectto read write getattr` | build.sh:574 | High |
+| 11 | `radio` | `ksu` | `unix_stream_socket` | `connectto read write getattr` | build.sh:575 | High |
+| 12 | `radio` | `magisk` | `unix_stream_socket` | `connectto read write getattr` | build.sh:576 | High |
+| 13 | `radio` | `su` | `unix_stream_socket` | `connectto read write getattr` | build.sh:577 | High |
+| 14 | `priv_app` | `tmpfs` | `file` | `read write open map getattr` | build.sh:582 | Medium |
+| 15 | `system_app` | `tmpfs` | `file` | `read write open map getattr` | build.sh:583 | Medium |
+| 16 | `platform_app` | `tmpfs` | `file` | `read write open map getattr` | build.sh:584 | High |
+| 17 | `radio` | `tmpfs` | `file` | `read write open map getattr` | build.sh:585 | High |
+| 18 | `phone` | `tmpfs` | `file` | `read write open map getattr` | build.sh:586 | High |
+| 19 | `priv_app` | `shell_data_file` | `{ read write create open append getattr setattr }` | — | build.sh:588 | High |
+
+#### Dynamic rules added by service.sh at runtime (lines 40–44)
+
+The loop adds four additional subject domains not in the static file (`platform_app`, `radio` → `init`), plus the `shell_data_file` rule for `priv_app`. The dynamic `apply_rule()` in `service.sh` also includes the `init` daemon domain not present in all static combinations:
+
+| Dynamic combo added | Reason |
+|---------------------|--------|
+| `allow platform_app init unix_stream_socket { connectto read write getattr }` | init domain added in service.sh loop |
+| `allow radio init unix_stream_socket { connectto read write getattr }` | init domain added in service.sh loop |
+| `allow priv_app shell_data_file { read write create open append getattr setattr }` | service.sh line 44 |
+
+---
+
+### 9.2 `appops set` Analysis
+
+**Call 1:** `appops set com.audiobridge RECORD_AUDIO allow` (service.sh line 20 / build.sh line 610)
+
+- **What it bypasses:** The appops system is Android's runtime gating layer that sits above declared permissions. Even if `android.permission.RECORD_AUDIO` is `pm grant`-ed, `system_server` checks the appops value (OP_RECORD_AUDIO) before allowing `AudioRecord` to proceed. Forcing it to `allow` bypasses that secondary gate without user interaction.
+- **Legitimate use:** The module must record call audio; `RECORD_AUDIO` is necessary.
+- **Hostile-package risk:** `appops` state is keyed on package name, not APK signature. If an attacker installs any APK with `applicationId "com.audiobridge"` (possible after `pm uninstall com.audiobridge` or via ADB on a device with USB debugging enabled), the new package inherits the `RECORD_AUDIO allow` appops grant set at boot by service.sh. The attacker app can record microphone audio without any user prompt or permission dialog. This is not exploitable during normal module operation (service.sh would have to have already run and then the legitimate APK replaced), but represents a permanent elevated-permission artifact on the device.
+
+**Call 2:** `appops set com.audiobridge SYSTEM_ALERT_WINDOW allow` (service.sh line 21 / build.sh line 611)
+
+- **What it bypasses:** `SYSTEM_ALERT_WINDOW` (OP_SYSTEM_ALERT_WINDOW, draw-over-other-apps) is a non-grantable-via-`pm` permission since Android 6.0; users must grant it through the Settings UI. The `appops set` call grants it directly without any user awareness.
+- **Legitimate use:** Unclear in this project — the daemon and IPC run entirely in native/background contexts; no UI overlays appear to be required. This grant appears precautionary.
+- **Hostile-package risk:** Any replacement package with `com.audiobridge` can draw overlays over any app, including banking apps, password managers, and authentication prompts. This enables overlay-based credential theft (UI redressing). Combined with the `RECORD_AUDIO` grant above, a hostile replacement package would have both microphone access and the ability to display convincing overlays — a complete phishing toolkit requiring zero additional permissions.
+
+---
+
+### 9.3 `privapp-permissions` Analysis
+
+**Is the XML file generated in build.sh?** No. The file `privapp-permissions-audiobridge.xml` is **referenced** in a comment at build.sh line 892 ("Android picks it up on boot scan with privileged permissions (privapp-permissions-audiobridge.xml)") but is **never generated** by `build.sh`. There is no `cat > ... privapp-permissions-audiobridge.xml` block anywhere in the script. The file does not exist in the repository.
+
+**What this means for `CAPTURE_AUDIO_OUTPUT`:**
+- `android.permission.CAPTURE_AUDIO_OUTPUT` is declared in the APK's `AndroidManifest.xml` (build.sh line 219).
+- The comment at build.sh line 217–219 says it is "Granted via privapp-permissions XML (cannot be granted via pm grant)."
+- Without the XML file present in `system/etc/permissions/` (via Magisk overlay), `CAPTURE_AUDIO_OUTPUT` is never actually granted by the framework's privileged-permission allowlist mechanism.
+- `pm grant` of this permission will fail (`pm` cannot grant `signature|privileged` permissions).
+- The workaround is `appops set com.audiobridge RECORD_AUDIO allow` (line 20), which forces OP_RECORD_AUDIO to ALLOW, bypassing the audio policy check that would have blocked `AudioSource.VOICE_CALL`. This is a functional workaround but it does not actually grant `CAPTURE_AUDIO_OUTPUT`; it bypasses the appops gate that enforces it.
+- **Gap:** If the APK is installed as a data-app (the current default path per service.sh lines 118–121), the priv-app mechanism never applies at all, and the missing XML is irrelevant. But if priv-app install is used on a device that enforces privapp-permissions whitelisting strictly (API 28+), the APK will receive a `INSTALL_FAILED_MISSING_SHARED_LIBRARY`-equivalent at permission grant time unless the XML is present.
+
+---
+
+### 9.4 Overall SELinux Surface Expansion
+
+The SELinux rule set is **not minimal**. The following over-broad grants exist:
+
+1. **`platform_app` domain** is allowed to connect to all daemon domains (`ksu`, `magisk`, `su`, `init`). `platform_app` covers _any_ platform-signed third-party app, not just `com.audiobridge`. Any app signed with the platform certificate (OEM apps, GApps) can connect to the audio bridge socket.
+
+2. **`radio` domain** is allowed to both connect to the daemon socket _and_ read/write/map tmpfs files. The `radio` domain runs the Phone process (`com.android.phone`). While IPC to the Phone process is intentional, granting `radio` access to arbitrary `tmpfs` files (backed by memfd) is broader than necessary — a read-only grant for the shared memory fd received via SCM_RIGHTS would suffice.
+
+3. **`phone` domain → tmpfs** (rule 18): `phone` and `radio` are distinct SELinux domains on some OEM builds. Both are granted identical tmpfs permissions.
+
+4. **`priv_app → shell_data_file { read write create open append getattr setattr }`** (rule 19): This allows any privileged app to create, write, and change attributes of files in `/data/local/tmp` (typed `shell_data_file`). On a device where multiple priv-apps are installed (e.g., OEM apps), this rule allows those apps to write to ADB-accessible log/temp space. The `setattr` permission is unnecessary for diagnostic logging.
+
+5. **`init` as daemon domain:** The daemon runs under KernelSU's `ksu` context, not `init`. Including `init` as a target domain means any connection attempt to a socket owned by the `init` domain is permitted by these rules — expanding the reachable socket namespace beyond the intended daemon.
+
+---
+
+### 9.5 Individual Findings
+
+### SEL-1: `platform_app` granted daemon socket access
+**Rule/Call:** `allow platform_app ksu unix_stream_socket { connectto read write getattr }`
+**File:** `build.sh` / `zygisk/module/sepolicy.rule`
+**Line:** build.sh:572–574
+**Issue:** `platform_app` covers all apps signed with the platform (OEM) key, not only `com.audiobridge`. Any platform-signed application on the device can connect to and communicate with the audio bridge daemon socket.
+**Risk:** An OEM system app (e.g., Settings, Device Health, OEM dialer) that is compromised or malicious can send IPC commands to the daemon — triggering calls, intercepting SMS, or exfiltrating audio without any interaction by the audio-bridge module.
+**Severity:** High
+
+### SEL-2: `init` included as daemon domain target
+**Rule/Call:** `allow priv_app init unix_stream_socket { connectto read write getattr }`
+**File:** `build.sh` / `zygisk/module/service.sh`
+**Line:** build.sh:568; service.sh:41 (via loop)
+**Issue:** The daemon does not run in the `init` domain; it runs under `ksu` (KernelSU) or `magisk`. Including `init` as a permitted target domain means the audio bridge APK (and other subjects in the loop) can connect to Unix stream sockets owned by the `init` process, which includes sockets used by Android's property service and init's control interface.
+**Risk:** If any init-domain socket is accidentally connectable, the rules open a path from `priv_app` to init. Minimal risk in practice (init sockets are abstract and most are seqpacket, not stream), but the permission is unnecessary and expands the allowed socket namespace.
+**Severity:** Medium
+
+### SEL-3: `priv_app → shell_data_file` includes `setattr`
+**Rule/Call:** `allow priv_app shell_data_file { read write create open append getattr setattr }`
+**File:** `build.sh` / `zygisk/module/sepolicy.rule`
+**Line:** build.sh:588; service.sh:44
+**Issue:** `setattr` allows the privileged app to change ownership and permissions of `shell_data_file`-labelled files in `/data/local/tmp`. The intended purpose is diagnostic log writing, which requires only `write`, `create`, `open`, `append`. The `setattr` permission is unnecessary for this purpose.
+**Risk:** A compromised `priv_app` process can alter the permissions of existing files in `/data/local/tmp`, potentially affecting ADB-accessible diagnostic data or enabling privilege escalation via file-permission manipulation.
+**Severity:** Medium
+
+### SEL-4: `appops set SYSTEM_ALERT_WINDOW allow` — no legitimate need identified
+**Rule/Call:** `appops set com.audiobridge SYSTEM_ALERT_WINDOW allow`
+**File:** `zygisk/module/service.sh` / `build.sh`
+**Line:** service.sh:21; build.sh:611
+**Issue:** The audio bridge daemon and APK operate entirely in the background. No code path in the reviewed Java sources (`AudioCapture.java`, `IPCClient.java`, `AudioBridgeService`) creates overlay windows. The `SYSTEM_ALERT_WINDOW` appops grant appears to have no functional purpose.
+**Risk:** This grant permanently allows any package with `applicationId "com.audiobridge"` to draw over other apps. If the legitimate APK is replaced (even briefly, e.g., via a malicious update) the replacement gains the ability to perform UI redressing attacks on banking apps and credential entry screens without any user-visible permission prompt.
+**Severity:** High
+
+### SEL-5: Missing `privapp-permissions-audiobridge.xml` — `CAPTURE_AUDIO_OUTPUT` never formally granted
+**Rule/Call:** Reference only — no `cat >` block generates the file
+**File:** `build.sh`
+**Line:** build.sh:892 (comment only)
+**Issue:** The `privapp-permissions-audiobridge.xml` file that would grant `CAPTURE_AUDIO_OUTPUT` to `com.audiobridge` as a privileged app is mentioned in a comment but never generated by the build script. No such file exists in the repository or in the module zip. The functional workaround (`appops set RECORD_AUDIO allow`) bypasses the appops gate but does not constitute a formal `CAPTURE_AUDIO_OUTPUT` grant.
+**Risk:** On devices with strict `privapp-permissions` enforcement (API 28+, many OEM ROMs), the missing XML may cause the system to log `Signature|privileged permissions not in privapp-permissions whitelist` and suppress the permission. The `appops` bypass is the only operational path. This represents an undocumented dependency on a specific enforcement mode and will fail silently on stricter ROMs.
+**Severity:** Medium
+
+### SEL-6: `radio` domain granted tmpfs `map` permission
+**Rule/Call:** `allow radio tmpfs file { read write open map getattr }`
+**File:** `build.sh` / `zygisk/module/sepolicy.rule`
+**Line:** build.sh:585
+**Issue:** The `radio` domain (Phone process) is granted the ability to `map` tmpfs files. The intended use is to receive a memfd via SCM_RIGHTS and `mmap()` the shared memory region. However, the rule grants `map` on all `tmpfs`-labelled files accessible to `radio`, not just the specific fd received from the daemon.
+**Risk:** A vulnerability in the Phone process's handling of file descriptors could allow an attacker to map arbitrary tmpfs regions if other tmpfs files become accessible to `radio`. Minimal real-world risk given ASLR and the Phone process's existing high privilege, but the rule is broader than the minimum necessary (`map` on a received fd does not require a domain-wide `map` rule on the `tmpfs` type).
+**Severity:** Low
+
+---
+
+### 9.6 Summary Table
+
+| ID | Title | Severity |
+|----|-------|----------|
+| SEL-1 | `platform_app` granted daemon socket access | High |
+| SEL-2 | `init` included as daemon domain target | Medium |
+| SEL-3 | `priv_app → shell_data_file` includes `setattr` | Medium |
+| SEL-4 | `appops set SYSTEM_ALERT_WINDOW allow` — no legitimate need identified | High |
+| SEL-5 | Missing `privapp-permissions-audiobridge.xml` | Medium |
+| SEL-6 | `radio` domain granted tmpfs `map` permission | Low |
+
+**Key finding:** The SELinux surface is meaningfully over-broad. The most significant risk is the combination of SEL-4 (`SYSTEM_ALERT_WINDOW` always granted at boot) and the appops-keyed-by-package-name model: any replacement package with the same application ID inherits two powerful appops grants (microphone + overlay) requiring zero additional user interaction.
+
+---
+
+*End of Phase 9 — SELinux Analysis*
+
+---
+
+## Phase 10 — Performance Findings
+
+**Files analysed:**
+- `jni/opus_wrapper.cpp` + `jni/opus_wrapper.h`
+- `java/com/audiobridge/AudioCapture.java`
+- `jni/audio_bridge.cpp` (hot-path logging, busy loops, O(N) operations, constants)
+
+---
+
+### 10.1 Opus Wrapper Analysis
+
+**Source:** `jni/opus_wrapper.cpp`, `jni/opus_wrapper.h`
+
+#### Encoder (OpusEncoderWrapper)
+- **Application mode:** `OPUS_APPLICATION_AUDIO` (line 16 of `opus_wrapper.cpp`). This is the generic wideband mode, not `OPUS_APPLICATION_VOIP`. Note: the inline encoder created directly in `capture_speaker_thread()` (audio_bridge.cpp:976) overrides this with `OPUS_APPLICATION_VOIP` — the wrapper class is a secondary code path.
+- **Bitrate:** Set via constructor parameter (no default in wrapper). The direct encoder in `capture_speaker_thread` uses 64000 bps (audio_bridge.cpp:983).
+- **Complexity:** Set to 10 (maximum) in the wrapper (opus_wrapper.cpp:21). The direct encoder in `capture_speaker_thread` uses complexity 5 (audio_bridge.cpp:986). **Discrepancy:** the wrapper class uses complexity 10 (CPU-intensive), while the hot-path inline encoder uses 5.
+- **VBR/CBR:** Neither the wrapper nor the direct encoder calls `OPUS_SET_VBR(0)`, so both use the default, which is **VBR on**. This is appropriate for voice but means bitrate will vary with signal complexity.
+- **FEC:** Enabled (`OPUS_SET_INBAND_FEC(1)`) in both wrapper (line 19) and direct encoder (audio_bridge.cpp:984).
+- **Packet loss concealment hint:** `OPUS_SET_PACKET_LOSS_PERC(10)` set in both.
+- **DTX:** Enabled (`OPUS_SET_DTX(1)`) only in the direct encoder (audio_bridge.cpp:987). The wrapper does not enable DTX.
+
+#### Decoder (OpusDecoderWrapper)
+- Straightforward; exposes `decode()` and `decodePLC()`. Decoder is created once per wrapper instance — not recreated per frame.
+- PLC via `opus_decode(nullptr, 0, ...)` is correctly implemented.
+
+#### Encoder/decoder reuse vs. per-frame recreation
+- The wrapper instances: if created once and reused, correct.
+- The direct encoder in `capture_speaker_thread` is created once at thread entry (audio_bridge.cpp:976) and destroyed at exit (line 1060). **Correct — not recreated per frame.**
+- The direct decoder in `virtual_mic_receiver_thread` (inferred from audio_bridge.cpp:1075) is similarly created once.
+
+#### Error handling
+- Wrapper constructor: if `opus_encoder_create` returns an error code but a non-null pointer, the `else` branch only fires if `err != OPUS_OK` — but the condition is `if (encoder_ && err == OPUS_OK)`, so if `err != OPUS_OK` the encoder is set to `nullptr` even if the pointer is non-null. This leaks the partially-constructed encoder. **Minor resource leak.**
+- Decoder wrapper (line 46–48): checks `err != OPUS_OK` but does not check if the returned pointer is null independently. If `opus_decoder_create` returns a non-null pointer with a non-OK error (library contract violation, but defensive coding should handle it), the decoder leaks.
+
+---
+
+### 10.2 Hot Path Logging
+
+Each call to `log_write()` (which `LOGI`, `LOGD`, `LOGW`, `LOGE` expand to) writes to a file via `fprintf`/`fflush` or equivalent. File I/O in an audio thread adds 50–200 μs per call; on a loaded Android device this can reach 1–2 ms.
+
+| Location | Macro | Function | Approx. Line | In Audio Loop? | Notes |
+|----------|-------|----------|-------------|----------------|-------|
+| audio_bridge.cpp:949 | `LOGD` | `status_sender_thread` | ~949 | Yes — every status event | "Status sent (type=0x%02x): %s" — runs inside the while loop |
+| audio_bridge.cpp:1054 | `LOGD` | `capture_speaker_thread` | ~1054 | Yes — every 50 frames (every ~1s) | "Speaker: %llu frames sent" — throttled with `% 50` check |
+| audio_bridge.cpp:1113 | `LOGI` | `virtual_mic_receiver_thread` | ~1113 | Yes — every control frame | "Control command: %s" — fires on every T_CONTROL frame received |
+| audio_bridge.cpp:1136 | `LOGI` | `virtual_mic_receiver_thread` | ~1136 | Yes — every SMS | "SMS queued: %s" |
+| audio_bridge.cpp:1142 | `LOGI` | `virtual_mic_receiver_thread` | ~1142 | Yes — every DTMF | "DTMF: %s" |
+| audio_bridge.cpp:1147 | `LOGI` | `virtual_mic_receiver_thread` | ~1147 | Yes — every audio_route | "Audio route: %s" |
+| audio_bridge.cpp:1151 | `LOGI` | `virtual_mic_receiver_thread` | ~1151 | Yes — every volume cmd | "Volume: %d" |
+| audio_bridge.cpp:1170 | `LOGW` | `virtual_mic_receiver_thread` | ~1170 | Yes — on buffer full | "Mic buffer full, dropping frame" — worst case when buffer saturated |
+| audio_bridge.cpp:1387 | `LOGW` | `tinyalsa_mic_inject_thread` | ~1387 | Yes — on pcm_write failure | "tinyalsa mic inject: pcm_write failed" |
+
+**Most critical:** The `LOGD` in `status_sender_thread` at line 949 fires on every status dequeue iteration and includes a substring operation (`json_str.substr(0, 100)`), which allocates heap memory inside the status loop. While the status thread is not the audio-encode thread, contention on the file handle or logging mutex adds indirect latency to the audio path if they share a lock.
+
+The `LOGD` in `capture_speaker_thread` at line 1054 is acceptably throttled to every 50 frames (~1 second at 20 ms/frame) and is low risk.
+
+---
+
+### 10.3 Busy Loop Scan
+
+Seven threads are identifiable in `audio_bridge.cpp`:
+
+| Thread | Loop condition | Sleep/yield present? | Assessment |
+|--------|---------------|----------------------|------------|
+| `capture_speaker_thread` | `while(g_running && g_connected)` | `usleep(5000)` when no work (line 1051) | **OK** — 5 ms backoff when idle |
+| `virtual_mic_receiver_thread` | `while(g_running && g_connected)` | Blocked on `recv_all()` (network I/O) | **OK** — I/O-blocked |
+| `status_sender_thread` | `while(g_running && g_connected)` | `cv.wait_for(100ms)` (line 929) | **OK** — condition variable with 100 ms timeout |
+| `tinyalsa_mic_inject_thread` | `while(g_running && g_connected)` | Blocked on `pcm_write()` (hardware timer) | **OK** — hardware-paced |
+| `read_java_audio_stream` | `while(g_running)` | Blocked on `recv()` (socket I/O) | **OK** — I/O-blocked |
+| `unix_socket_server_thread` | `while(g_running)` | Blocked on `select()` (line 1429) | **OK** — select-blocked |
+| Main reconnect loop | `while(g_running)` | `sleep(5)` / `sleep(15)` on retry | **OK** — long sleep on failure |
+
+No true busy-spin loops without sleep or yield were found. All threads either block on I/O, use condition variables, or have explicit sleeps when idle.
+
+---
+
+### 10.4 O(N) Operations in Audio Path
+
+**Found:** `pcm_leftover.erase(pcm_leftover.begin(), pcm_leftover.begin() + FRAME_SAMPLES)` in `capture_speaker_thread` (audio_bridge.cpp:1044–1045).
+
+This is a `std::vector::erase` from the front. For a vector of `int16_t`, erasing `FRAME_SAMPLES` (960 elements at 48 kHz / 20 ms) from the beginning requires shifting all remaining elements left by 960 positions — an O(N) `memmove` of up to `FRAME_SAMPLES * 2` bytes per remaining frame. In the worst case (a Java PCM chunk delivering many frames at once), this inner erase is called multiple times per chunk.
+
+**Context:** The `pcm_leftover` vector accumulates Java PCM samples and is drained in a while-loop that erases one frame at a time from the front on each iteration. The vector's `reserve(FRAME_SAMPLES * 2)` (line 995) means it holds at most 2 frames, capping the erase cost at ~960 × 2 bytes = ~3.75 KB per iteration. This is acceptable in practice but is O(N) by algorithm — using a ring buffer or `std::deque` would eliminate the shift entirely.
+
+---
+
+### 10.5 AudioCapture.java Analysis
+
+**File:** `java/com/audiobridge/AudioCapture.java`
+
+- **Sample rate:** 8000 Hz (line 19: `SAMPLE_RATE = 8000`)
+- **Frame size:** 160 samples = 20 ms at 8 kHz (line 20: `FRAME_SAMPLES = 160`)
+- **Frame bytes:** 320 bytes (16-bit PCM mono)
+- **Buffer size:** `max(minBufSize, FRAME_BYTES * 8)` = `max(minBuf, 2560 bytes)` (line 41). This is 8 frames = 160 ms of buffer, providing good headroom against AudioRecord underruns.
+- **Audio source:** Primary attempt is `MediaRecorder.AudioSource.VOICE_CALL` (line 43), falling back to `VOICE_COMMUNICATION` (line 46). `VOICE_CALL` captures both uplink and downlink mixed; `VOICE_COMMUNICATION` captures only the device microphone (uplink).
+- **Threading model:** Dedicated thread named `"AudioCapture"` (line 60), priority `MAX_PRIORITY - 1` (line 61). Uses a pull model: `AudioRecord.read()` blocking call in `captureLoop()` (line 84). This is the standard Android AudioRecord approach — no callback, no JNI boundary per frame. When no data is available, blocks inside the native AudioRecord layer.
+- **IPC:** On each successful read, calls `ipc.sendAudio(buf, 0, n)` (line 90), which sends the raw PCM frame over the Unix socket to the daemon. No internal buffering or queuing at the Java layer.
+
+**Sample rate mismatch:** `AudioCapture.java` uses 8000 Hz (line 19), but the daemon's `SAMPLE_RATE` constant is 48000 Hz (audio_bridge.cpp:74). The Opus encoder in `capture_speaker_thread` is created with `SAMPLE_RATE = 48000`. When Java PCM data at 8 kHz is fed directly to the 48 kHz Opus encoder (via the `g_java_pcm_queue` path in `capture_speaker_thread`), the encoder will mis-interpret 160-sample frames as 48000 Hz audio, producing corrupted output pitched 6× too high.
+
+---
+
+### 10.6 Theoretical Latency Chain
+
+| Stage | Latency | Source |
+|-------|---------|--------|
+| AudioRecord buffer fill | 20 ms (1 frame at 8 kHz) | `FRAME_MS` / AudioCapture FRAME_SAMPLES |
+| Java → daemon Unix socket IPC | ~0.1–0.5 ms | Local socket, no TLS |
+| Daemon PCM queue wait (usleep 5 ms) | 0–5 ms | audio_bridge.cpp:1051 |
+| Opus encode (complexity 5) | ~1–3 ms at 48 kHz | CPU-dependent |
+| Jitter buffer (`JITTER_FRAMES = 6`) | 6 × 20 ms = **120 ms** | audio_bridge.cpp:80 (note: constant is 6, not 3 as initially stated) |
+| SHM ring buffer max depth (`SHM_RING_SIZE = 64`) | 64 × 20 ms = **1280 ms** | audio_bridge.cpp:81 |
+| TCP network transit | Unknown — not measurable from code | Dependent on internet path |
+| Server → browser WebSocket | ~1–5 ms | Local if co-located |
+| Opus decode (server or browser) | ~0.5–2 ms | Complexity-dependent |
+
+**Total minimum one-way algorithmic latency (no jitter buffer):** ~22–28 ms
+**Total with jitter buffer engaged:** ~142–148 ms
+**Worst-case SHM saturation (all 64 frames buffered):** ~1300 ms before data flows
+
+The jitter buffer constant `JITTER_FRAMES = 6` (audio_bridge.cpp:80) adds 120 ms of fixed latency, which is above the 100 ms threshold where speech becomes noticeably delayed for two-way conversation.
+
+---
+
+### 10.7 Performance Findings
+
+### PERF-1: Sample rate mismatch — Java AudioCapture (8 kHz) vs. daemon Opus encoder (48 kHz)
+**File:** `java/com/audiobridge/AudioCapture.java` + `jni/audio_bridge.cpp`
+**Function:** `captureLoop()` / `capture_speaker_thread()`
+**Line:** AudioCapture.java:19 (`SAMPLE_RATE = 8000`) vs. audio_bridge.cpp:74 (`SAMPLE_RATE = 48000`)
+**Issue:** Java AudioRecord captures at 8000 Hz with 160-sample frames (20 ms). The daemon's Opus encoder is initialized at 48000 Hz with `FRAME_SAMPLES = 960`. When Java PCM chunks arrive via `g_java_pcm_queue` and are fed to the 48 kHz encoder, the encoder receives 160 int16 samples and interprets them as a partial 48 kHz frame, producing audio that is pitch-shifted upward by 6× and temporally compressed.
+**Impact:** Audio captured via Java AudioCapture path is completely unusable. This affects all devices where `VOICE_CALL` or `VOICE_COMMUNICATION` AudioRecord is used (the Java path is the fallback when Zygisk SHM is not populated).
+**Severity:** High
+
+### PERF-2: `vector::erase` from front — O(N) shift in speaker capture hot path
+**File:** `jni/audio_bridge.cpp`
+**Function:** `capture_speaker_thread()`
+**Line:** 1044–1045
+**Issue:** `pcm_leftover.erase(pcm_leftover.begin(), pcm_leftover.begin() + FRAME_SAMPLES)` shifts all remaining samples left on every frame boundary. Called inside a while-loop that processes every Java PCM chunk.
+**Impact:** O(N) memory shift of up to 960 int16 samples (~1.9 KB) per frame drain. At 50 fps (20 ms frames), worst case adds ~5–15 μs of CPU work per second on a modern ARM core. Low absolute impact but avoidable with a ring buffer or deque.
+**Severity:** Low
+
+### PERF-3: `LOGD` in `status_sender_thread` includes heap allocation (`substr`)
+**File:** `jni/audio_bridge.cpp`
+**Function:** `status_sender_thread()`
+**Line:** 949
+**Issue:** `LOGD("Status sent (type=0x%02x): %s", frame_type, json_str.substr(0, 100).c_str())` creates a temporary `std::string` via `substr` on every status send. This allocates heap memory inside the thread loop.
+**Impact:** Heap allocation in a near-real-time thread adds unpredictable latency (allocator lock contention, potential GC pressure on a device under memory pressure). Status events fire frequently (every call state change, every SMS). Replacing with `json_str.c_str()` with a length cap via format string truncation eliminates the allocation.
+**Severity:** Low
+
+### PERF-4: Jitter buffer of 6 frames adds fixed 120 ms one-way latency
+**File:** `jni/audio_bridge.cpp`
+**Function:** constants / `virtual_mic_receiver_thread`
+**Line:** 80 (`JITTER_FRAMES = 6`)
+**Issue:** `JITTER_FRAMES = 6` implies a 120 ms jitter buffer at 20 ms/frame. This exceeds the 100 ms threshold at which speech latency becomes perceptible in two-way conversation. The constant value (6) is higher than the brief (which stated 3).
+**Impact:** All received audio is delayed by a fixed 120 ms before playback, making real-time monitoring noticeably delayed. For a surveillance/monitoring use case this may be acceptable, but for any interactive use it degrades quality.
+**Severity:** Medium
+
+### PERF-5: Opus wrapper uses `OPUS_APPLICATION_AUDIO` with complexity 10
+**File:** `jni/opus_wrapper.cpp`
+**Function:** `OpusEncoderWrapper::OpusEncoderWrapper()`
+**Line:** 16, 21
+**Issue:** The wrapper class uses `OPUS_APPLICATION_AUDIO` (generic mode, higher algorithmic delay) and complexity 10 (maximum CPU usage). The hot-path direct encoder uses `OPUS_APPLICATION_VOIP` and complexity 5, which is more appropriate for voice. If any code path uses the wrapper class for real-time voice encoding, it will consume approximately 2× the CPU of the direct encoder.
+**Impact:** If the wrapper is used in a real-time audio path, CPU consumption roughly doubles compared to complexity 5. On a constrained Android device under call load, this can cause thermal throttling or missed frames.
+**Severity:** Medium
+
+### PERF-6: `OpusEncoderWrapper` constructor leaks partially-constructed encoder on error
+**File:** `jni/opus_wrapper.cpp`
+**Function:** `OpusEncoderWrapper::OpusEncoderWrapper()`
+**Line:** 17–24
+**Issue:** If `opus_encoder_create` returns a non-null pointer but `err != OPUS_OK`, the constructor sets `encoder_ = nullptr` without calling `opus_encoder_destroy(encoder_)`. The encoder object is leaked.
+**Impact:** Memory leak on encoder creation failure. In practice `opus_encoder_create` returning non-null with a non-OK error code is against the documented Opus API contract, but defensive code should handle it.
+**Severity:** Low
+
+---
+
+### 10.8 Performance Summary Table
+
+| ID | Title | Severity |
+|----|-------|----------|
+| PERF-1 | Sample rate mismatch Java (8 kHz) vs. daemon Opus (48 kHz) | High |
+| PERF-2 | `vector::erase` from front in speaker capture hot path | Low |
+| PERF-3 | `LOGD` with heap allocation (`substr`) in status thread loop | Low |
+| PERF-4 | Jitter buffer 6 frames = 120 ms fixed latency | Medium |
+| PERF-5 | Opus wrapper uses `OPUS_APPLICATION_AUDIO` + complexity 10 | Medium |
+| PERF-6 | Opus encoder leak on partial construction failure | Low |
+
+**Key finding:** PERF-1 is the dominant issue — the Java audio capture path produces audio at 8 kHz that the daemon encoder interprets as 48 kHz, making this entire fallback path functionally broken. All other performance issues are low-to-medium severity optimisation opportunities.
+
+---
+
+*End of Phase 10 — Performance Findings*
