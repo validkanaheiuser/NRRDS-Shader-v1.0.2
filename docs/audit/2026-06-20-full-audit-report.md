@@ -2003,7 +2003,7 @@ JNI callbacks (called from Java via System.loadLibrary, on telephony threads):
     └── push JSON → g_status_queue + g_status_cv.notify_one()
 ```
 
-**Note on JNI callbacks:** The `g_jvm`, `g_helper_class`, and `g_helper_obj` globals are declared (lines 115–117) but never set. The JNI callbacks above are registered as `extern "C" JNIEXPORT` functions and are called *from* Java (via native method declaration `native void nativeOnCallStateChanged(...)` in `TelephonyHelper.java` line 64, shown as `// Native methods removed in favor of IPCClient`). In the current codebase, `TelephonyHelper.java` has removed native method declarations in favor of the IPCClient path — meaning **these JNI callbacks are dead code** in the current Java implementation and will never be invoked.
+**Note on JNI callbacks:** The `g_jvm`, `g_helper_class`, and `g_helper_obj` globals are declared (lines 115–117) but never set. The JNI callbacks above are registered as `extern "C" JNIEXPORT` functions and are called *from* Java (via native method declaration `native void nativeOnCallStateChanged(...)` in `TelephonyHelper.java` line 66, shown as `// Native methods removed in favor of IPCClient`). In the current codebase, `TelephonyHelper.java` has removed native method declarations in favor of the IPCClient path — meaning **these JNI callbacks are dead code** in the current Java implementation and will never be invoked.
 
 ---
 
@@ -2374,8 +2374,8 @@ Java events never contain `"type":"sms"` — they use `"event":"sms_received"`. 
 
 #### E3 — JNI callbacks in audio_bridge.cpp are dead code
 **Severity:** MEDIUM  
-**File:** `jni/audio_bridge.cpp` lines 763–912; `java/com/audiobridge/TelephonyHelper.java` line 64  
-**Evidence:** The five `extern "C" JNIEXPORT` callbacks (`nativeOnCallStateChanged`, `nativeOnCallWaiting`, `nativeOnSMSSent`, `nativeOnSMSDelivered`, `nativeOnSMSReceived`) require that `TelephonyHelper.java` declare them as `native` methods and call them. However, `TelephonyHelper.java` line 64 has the comment `// Native methods removed in favor of IPCClient` — no `native` method declarations exist in the Java source. These JNI callbacks are therefore never invoked. The ~150 lines of JNI callback code in `audio_bridge.cpp` (lines 763–912) are unreachable. This means the schemas they produce (`"type":"call_status"`, `"type":"sms_received"`) — which are the schemas in `protocol.md` — are never actually sent. The server receives Java-formatted events with different keys.
+**File:** `jni/audio_bridge.cpp` lines 763–912; `java/com/audiobridge/TelephonyHelper.java` line 66  
+**Evidence:** The five `extern "C" JNIEXPORT` callbacks (`nativeOnCallStateChanged`, `nativeOnCallWaiting`, `nativeOnSMSSent`, `nativeOnSMSDelivered`, `nativeOnSMSReceived`) require that `TelephonyHelper.java` declare them as `native` methods and call them. However, `TelephonyHelper.java` line 66 has the comment `// Native methods removed in favor of IPCClient` — no `native` method declarations exist in the Java source. These JNI callbacks are therefore never invoked. The ~150 lines of JNI callback code in `audio_bridge.cpp` (lines 763–912) are unreachable. This means the schemas they produce (`"type":"call_status"`, `"type":"sms_received"`) — which are the schemas in `protocol.md` — are never actually sent. The server receives Java-formatted events with different keys.
 
 #### E4 — `g_active_calls` and `g_sms_tracking` maps are never populated
 **Severity:** LOW  
