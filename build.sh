@@ -168,6 +168,7 @@ build_native() {
         -lmbedtls -lmbedx509 -lmbedcrypto \
         -pthread \
         -pie \
+        -static-libstdc++ \
         -Wl,-z,relro,-z,now \
         -Wl,--gc-sections \
         -Wl,--strip-all \
@@ -876,6 +877,8 @@ ui_print "- Installing Audio Bridge v4.0"
 ui_print "  Removing stale priv-app and system overlays..."
 rm -rf "$MODPATH/system/priv-app" 2>/dev/null
 rm -rf "$MODPATH/system/bin" 2>/dev/null
+ui_print "  Setting daemon executable bit..."
+chmod 755 "$MODPATH/files/audio-bridge" 2>/dev/null
 CUSTOMEOF
 }
 
@@ -928,7 +931,8 @@ main() {
     fi
 
     cp "$BUILD_DIR/audio-bridge-arm64-v8a" "$PROJECT_DIR/zygisk/module/files/audio-bridge"
-    
+    chmod +x "$PROJECT_DIR/zygisk/module/files/audio-bridge"
+
     # Zip module
     cd "$PROJECT_DIR/zygisk/module"
     zip -r9 "$PROJECT_DIR/build/audio-bridge-module.zip" ./*
