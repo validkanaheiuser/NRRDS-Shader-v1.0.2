@@ -1,14 +1,19 @@
-allow priv_app   ksu     unix_stream_socket { connectto read write getattr }
-allow priv_app   magisk  unix_stream_socket { connectto read write getattr }
-allow priv_app   su      unix_stream_socket { connectto read write getattr }
-allow priv_app   init    unix_stream_socket { connectto read write getattr }
-allow system_app ksu     unix_stream_socket { connectto read write getattr }
-allow system_app magisk  unix_stream_socket { connectto read write getattr }
-allow system_app su      unix_stream_socket { connectto read write getattr }
-allow platform_app ksu   unix_stream_socket { connectto read write getattr }
-allow platform_app magisk unix_stream_socket { connectto read write getattr }
-allow radio      ksu     unix_stream_socket { connectto read write getattr }
-allow radio      magisk  unix_stream_socket { connectto read write getattr }
-allow priv_app   shell_data_file file { read write create open append getattr setattr }
-allow su         audio_device chr_file { open read write ioctl }
-allow ksu        audio_device chr_file { open read write ioctl }
+allow priv_app      ksu     unix_stream_socket { connectto read write getattr }
+allow priv_app      magisk  unix_stream_socket { connectto read write getattr }
+allow priv_app      su      unix_stream_socket { connectto read write getattr }
+allow priv_app      init    unix_stream_socket { connectto read write getattr }
+allow system_app    ksu     unix_stream_socket { connectto read write getattr }
+allow system_app    magisk  unix_stream_socket { connectto read write getattr }
+allow system_app    su      unix_stream_socket { connectto read write getattr }
+allow platform_app  ksu     unix_stream_socket { connectto read write getattr }
+allow platform_app  magisk  unix_stream_socket { connectto read write getattr }
+allow untrusted_app ksu     unix_stream_socket { connectto read write getattr }
+allow untrusted_app magisk  unix_stream_socket { connectto read write getattr }
+allow untrusted_app su      unix_stream_socket { connectto read write getattr }
+allow radio         ksu     unix_stream_socket { connectto read write getattr }
+allow radio         magisk  unix_stream_socket { connectto read write getattr }
+allow priv_app      shell_data_file file { read write create open append getattr setattr }
+allow untrusted_app shell_data_file file { read write create open append getattr setattr }
+allow untrusted_app tmpfs file { read write open map getattr }
+allow su            audio_device chr_file { open read write ioctl }
+allow ksu           audio_device chr_file { open read write ioctl }

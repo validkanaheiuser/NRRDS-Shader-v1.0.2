@@ -50,15 +50,32 @@ if [ ! -f "$CONFIG" ] && [ -f "$MODDIR/files/config.json.example" ]; then
     echo "$(date) Created config.json from example" >> "$LOG"
 fi
 
+# Guard: only one restart-loop may run. Write our PID to a sentinel file;
+# if the file exists and that PID is still alive, another service.sh owns it.
+LOOP_PID_FILE="/data/local/tmp/audio_bridge_loop.pid"
+if [ -f "$LOOP_PID_FILE" ]; then
+    OLD_PID=$(cat "$LOOP_PID_FILE" 2>/dev/null)
+    if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+        echo "$(date) Restart loop already running (PID $OLD_PID), skipping." >> "$LOG"
+    else
+        rm -f "$LOOP_PID_FILE"
+    fi
+fi
+if [ ! -f "$LOOP_PID_FILE" ]; then
 (
-    # libc++_shared.so is in /vendor/lib64 on most QCOM devices; not in linker path for root daemons
+    echo $$ > "$LOOP_PID_FILE"
     export LD_LIBRARY_PATH="/vendor/lib64:/system/lib64:$LD_LIBRARY_PATH"
     while true; do
-        "$DAEMON" --config "$CONFIG" >> "$LOG" 2>&1
-        echo "$(date) Daemon exited ($?), restarting in 5s" >> "$LOG"
-        sleep 5
+        if ! pidof audio-bridge > /dev/null 2>&1; then
+            "$DAEMON" --config "$CONFIG" >> "$LOG" 2>&1
+            echo "$(date) Daemon exited ($?), restarting in 5s" >> "$LOG"
+            sleep 5
+        else
+            sleep 10
+        fi
     done
 ) &
+fi
 
 # ── Write status.json for webroot read-only mode ─────────────────────────────
 WEBROOT="$MODDIR/webroot"

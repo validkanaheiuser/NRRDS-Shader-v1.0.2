@@ -373,21 +373,25 @@ async function saveAndRestart() {
 
 async function killDaemon() {
   if (!ksuAvail) { showAlert('kernelsu manager required.', 'err'); return; }
-  await sh('pkill -f audio-bridge 2>/dev/null; true');
-  await new Promise(r => setTimeout(r, 1000));
+  // Kill all daemon instances; also remove loop sentinel so loop doesn't respawn immediately
+  await sh('pkill -9 -x audio-bridge 2>/dev/null; rm -f /data/local/tmp/audio_bridge_loop.pid; true');
+  await new Promise(r => setTimeout(r, 1500));
   await refreshStatus();
   showAlert('kill signal sent.', 'info');
 }
 
 async function startDaemon() {
   if (!ksuAvail) { showAlert('kernelsu manager required.', 'err'); return; }
-  const r = await sh('[ -f ' + CFG + ' ] || { echo "no config"; exit 1; }; nohup ' + DAEMON + ' --config ' + CFG + ' >> ' + SVCLOG + ' 2>&1 &');
+  const cmd = '[ -f ' + CFG + ' ] || { echo "no config"; exit 1; }; '
+    + 'export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64; '
+    + DAEMON + ' --config ' + CFG + ' >> ' + SVCLOG + ' 2>&1 &';
+  const r = await sh(cmd);
   if (r.ok) {
-    await new Promise(res => setTimeout(res, 1500));
+    await new Promise(res => setTimeout(res, 2000));
     await refreshStatus();
     showAlert('daemon started.', 'ok');
   } else {
-    showAlert('start failed: ' + (r.err || r.out || 'no config?'), 'err');
+    showAlert('start failed: ' + (r.err || r.out || 'no config'), 'err');
   }
 }
 
