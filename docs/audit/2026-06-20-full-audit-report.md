@@ -3996,3 +3996,510 @@ The jitter buffer constant `JITTER_FRAMES = 6` (audio_bridge.cpp:80) adds 120 ms
 ---
 
 *End of Phase 10 — Performance Findings*
+
+---
+
+## Phase 11 - Compatibility Audit
+
+### 11.1 Android API Version Matrix
+
+Every `Build.VERSION.SDK_INT` check found across all Java files:
+
+| File | Line | Check | Minimum Android | Fallback |
+|------|------|-------|-----------------|---------|
+| `AudioBridgeService.java` | 47 | `SDK_INT >= 34` | Android 14 | Yes -- falls through to API 29 block |
+| `AudioBridgeService.java` | 52 | `SDK_INT >= Build.VERSION_CODES.Q` (29) | Android 10 | Yes -- untyped `startForeground()` for pre-Q |
+| `AudioBridgeService.java` | 105 | `SDK_INT >= Build.VERSION_CODES.O` (26) | Android 8 | Yes -- legacy `Notification.Builder(context)` |
+| `AudioBridgeService.java` | 121 | `SDK_INT >= Build.VERSION_CODES.O` (26) | Android 8 | Yes -- legacy builder without channel |
+| `AudioBridgeService.java` | 141 | `SDK_INT >= Build.VERSION_CODES.O` (26) | Android 8 | Yes -- legacy notification builder |
+| `TelephonyHelper.java` | 230 | `SDK_INT >= Build.VERSION_CODES.TIRAMISU` (33) | Android 13 | Yes -- `registerReceiver()` without flag for pre-13 |
+| `TelephonyHelper.java` | 596 | `SDK_INT >= Build.VERSION_CODES.M` (23) | Android 6 | Yes -- deprecated single-arg `createFromPdu()` |
+| `IPCClient.java` | -- | None -- no SDK_INT checks | N/A | N/A |
+
+**Assessment of fallbacks:**
+- `startForeground()` at line 47-64: three-tier fallback (API 34 typed -> API 29 typed with Throwable catch -> pre-Q untyped). Correct and complete.
+- `Notification.Builder` at lines 121/141: `Build.VERSION_CODES.O` guard with legacy path. Correct.
+- SMS receiver at line 230: `RECEIVER_EXPORTED` flag guard. Required on Android 13+; fallback omits the flag for older versions. Correct.
+- `SmsMessage.createFromPdu` at line 596: two-arg form with format string for API 23+; deprecated single-arg for older. Correct.
+- `IPCClient.java` uses `LocalSocket`/`LocalSocketAddress` (Android abstract namespace), which has been stable since API 1.
+
+No missing fallback paths were found.
+
+---
+
+### 11.2 NDK/ABI Matrix
+
+**Source:** `Application.mk` (ndk-build config), `CMakeLists.txt` (CMake config -- secondary).
+
+| Property | Application.mk | CMakeLists.txt | Notes |
+|----------|---------------|----------------|-------|
+| `APP_ABI` / `ANDROID_ABI` | `arm64-v8a` only | Not specified (inherits from `-DANDROID_ABI`) | No armeabi-v7a, x86, x86_64 |
+| `APP_PLATFORM` / `CMAKE_ANDROID_API` | `android-28` (Android 9) | `28` | Minimum API 28 |
+| `APP_STL` / `CMAKE_ANDROID_STL` | `c++_static` (daemon) | `c++_shared` (Android target) | **Mismatch** -- see COMPAT-3 |
+| `APP_CPPFLAGS` | `-std=c++17 -O3` | `CMAKE_CXX_STANDARD 17` | Consistent |
+
+**STL linkage mismatch:** `Application.mk` specifies `c++_static` for ndk-build (used to compile `audio_bridge.cpp` daemon binary and `jni_bridge.cpp`). `CMakeLists.txt` specifies `c++_shared` for the Android CMake target. The Zygisk `.so` (`zygisk_module.cpp`) explicitly uses **no STL linkage** (`# Do NOT link c++_static / c++_shared here` at CMakeLists.txt line 84), with the comment confirming this was the `-nostdlib++` fix for ZygiskNext.
+
+**C++17 usage:** `Application.mk` sets `-std=c++17`. C++17 features present in `audio_bridge.cpp` include `std::atomic`, `std::mutex`, `std::condition_variable`, `std::queue`, `std::map` -- all available from NDK 14+ with API 21+. The constrained use in `zygisk_module.cpp` (`std::atomic`, `std::min`, `memcpy`) requires no C++ runtime library. No C++17-only language features (e.g., structured bindings, `if constexpr`) were found that would require NDK 29 specifically.
+
+**arm64-v8a only:** Any device running Android 9+ (API 28) on an arm64 processor is covered. All flagship Android devices since 2017 are arm64. 32-bit-only devices (armeabi-v7a) running Android 9 are rare but exist (MediaTek budget devices). No compatibility gap is formally documented.
+
+---
+
+### 11.3 KernelSU vs Magisk Compatibility
+
+**Source:** `zygisk/module/service.sh` (from Phase 2/3 analysis).
+
+From the Phase 3 analysis, `service.sh` uses `ksud policy` (or `magiskpolicy --live`) for SELinux policy application and `pm install` for APK install. Both root managers support `pm` commands from root shell.
+
+| Aspect | KernelSU | Magisk |
+|--------|----------|--------|
+| SELinux tool | `ksud policy` | `magiskpolicy --live` |
+| Module install dir | `/data/adb/modules/audio_bridge/` | `/data/adb/modules/audio_bridge/` (same) |
+| Zygisk provider | ZygiskNext or ReZygisk | Built-in Zygisk or ZygiskNext |
+| `service.sh` execution context | `u:r:su:s0` (KernelSU service) | `u:r:magisk:s0` (Magisk service) |
+| APK install (`pm install`) | Works from both contexts | Works from both contexts |
+
+**Compatibility gap:** `kShadowhookPath` in `zygisk_module.cpp` line 43 is hardcoded to `/data/adb/modules/audio_bridge/zygisk/libshadowhook.so`. This path is identical for both KernelSU and Magisk module layouts. No incompatibility found for the shadowhook path.
+
+**Dual SELinux support:** The service.sh script detects which root manager is present and branches accordingly. No single-manager hardcoding was observed.
+
+---
+
+### 11.4 ZygiskNext vs Magisk Built-in vs ReZygisk
+
+| Zygisk Provider | Linker Restriction | `c++_static` TLS issue | Status |
+|----------------|-------------------|------------------------|--------|
+| **ZygiskNext** | Restricted linker -- rejects TLS relocations from `c++_static` | Fixed by `-nostdlib++` (CMakeLists.txt line 84) | **Works** |
+| **Magisk built-in Zygisk** | Standard linker -- no TLS restriction | No issue | **Works** (no restriction to violate) |
+| **ReZygisk** | Uses ZygiskNext engine | Same restriction as ZygiskNext | **Works** -- same fix applies |
+
+**Evidence:** CMakeLists.txt line 84-88 comment: "NDK 29's libc++_static introduces TLS relocations that ZygiskNext's restricted linker inside zygote cannot handle -> zygote crash -> bootloop." The `-nostdlib++` fix is the permanent solution covering all three providers.
+
+---
+
+### 11.5 Android Version-Specific Issues
+
+#### FGS Type Requirements
+
+| Android Version | Requirement | Code Status |
+|----------------|-------------|-------------|
+| < 9 (API < 28) | No typed FGS | Never reached -- min API is 28 |
+| 9-13 (API 28-33) | Optional FGS type | Code tries typed first (line 52), falls back to untyped (line 59) via `Throwable` catch |
+| 14+ (API 34+) | **Must** call typed `startForeground()` | Handled: line 47 `SDK_INT >= 34` path uses `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK` |
+
+#### Android 13+ SMS Receiver (API 33)
+
+`TelephonyHelper.java` line 230: `RECEIVER_EXPORTED` flag added conditionally for API 33+. Missing this flag on Android 13+ causes `IllegalArgumentException` on `registerReceiver()`. Correctly handled.
+
+#### Android 16 priv-app crash
+
+From the Phase 3/service.sh analysis: the `handleBindApplication` crash was caused by a priv-app overlay that is no longer created. The fix (removing the priv-app overlay from the module zip, documented in commit `86a4364`) resolves the Android 16 crash. The daemon is now installed to `$MODDIR/files/` rather than system priv-app, which avoids the `handleBindApplication` hook point entirely.
+
+#### tinyalsa on Android 12+
+
+On Android 12 (API 31)+, the Audio HAL owns PCM devices via AIDL HAL isolation. Direct `pcm_open()` calls to ALSA nodes (`/dev/snd/pcmCXDXc`/`p`) fail with `ENOENT` or permission denied because the HAL process holds exclusive access.
+
+`tinyalsa_mic_inject_thread()` in `audio_bridge.cpp` calls `pcm_open()`. No graceful fallback path exists when `pcm_open()` fails -- the thread logs the error and terminates. The Zygisk SHM path (`hooked_audio_track_write`) is the intended replacement for tinyalsa injection on Android 12+.
+
+#### Android Version Compatibility Matrix
+
+| Feature | Android 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 |
+|---------|-----------|----|----|----|----|----|----|-----|
+| FGS start (typed) | v | v | v | v | v | v | v | v |
+| FGS untyped fallback | v | v | v | v | v | x (throws) | x | x |
+| tinyalsa `pcm_open` | v | v | v | x | x | x | x | x |
+| Zygisk SHM speaker capture | v | v | v | v | v | v | v | v |
+| `RECEIVER_EXPORTED` req | -- | -- | -- | -- | v | v | v | v |
+| priv-app `handleBindApp` crash | -- | -- | -- | -- | -- | -- | -- | FIXED |
+| `PhoneStateListener` deprecated | -- | -- | -- | -- | v (still works) | v | v | v |
+
+---
+
+### 11.6 Python/Node Version Requirements
+
+**Python (server/requirements.txt):**
+- `fastapi>=0.100.0` -- requires Python 3.7+
+- `uvicorn>=0.23.0` -- requires Python 3.7+
+- `cryptography>=41.0.0` -- requires Python 3.7+
+- `opuslib>=3.0.1` -- requires libopus native library on host
+- `soxr>=0.3.7` -- requires Python 3.7+
+- `numpy>=1.24.0` -- requires Python **3.8+**
+
+**Effective minimum Python version: 3.8** (driven by numpy 1.24.0).
+
+No Python 3.10+ match-statement syntax was found in `server/main.py`. No walrus operator (`:=`) patterns requiring beyond Python 3.8 were observed.
+
+**Node.js (server/package.json):**
+- `"engines": {"node": ">=18.0.0"}` -- explicit minimum Node 18 (LTS).
+- `"ws": "^8.18.0"` -- requires Node 12+; `^8.x` is compatible with Node 18+.
+- `"@discordjs/opus": "^0.9.0"` (optional) -- requires Node 16+.
+
+**Minimum Node.js: 18.0.0** (explicitly declared in package.json).
+
+---
+
+### 11.7 Compatibility Findings Summary
+
+### COMPAT-1: tinyalsa mic injection fails silently on Android 12+
+**Android version:** Android 12 (API 31) and above
+**Impact:** Virtual microphone injection via `pcm_open()` in `tinyalsa_mic_inject_thread()` fails. Thread terminates. No audio is injected into the microphone HAL path. Zygisk SHM path (`hooked_audio_record_read`) is the only alternative.
+**Severity:** High
+**Fix:** Add `pcm_open()` failure detection with an explicit log message indicating the Android 12+ HAL ownership restriction. Document that the Zygisk SHM path is the intended mechanism on Android 12+.
+
+### COMPAT-2: arm64-v8a only -- no armeabi-v7a support
+**Android version:** All versions on 32-bit-only devices
+**Impact:** Android 9+ devices that are 32-bit only cannot run the native daemon or Zygisk module. `Application.mk` line 3: `APP_ABI := arm64-v8a`.
+**Severity:** Low
+**Fix:** Add `armeabi-v7a` to `APP_ABI` if 32-bit device coverage is required. Requires building arm32 variants of tinyalsa and Opus.
+
+### COMPAT-3: STL linkage mismatch between Application.mk and CMakeLists.txt
+**Android version:** All versions
+**Impact:** `Application.mk` uses `c++_static`; `CMakeLists.txt` uses `c++_shared`. The Zygisk module correctly uses neither. Inconsistency creates maintenance confusion when switching build systems.
+**Severity:** Low
+**Fix:** Align both files to use `c++_static` for the daemon binary. Zygisk module correctly remains `-nostdlib++`.
+
+### COMPAT-4: `PhoneStateListener` deprecated since API 31
+**Android version:** Android 12 (API 31) and above -- still functional through Android 16
+**Impact:** `TelephonyHelper.java` line 160 uses the deprecated API. No runtime crash. The deprecation comment at line 158-159 acknowledges this with rationale.
+**Severity:** Low
+**Fix:** Accept for now. Migrate to `TelephonyCallback` when `PhoneStateListener` is eventually removed, accepting loss of ringing number in the callback.
+
+### COMPAT-5: Minimum Python 3.8 not documented
+**Android version:** N/A (server-side)
+**Impact:** Running `pip install -r requirements.txt` on Python 3.7 fails at numpy 1.24.0. No explicit Python version constraint in `requirements.txt`.
+**Severity:** Low
+**Fix:** Add comment `# Requires Python >= 3.8` to `server/requirements.txt`, or add `python_requires = ">=3.8"` to a `setup.cfg`/`pyproject.toml`.
+
+---
+
+*End of Phase 11 - Compatibility Audit*
+
+---
+
+## Phase 12 - Feature Expansion Opportunities
+
+This phase identifies extension points provable from source code analysis. All claims cite file:function:line.
+
+---
+
+### 12.1 New Audio Sources -- MediaPlayer / AudioFlinger
+
+**Current hook targets** (zygisk_module.cpp lines 440-464):
+- `AudioRecord::read` -- captures microphone/voice-call input
+- `AudioTrack::write` -- captures speaker output
+
+To add `MediaPlayer` audio capture, the hook list in `install_inline_hooks()` would need additional entries. `MediaPlayer` on Android 12+ goes through `AudioTrack` internally for PCM output, so the existing `AudioTrack::write` hook **already captures MediaPlayer output** when running inside the targeted process. No separate MediaPlayer hook is required.
+
+For `AudioFlinger` (system-level, catches all audio from all apps), the hook target would be `AudioFlinger::PlaybackThread::threadLoop_write` or equivalent -- a much deeper system hook that would require injecting into the `audioserver` process. The current allow-list (`app_should_hook` at `zygisk_module.cpp:349`) does not include `audioserver`. Adding it would require:
+1. Adding `"audioserver"` to the `kAllow[]` array at `zygisk_module.cpp:351-358`
+2. Accepting the risk of injecting into a root-context process with full audio access
+
+**Risk:** Injecting into `audioserver` crashes the entire audio subsystem on hook failure, affecting all apps system-wide.
+
+### FEAT-1: Add AudioFlinger process to hook allow-list
+**Entry point:** `zygisk/src/zygisk_module.cpp:app_should_hook:351`
+**Dependencies:** None -- only requires adding one string to `kAllow[]`
+**Risk:** Injection into audioserver crashes all device audio on shadowhook failure; significantly broader blast radius than per-app injection
+**Effort:** Low (code change) / High (testing and stability validation)
+
+---
+
+### 12.2 Fix Java Audio Path -- 8 kHz to 48 kHz Mismatch
+
+**Problem** (from Phase 10, PERF-1): `AudioCapture.java` line 19 defines `SAMPLE_RATE = 8000`. The daemon's Opus encoder (`audio_bridge.cpp:74`) uses `SAMPLE_RATE = 48000`. PCM data from Java at 8 kHz is fed to a 48 kHz encoder, producing output pitched 6x too high.
+
+**Changes required:**
+
+1. `java/com/audiobridge/AudioCapture.java:19` -- change `SAMPLE_RATE = 8000` to `SAMPLE_RATE = 48000`
+2. `java/com/audiobridge/AudioCapture.java:20` -- change `FRAME_SAMPLES = 160` to `FRAME_SAMPLES = 960` (20 ms at 48 kHz)
+3. `java/com/audiobridge/AudioCapture.java:21` -- `FRAME_BYTES = FRAME_SAMPLES * 2` updates automatically (1920 bytes)
+4. `jni/audio_bridge.cpp` -- `g_java_pcm_queue` handler in `capture_speaker_thread()`: the jitter buffer calculation (`pcm_leftover.reserve(FRAME_SAMPLES * 2)` at line 995) automatically uses the daemon's `FRAME_SAMPLES = 960`; no change needed in daemon if Java delivers 48 kHz frames
+5. `java/com/audiobridge/IPCClient.java:239` -- comment says "S16LE, 8 kHz, mono"; update comment to "S16LE, 48 kHz, mono"
+
+**The Zygisk SHM path already operates at 48 kHz** (zygisk_module.cpp line 50-51). The fix unifies both paths.
+
+### FEAT-2: Fix Java AudioCapture sample rate (8 kHz -> 48 kHz)
+**Entry point:** `java/com/audiobridge/AudioCapture.java:captureLoop:19`
+**Dependencies:** None -- isolated change; daemon already expects 48 kHz from the SHM path
+**Risk:** Low -- `VOICE_CALL`/`VOICE_COMMUNICATION` AudioRecord supports 48 kHz on all Android 9+ devices. Potential increase in audio data volume (6x more samples per frame) on the Unix socket path
+**Effort:** Low
+
+---
+
+### 12.3 Add Reconnect Logic to Zygisk Module
+
+**Problem** (from Phase 4/5 analysis, finding D5): `g_active` is set to `true` in `connect_to_daemon_loop()` at `zygisk_module.cpp:519` and **never reset to false**. If the daemon restarts (killed by OOM, `service.sh` restart, etc.), the injected hook functions continue operating against a stale `g_shm` mmap that may be closed or remapped. The connection loop exits at `zygisk_module.cpp:486` `while (!g_active.load())` and never re-enters.
+
+**Where to add reconnect:**
+- File: `zygisk/src/zygisk_module.cpp`
+- Function: `connect_to_daemon_loop()` at line 485
+- Change: After `g_active.store(true)` at line 519, the loop naturally exits. Reconnect requires either:
+  a. Changing the loop condition to `while (true)` and adding a daemon-liveness check (poll the abstract socket periodically), or
+  b. Adding a background watchdog thread that checks `g_shm->last_activity` and resets `g_active = false` on timeout, re-triggering the loop
+
+**Thread safety concern:** `g_active` is `std::atomic<bool>` (line 76), so a write from the watchdog thread while `hooked_audio_record_read` reads it is safe. `g_shm` is a plain pointer (line 75) -- setting it to `nullptr` while hooks may be executing `pull_mic_samples()` creates a use-after-free window. A `std::atomic<SharedMemoryLayout*>` swap would be required.
+
+### FEAT-3: Add daemon reconnect to Zygisk module
+**Entry point:** `zygisk/src/zygisk_module.cpp:connect_to_daemon_loop:485`
+**Dependencies:** Must also convert `g_shm` (line 75) from `SharedMemoryLayout*` to `std::atomic<SharedMemoryLayout*>` to avoid use-after-free during reconnect
+**Risk:** Thread safety on the `g_shm` pointer swap during the reconnect window while hook functions may be executing; requires careful acquire/release ordering
+**Effort:** Medium
+
+---
+
+### 12.4 Dead JNI Callback Cleanup
+
+**Dead code location:** `jni/audio_bridge.cpp` lines 763-912, `extern "C"` block containing five JNI callbacks:
+
+| Function | Lines | Status |
+|----------|-------|--------|
+| `Java_com_audiobridge_TelephonyHelper_nativeOnCallStateChanged` | 766-801 | Dead -- no `native` method in TelephonyHelper.java |
+| `Java_com_audiobridge_TelephonyHelper_nativeOnCallWaiting` | 804-832 | Dead -- no `native` method in TelephonyHelper.java |
+| `Java_com_audiobridge_TelephonyHelper_nativeOnSMSSent` | 835-858 | Dead -- no `native` method in TelephonyHelper.java |
+| `Java_com_audiobridge_TelephonyHelper_nativeOnSMSDelivered` | 861-883 | Dead -- no `native` method in TelephonyHelper.java |
+| `Java_com_audiobridge_TelephonyHelper_nativeOnSMSReceived` | 886-912 | Dead -- no `native` method in TelephonyHelper.java |
+
+**Evidence:** `TelephonyHelper.java` contains the comment at line 66: "Native methods removed in favor of IPCClient". The current event path is: `TelephonyHelper.emitCallState()` -> `IPCClient.sendEvent()` -> Unix socket JSON. None of the five `nativeOnXxx` methods are declared in `TelephonyHelper.java`, so the JVM will never call them. The functions are compiled into the binary and linked, but are effectively unreachable.
+
+Additionally, `g_jvm`, `g_helper_class`, and `g_helper_obj` globals (audio_bridge.cpp lines 116-118) are set only by these dead JNI callbacks and are never read by any other code path. They can be deleted along with the callbacks.
+
+### FEAT-4: Remove dead JNI callbacks and associated globals
+**Entry point:** `jni/audio_bridge.cpp:extern "C":763`
+**Dependencies:** Verify `TelephonyHelper.java` has no `native` declarations (confirmed: none found)
+**Risk:** None -- dead code removal. The functions are never called by the JVM.
+**Effort:** Low
+
+---
+
+### 12.5 New TCP Frame Types (0x08+)
+
+**Current frame type assignments** (audio_bridge.cpp lines 85-93, `FrameType` enum):
+- `T_SPEAKER = 0x01` -- Phone speaker -> Server (audio data)
+- `T_VIRTUAL_MIC = 0x02` -- Server -> Phone virtual mic (audio data)
+- `T_CONTROL = 0x03` -- Control messages (JSON)
+- `T_CALL_STATUS = 0x04` -- Call status updates (JSON)
+- `T_SMS = 0x05` -- SMS control and status (JSON)
+- `T_PING = 0x06` -- Keepalive ping
+- `T_PONG = 0x07` -- Keepalive pong
+- `T_ERROR = 0xFF` -- Error response
+- **0x08-0xFE: all available**
+
+**Missing functionality that new frame types could address:**
+
+| Proposed Frame | Type Byte | Purpose | Notes |
+|---------------|-----------|---------|-------|
+| `T_DEVICE_INFO` | `0x08` | Send device metadata on connect (IMEI, model, Android version, SIM carrier) | Currently absent; dashboard has no device identification |
+| `T_AUDIO_QUALITY` | `0x09` | Report Opus encode stats, packet loss, jitter per frame | Enables adaptive bitrate from server |
+| `T_FILE_PUSH` | `0x0A` | Push a file from server to device (`/sdcard/`) | Requires chunked reassembly; high complexity |
+| `T_SCREENSHOT` | `0x0B` | Request a screenshot via `screencap` and return PNG bytes | Requires MediaProjection or root shell; significant scope |
+| `T_SHELL_CMD` | `0x0C` | Execute an arbitrary root shell command | Very high security risk; already possible via `T_CONTROL`-triggered daemon logic |
+
+**Most impactful near-term addition: `T_DEVICE_INFO` (0x08).** The server currently has no way to distinguish between multiple connected devices. Adding a `T_DEVICE_INFO` frame sent immediately after TCP connect would enable the dashboard to show "Device: Samsung Galaxy S21 / Android 14 / Carrier: AT&T" per connection.
+
+### FEAT-5: Add T_DEVICE_INFO frame type (0x08)
+**Entry point:** `jni/audio_bridge.cpp:tcp_connect_thread:line where connection is established`
+**Dependencies:** Server-side (`server/main.py`) must handle the new frame type in its dispatch loop
+**Risk:** Low -- additive change; old servers ignore unknown frame types (if they implement a length-delimited skip)
+**Effort:** Low (daemon) + Low (server)
+
+---
+
+### 12.6 Feature Opportunities Summary
+
+| ID | Title | Effort | Risk | Priority |
+|----|-------|--------|------|----------|
+| FEAT-1 | Add AudioFlinger process to hook allow-list | High (testing) | High | Low |
+| FEAT-2 | Fix Java AudioCapture sample rate (8 kHz -> 48 kHz) | Low | Low | **High** |
+| FEAT-3 | Add daemon reconnect to Zygisk module | Medium | Medium | Medium |
+| FEAT-4 | Remove dead JNI callbacks (lines 763-912) | Low | None | **High** |
+| FEAT-5 | Add T_DEVICE_INFO frame type (0x08) | Low | Low | Medium |
+
+**Recommended first:** FEAT-2 (fixes broken Java audio path) and FEAT-4 (removes dead code, reduces binary size, eliminates confusion). Both are low-risk, low-effort, high-impact.
+
+---
+
+*End of Phase 12 - Feature Expansion Opportunities*
+
+---
+
+## Phase 13 - Technical Debt
+
+### 13.1 scratch/ Contents
+
+Both files in `scratch/` are one-off debug scripts committed to the main repository.
+
+**`scratch/check_braces.py`** (72 lines): A standalone C/C++ brace-balance checker. Reads `jni/audio_bridge.cpp` relative to the working directory (hardcoded at line 71: `check_brace('jni/audio_bridge.cpp')`). Counts `{` and `}` tokens while correctly skipping string literals, char literals, and comments. Outputs "PERFECT BALANCE" or reports the line numbers of unmatched braces. This was written to diagnose syntax errors in `audio_bridge.cpp` during development.
+
+**`scratch/patch_debug.py`** (23 lines): A text-substitution script that patches `server/main.py` in-place (hardcoded path at line 3: `open('server/main.py', 'r')`). Adds debug-level logging to the TLS connection handler: augments log messages, adds a `wait_for()` timeout for the handshake, and adds `TimeoutError` handling. This was used to diagnose connection timing issues between the daemon and server.
+
+**Assessment:** Neither file belongs in the production repository:
+- Both use hardcoded relative paths that only work when invoked from the repo root.
+- `patch_debug.py` modifies `server/main.py` destructively (overwrites in-place). If run accidentally, it patches production source with debug logging.
+- Neither is referenced by `build.sh`, CI/CD, or any Makefile target.
+- Both are debugging artifacts that should be in a developer gitignore or a separate `tools/` branch.
+
+---
+
+### 13.2 Hardcoded Values Table
+
+Values found across all source files that belong in a configuration file:
+
+| Value | Where | What it means | Config-worthy? |
+|-------|-------|---------------|----------------|
+| `59100` | `jni/audio_bridge.cpp:68` (`g_port = 59100`) | TCP port daemon connects to | Yes -- already overridable via config file; but hardcoded default |
+| `59100` | `server/test_server.py:7`, `server/test_tls.py:6`, `server/test_client.py:48` | Test scripts hardcode port | Yes -- tests should read from shared constant |
+| `"default_secure_token_123"` | `jni/audio_bridge.cpp:69` (`g_token`) | Auth token default value | **Critical** -- a hardcoded default token that ships in binary |
+| `"/data/local/tmp/audio_bridge.sock"` | `jni/audio_bridge.cpp:70` (`g_socket_path`) | Fallback socket path | Yes -- should be config; currently unused (abstract socket is used) |
+| `"/data/local/tmp/audio_bridge.pid"` | `jni/audio_bridge.cpp:71` (`g_pid_file`) | PID file path | Yes -- config-worthy |
+| `"/data/local/tmp/audio_bridge_java.log"` | `IPCClient.java:31`, `AudioBridgeService.java:25` | Java diagnostics log path | Low -- debug log, acceptable to hardcode |
+| `"/audio_bridge_shm"` | `jni/audio_bridge.cpp:72` (`g_shm_path`) | Shared memory name | Low -- internal implementation detail |
+| `"audio_bridge"` | `jni/audio_bridge.cpp:1409-1410`, `zygisk_module.cpp:493-495` | Abstract Unix socket name | Yes -- defined in two places; see DEBT-2 |
+| `/data/adb/modules/audio_bridge/zygisk/libshadowhook.so` | `zygisk_module.cpp:43` | shadowhook .so path | Yes -- module ID `audio_bridge` is hardcoded into this path |
+| `1024 * 1024` | `jni/audio_bridge.cpp:82` (`SHM_SIZE = 1024*1024`) | 1 MB shared memory allocation | Low -- derived from ring geometry; already in header |
+| `5000` | `IPCClient.java:99` | Reconnect delay milliseconds | Yes -- config-worthy |
+| `160` | `AudioCapture.java:20` (`FRAME_SAMPLES = 160`) | 20 ms at 8 kHz | Yes -- should match daemon constant (currently mismatched) |
+
+**Most critical:** The `"default_secure_token_123"` default token at `audio_bridge.cpp:69` ships in the compiled binary. Any device that does not override it via the config file is accessible to anyone who knows this default. This was noted as SEC-2 in Phase 6.
+
+---
+
+### 13.3 Duplicate Constants
+
+Constants defined in multiple independent files (no shared header inclusion):
+
+| Constant | audio_bridge.h | audio_bridge.cpp | zygisk_module.cpp | AudioCapture.java | Notes |
+|----------|---------------|-----------------|------------------|------------------|-------|
+| `SAMPLE_RATE` | 48000 (line 28) | 48000 (line 74) | 48000 (line 50) | 8000 (line 19) | **4 definitions, one wrong** |
+| `FRAME_SAMPLES` | 960 (line 31) | 960 (line 77) | 960 (line 51) | 160 (line 20) | **4 definitions, one wrong** |
+| `FRAME_BYTES` | `FRAME_SAMPLES*2` (line 32) | `FRAME_SAMPLES*2` (line 78) | `FRAME_SAMPLES*2` (line 52) | `FRAME_SAMPLES*2` (line 21) | 4 definitions |
+| `SHM_RING_SIZE` / `RING_SIZE` | `SHM_RING_SIZE=64` (line 38) | `SHM_RING_SIZE=64` (line 81) | `RING_SIZE=64` (line 53) | N/A | 3 definitions, different names |
+| `JITTER_FRAMES` | 3 (line 34) | 6 (line 80) | N/A | N/A | **2 definitions, different values** |
+| `SHM_SIZE` | `1024*1024` (line 39) | `1024*1024` (line 82) | N/A | N/A | 2 definitions |
+| `MAX_PKT` | 4000 (line 33) | 4000 (line 79) | N/A | N/A | 2 definitions |
+
+**Worst duplicates:**
+- `JITTER_FRAMES`: header says 3, daemon says 6. The daemon uses its own definition (line 80), so the effective value is 6. The header value (3) is misleading. This is a documentation bug that caused an incorrect statement in Phase 10 (later corrected). Filed as DEBT-3.
+- `SAMPLE_RATE`/`FRAME_SAMPLES` in `AudioCapture.java`: wrong values (8000/160 vs 48000/960). Filed as FEAT-2/PERF-1.
+- `SHM_RING_SIZE` vs `RING_SIZE`: same value (64) but different constant names in different files. Comment in `audio_bridge.h` line 35-37 acknowledges this and asks for manual synchronization.
+
+---
+
+### 13.4 God Functions
+
+Functions with excessive line counts and multiple responsibilities:
+
+| Function | File | Approx. Lines | Responsibilities |
+|----------|------|---------------|-----------------|
+| `unix_socket_server_thread()` | `jni/audio_bridge.cpp` | ~250 lines | Accept loop + GET_SHM_FD + HELO_JAVA + HELO_AUDIO + PING + client dispatch |
+| `capture_speaker_thread()` | `jni/audio_bridge.cpp` | ~120 lines | Wait on SHM + wait on Java PCM queue + resample + Opus encode + TCP frame write |
+| `status_sender_thread()` | `jni/audio_bridge.cpp` | ~80 lines | Drain status queue + JSON parsing for SMS routing + TCP frame type selection + send |
+| `service.sh` | `zygisk/module/service.sh` | ~400+ lines (estimated from Phase 2) | Wait for boot + SELinux policy + permissions + APK install + FGS start + background status loop |
+
+`unix_socket_server_thread()` handles six distinct protocol commands inline with no command dispatch table or per-handler function decomposition. The HELO_JAVA and HELO_AUDIO handlers each span tens of lines within the same function body.
+
+`service.sh` is a monolithic shell script combining boot sequencing, SELinux policy application, permissions management, APK lifecycle management, and periodic status reporting. Any change to one concern risks breaking another.
+
+---
+
+### 13.5 Dead Code
+
+| Location | File | Lines | Why Dead |
+|----------|------|-------|---------|
+| JNI callbacks block | `jni/audio_bridge.cpp` | 763-912 | No `native` declarations in `TelephonyHelper.java`; comment at line 66 says "Native methods removed in favor of IPCClient" |
+| `g_jvm`, `g_helper_class`, `g_helper_obj` globals | `jni/audio_bridge.cpp` | 116-118 | Only written by the dead JNI callbacks; never read by any live code path |
+| `scripts/` directory | `scripts/install.sh`, `scripts/start.sh`, `scripts/stop.sh` | ~60 lines total | Manual install path not referenced in module flow; `service.sh` handles all lifecycle; scripts exist from an earlier design |
+| `scratch/check_braces.py` | `scratch/check_braces.py` | 72 lines | One-off debug tool; not part of build or test pipeline |
+| `scratch/patch_debug.py` | `scratch/patch_debug.py` | 23 lines | One-off patch script; dangerous if run accidentally (overwrites server/main.py) |
+
+---
+
+### 13.6 Unsafe Globals
+
+Non-atomic globals accessed from multiple threads without mutex protection:
+
+| Variable | Type | File:Line | Writers | Readers | Protection |
+|----------|------|-----------|---------|---------|------------|
+| `g_host` | `const char*` | `audio_bridge.cpp:67` | `main()` (startup only) | `tcp_connect_thread()` | None -- safe only because write precedes thread spawn |
+| `g_token` | `const char*` | `audio_bridge.cpp:69` | `main()` (startup only) | Multiple TCP handler threads | None -- safe only because write precedes thread spawn |
+| `g_shm_ptr` | `void*` | `audio_bridge.cpp:115` | `setup_shared_memory()` (startup) | `unix_socket_server_thread()` (GET_SHM_FD) | None -- set before threads spawn |
+| `g_shm_fd` | `int` | `audio_bridge.cpp:114` | `setup_shared_memory()` (startup) | `unix_socket_server_thread()` (GET_SHM_FD via sendmsg) | None -- set before threads spawn |
+| `g_jvm` | `JavaVM*` | `audio_bridge.cpp:116` | Dead JNI callbacks only | Dead JNI callbacks only | N/A -- dead code |
+| `g_helper_class` | `jclass` | `audio_bridge.cpp:117` | Dead JNI callbacks only | Dead JNI callbacks only | N/A -- dead code |
+| `g_helper_obj` | `jobject` | `audio_bridge.cpp:118` | Dead JNI callbacks only | Dead JNI callbacks only | N/A -- dead code |
+| `g_current_number` | `std::string` | `audio_bridge.cpp:126` | Dead JNI + `status_sender_thread` (via JSON) | Status thread | Protected by `g_call_mutex` when written by dead JNI; unprotected reads in live code paths unclear |
+| `g_active_calls` | `std::map<string,string>` | `audio_bridge.cpp:127` | Dead JNI callbacks | Status thread | Protected by `g_call_mutex` in dead paths; live status reads not seen under lock |
+| `g_shm` (Zygisk) | `SharedMemoryLayout*` | `zygisk_module.cpp:75` | `connect_to_daemon_loop()` | `hooked_audio_record_read()`, `hooked_audio_track_write()` | None -- plain pointer; safe only because loop exits before hooks begin writing |
+
+**Most critical unsafe global:** `g_shm` in `zygisk_module.cpp` line 75. It is written by `connect_to_daemon_loop()` (line 514) and read by both hook functions. After `g_active.store(true)` the loop exits, but there is no memory barrier guaranteeing that the hook functions (which may run on any thread at any time after the app process is specialized) see the `g_shm` write before they read it. In practice, `std::memory_order_release` on the `g_active` store (line 519) and `std::memory_order_acquire` on the load in the hooks (line 216) provide the necessary ordering via the `g_active` atomic -- the `g_shm` write happens-before the `g_active` release store, and the `g_shm` read happens-after the `g_active` acquire load. This is correct but relies on the invariant that `g_shm` is always written before `g_active` is set. No explicit comment documents this ordering requirement.
+
+---
+
+### 13.7 Technical Debt Findings
+
+### DEBT-1: Hardcoded default token "default_secure_token_123"
+**File:** `jni/audio_bridge.cpp`
+**Location:** global declaration:69
+**Issue:** `g_token = "default_secure_token_123"` is the default auth token shipped in the binary. Any device that does not configure a custom token is accessible to anyone who knows this default string. Token is sent in plaintext over TCP (no TLS on daemon connection).
+**Severity:** High
+**Fix:** Remove the default value; require the token to be specified in `config/audio_bridge.conf`. Fail to start if no token is configured. Add token validation in `config/` parsing code.
+
+### DEBT-2: Socket name "audio_bridge" hardcoded in two files
+**File:** `jni/audio_bridge.cpp:1409` and `zygisk/src/zygisk_module.cpp:493`
+**Location:** `unix_socket_server_thread():1409` and `connect_to_daemon_loop():493`
+**Issue:** The abstract Unix socket name `"audio_bridge"` is a string literal in two separate `.cpp` files. If the socket name ever needs to change, both files must be updated manually. The shared header `jni/audio_bridge.h` already exists as the natural home for this constant.
+**Severity:** Low
+**Fix:** Add `static constexpr const char* kSocketName = "audio_bridge";` to `jni/audio_bridge.h` and reference it from both files.
+
+### DEBT-3: JITTER_FRAMES defined twice with different values
+**File:** `jni/audio_bridge.h:34` and `jni/audio_bridge.cpp:80`
+**Location:** file scope
+**Issue:** `audio_bridge.h` defines `JITTER_FRAMES = 3`; `audio_bridge.cpp` defines `JITTER_FRAMES = 6`. Since `audio_bridge.cpp` does not include `audio_bridge.h` for this constant (it redefines it), the effective value is 6. The header value (3) misleads any reader of the header into believing the jitter buffer is 60 ms when it is actually 120 ms.
+**Severity:** Medium
+**Fix:** Remove `JITTER_FRAMES` from `jni/audio_bridge.cpp`. Include `jni/audio_bridge.h` (or create a shared config header) and use the single canonical definition. Decide whether the intended value is 3 or 6 and document the rationale.
+
+### DEBT-4: SHM constants duplicated across three files with different names
+**File:** `jni/audio_bridge.h:38` (`SHM_RING_SIZE`), `jni/audio_bridge.cpp:81` (`SHM_RING_SIZE`), `zygisk/src/zygisk_module.cpp:53` (`RING_SIZE`)
+**Location:** file scope in all three files
+**Issue:** The ring buffer size 64 is defined three times. The header comment at line 35-37 acknowledges this explicitly: "keep them in sync manually." Manual synchronization is a maintenance hazard -- a change to one value without updating the others corrupts the SHM layout and causes silent data corruption or crashes.
+**Severity:** Medium
+**Fix:** Consolidate into a single shared header (e.g., `jni/audio_bridge_shm.h`) that defines `SHM_RING_SIZE`. Include this header from all three files. The Zygisk module cannot include most system headers but can include a minimal constants-only header.
+
+### DEBT-5: Dead JNI callbacks and associated globals (150 lines of dead code)
+**File:** `jni/audio_bridge.cpp`
+**Location:** extern "C" block:763-912; globals:116-118
+**Issue:** Five JNI callback functions (`nativeOnCallStateChanged`, `nativeOnCallWaiting`, `nativeOnSMSSent`, `nativeOnSMSDelivered`, `nativeOnSMSReceived`) and three associated globals (`g_jvm`, `g_helper_class`, `g_helper_obj`) are dead. The Java side migrated to `IPCClient.sendEvent()` and the `native` declarations were removed from `TelephonyHelper.java`. The C++ callbacks remain in the binary, wasting ~150 lines of code and compiled binary space.
+**Severity:** Low
+**Fix:** Delete lines 763-912 (extern "C" block) and lines 116-118 (`g_jvm`, `g_helper_class`, `g_helper_obj` globals). Verify no remaining references to these symbols.
+
+### DEBT-6: scratch/ debug tools in production repository
+**File:** `scratch/check_braces.py`, `scratch/patch_debug.py`
+**Location:** entire directory
+**Issue:** Two debug scripts use hardcoded relative paths and are not part of any build or test pipeline. `patch_debug.py` in particular is dangerous: if run from the repo root it overwrites `server/main.py` with debug logging, silently modifying production source. Neither file is referenced from CI, build scripts, or documentation.
+**Severity:** Medium
+**Fix:** Add `scratch/` to `.gitignore` and remove from version control, or move to a `tools/dev/` directory with explicit documentation that these are development-only utilities not to be run in production.
+
+### DEBT-7: `scripts/` directory is orphaned manual install path
+**File:** `scripts/install.sh`, `scripts/start.sh`, `scripts/stop.sh`
+**Location:** `scripts/` directory
+**Issue:** The `scripts/` directory contains manual install/start/stop scripts from an earlier design where the daemon was installed by hand rather than via the KernelSU module system. The current module flow (`service.sh`) handles all lifecycle. The scripts are not referenced by `build.sh`, CI, or documentation. Running them on a module-managed device could conflict with the module's own service management.
+**Severity:** Low
+**Fix:** Add a `DEPRECATED.md` note or remove the scripts. If retained for emergency use, document clearly that they conflict with the module's `service.sh` lifecycle.
+
+---
+
+### 13.8 Technical Debt Summary Table
+
+| ID | Title | File | Severity |
+|----|-------|------|----------|
+| DEBT-1 | Hardcoded default token "default_secure_token_123" | audio_bridge.cpp:69 | High |
+| DEBT-2 | Socket name hardcoded in two files | audio_bridge.cpp:1409, zygisk_module.cpp:493 | Low |
+| DEBT-3 | JITTER_FRAMES defined twice with different values (3 vs 6) | audio_bridge.h:34, audio_bridge.cpp:80 | Medium |
+| DEBT-4 | SHM ring size duplicated across three files with different names | audio_bridge.h:38, audio_bridge.cpp:81, zygisk_module.cpp:53 | Medium |
+| DEBT-5 | Dead JNI callbacks and globals (lines 763-912, 116-118) | audio_bridge.cpp | Low |
+| DEBT-6 | scratch/ debug tools in production repository | scratch/ | Medium |
+| DEBT-7 | scripts/ orphaned manual install path | scripts/ | Low |
+
+---
+
+*End of Phase 13 - Technical Debt*
