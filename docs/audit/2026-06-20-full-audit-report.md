@@ -3048,6 +3048,8 @@ The CLAUDE.md states this was FIXED ("SMS key mismatch: FIXED (`"event"` → `"t
 - Line 537: `event.put("type", "sms_delivered")`
 - Line 609: `event.put("type", "sms_received")`
 
+> **Note:** This issue was partially addressed in commit 86a4364, which changed the daemon-side routing check from `"event":"sms"` to `"type":"sms"` in `status_sender_thread`. However, the Java source (`TelephonyHelper.java`) still emits `"event":"sms_received"` (line 609) — meaning the daemon routing check still never matches live SMS events. A complete fix requires changing either: (a) the Java side to emit `"type":"sms_received"`, or (b) the daemon check to match `"event":"sms"`.
+
 ---
 
 ### BUG-7: `test_client.py` Does Not Perform HMAC Authentication — Connects Without Token
@@ -3256,6 +3258,53 @@ if (!f) {
 
 ---
 
+### BUG-11: Frame Header recv() Uses Proper Retry Loop — Partial Recv Handled Correctly
+
+**File:** `jni/audio_bridge.cpp`
+**Function:** `receive_virtual_mic_thread()`
+**Line:** 1082–1090
+
+**Issue (investigated):** TCP `recv()` is NOT guaranteed to return all requested bytes in a single call. The daemon reads the TCP frame header (5 bytes: `[1B type][4B len BE]`) at multiple locations. This audit examined whether partial `recv()` calls are handled correctly.
+
+**Findings:**
+
+1. **Main frame recv loop (lines 1082–1090):** Uses a dedicated `recv_all()` helper function:
+```cpp
+static bool recv_all(mbedtls_net_context* net, void* data, size_t len) {
+    auto* p = (uint8_t*)data;
+    while(len > 0) {
+        int n = mbedtls_net_recv(net, p, len);
+        if(n <= 0) {
+            if(n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            g_connected = false;
+            return false;
+        }
+        p += n;
+        len -= n;
+    }
+    return true;
+}
+```
+The frame header is read via `if(!recv_all(net, hdr, 5)) break;` (line 1086). The `recv_all()` function implements a retry loop: it calls `mbedtls_net_recv()` in a loop, advancing the buffer pointer (`p += n`) and decrementing the byte count (`len -= n`) after each partial read. **This is CORRECT and handles partial recv properly.**
+
+2. **Java audio stream recv loop (lines 1262–1268):** Reads a 4-byte big-endian length header:
+```cpp
+uint8_t hdr[4];
+ssize_t got = 0;
+while (got < 4) {
+    ssize_t r = recv(fd, hdr + got, 4 - got, 0);
+    if (r <= 0) goto done;
+    got += r;
+}
+```
+This is a **native `recv()` call** (not through mbedtls), but it **also uses a proper retry loop** with buffer advancement (`hdr + got`) and byte count update (`got += r`). **This is CORRECT.**
+
+**Conclusion:** The daemon's frame header recv implementation is robust and correctly handles partial `recv()` calls on both the main TCP connection (via `recv_all()` with mbed TLS) and the Java audio stream (via native `recv()` with a manual loop). No vulnerability exists here. The retry-loop pattern is consistently applied in both locations.
+
+**Severity:** Informational (pattern verified as correct; no action needed)
+
+---
+
 ### Phase 7 Summary Table
 
 | ID | Title | Severity | File | Status |
@@ -3270,6 +3319,7 @@ if (!f) {
 | BUG-8 | `test_server.py` is a TLS debugging dump with no assertions — not a real test | Medium | server/test_server.py | Open |
 | BUG-9 | `send_frame(net, T_PING, nullptr, 0)` passes null pointer — safe now but UB-adjacent pattern | Low | audio_bridge.cpp:605,1690 | Open |
 | BUG-10 | `fdopen()` failure in `read_java_client()` leaves stale closed fd in `g_java_fd` | Low | audio_bridge.cpp:1215–1219 | Open |
+| BUG-11 | Frame header recv() uses proper retry loop — partial recv handled correctly | Informational | audio_bridge.cpp:1082–1090, 1262–1268 | No fix needed |
 
 **Critical / High findings in Phase 7:**
 - **BUG-6 (High):** The Java SMS key mismatch (E2 from Phase 5) was reported as FIXED in commit 86a4364, but the Java source (`TelephonyHelper.java`) still emits `"event":"sms_received"` etc. The daemon routing check looks for `"type":"sms"`. All SMS notification frames are still mis-routed as T_CALL_STATUS. This is the most impactful finding in Phase 7.
