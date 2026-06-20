@@ -45,14 +45,6 @@ enum CallState : int {
     CALL_HOLDING = 4
 };
 
-// ── Logging ───────────────────────────────────────────────────────────────────
-#ifdef ANDROID
-#include <android/log.h>
-#define LOG_TAG "AudioBridge"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#endif
+// ── Logging — defined by consumer (daemon uses log_write, no android/log.h) ──
 
 #endif // AUDIO_BRIDGE_H
