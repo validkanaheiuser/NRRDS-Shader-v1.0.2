@@ -4503,3 +4503,5 @@ Non-atomic globals accessed from multiple threads without mutex protection:
 ---
 
 *End of Phase 13 - Technical Debt*
+
+<!-- audit-phase-12-committed: 2026-06-20 -->
