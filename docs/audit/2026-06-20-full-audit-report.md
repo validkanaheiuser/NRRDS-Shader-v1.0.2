@@ -3330,3 +3330,308 @@ BUG-6 reveals that the E2 fix documented in Phase 5/6 was incomplete. The commit
 ---
 
 *End of Phase 7 — Bug Catalog*
+
+---
+
+## Phase 8 — Network Analysis
+
+**Files examined:**
+- `server/main.py` (FastAPI server, full)
+- `server/server.js` (Node.js port, full)
+- `server/dashboard.html` (Web dashboard, full)
+- `zygisk/module/webroot/app.js` (Module WebUI JS, full)
+- `zygisk/module/webroot/index.html` (Module WebUI HTML, full)
+- `server/requirements.txt`
+- `server/package.json`
+
+---
+
+### 1. HTTP Endpoint Table
+
+All HTTP routes are defined in `server/main.py`. There are **three** routes total.
+
+| Endpoint | Method | Auth Required | Request Payload | Response | Notes |
+|---|---|---|---|---|---|
+| `/` | GET | None | None | `text/html` — contents of `dashboard.html` | Line 637; no token check; world-accessible |
+| `/ws/ui` | WS | None | JSON command objects | JSON state/event objects | Line 525; no token check on upgrade; world-accessible |
+| `/ws/audio/{device_id}` | WS | None | Binary PCM or JSON rate-change | Binary PCM | Line 565; no token check; `device_id` validated only against `mgr.devices` |
+
+`server/server.js` exposes the same three logical routes via `httpServer` (line 614) and WebSocket upgrade handler (line 632).
+
+---
+
+### 2. WebSocket Endpoint Table
+
+| Endpoint | Auth | Direction | Message Types | Notes |
+|---|---|---|---|---|
+| `/ws/ui` | None | Bidirectional | Client→Server: JSON `{command, device_id, …}`; Server→Client: JSON `{type:"state_update", devices:[…]}` and `{type:"event", kind, device_id, data}` | Line 525 (main.py); full telephony control (dial, hangup, answer, mute, send_sms, dtmf, audio_route, volume) without any credential check |
+| `/ws/audio/{device_id}` | None | Bidirectional | Client→Server: raw s16 PCM bytes (mic) or JSON `{rate:N}` control; Server→Client: raw s16 PCM bytes (speaker) | Line 565 (main.py); live call audio streamed in both directions without auth; `device_id` from URL path is the only gate — any client that knows the ID gets full audio |
+
+---
+
+### 3. TCP Protocol Analysis (port 59100)
+
+**Bind address and port:**
+- `main.py` line 500: `await asyncio.start_server(handle_device, "0.0.0.0", TCP_PORT)`
+- `server.js` line 658: `tcpServer.listen(TCP_PORT, '0.0.0.0', ...)`
+- Binds on all interfaces; port defaults to 59100, overridable via `AUDIO_BRIDGE_TCP_PORT` env var (main.py line 100; server.js line 38).
+
+**Authentication mechanism:**
+HMAC-SHA256 handshake on first connect, before any frames are exchanged. The daemon sends a newline-terminated JSON object; the server verifies the HMAC before accepting the connection.
+
+**HMAC handshake details (`do_handshake`, main.py lines 381–392):**
+
+| Field | Source | Purpose |
+|---|---|---|
+| `id` | Device identifier string | Part of signed message |
+| `date` | Free-form string (device clock) | Intended as freshness factor |
+| `hmac` | hex(HMAC-SHA256(TOKEN, `"{id}-{date}"`)) | Signature over id+date |
+
+- **Verification (main.py line 387–390):** Server recomputes `HMAC-SHA256(AUTH_TOKEN, f"{dev_id}-{date}")` and compares with `hmac.compare_digest()` — constant-time comparison is correct.
+- **server.js (lines 404–410):** Uses `crypto.timingSafeEqual()` — also constant-time.
+- **Replay protection:** The `date` field is included in the signed payload but is **never validated against server time**. Neither `main.py` nor `server.js` checks that `date` is recent, checks for duplicate `{id, date}` pairs, or maintains a nonce/timestamp window. A captured handshake can be replayed indefinitely.
+- **Handshake timeout:** 10 seconds (`asyncio.wait_for(..., timeout=10.0)` at main.py line 382; `setTimeout(..., 10_000)` at server.js line 384).
+
+**Frame format:** (documented in Phase 5; reproduced for reference)
+```
+[1B type][4B len BE][payload bytes]
+```
+Types: 1=SPEAKER, 2=VIRTUAL_MIC, 3=CONTROL, 4=CALL_STATUS, 5=SMS, 6=PING, 7=PONG
+
+**Max frame size validation:** Neither `main.py` (`read_frame`, lines 395–400) nor `server.js` (`FrameReader.push`, lines 147–163) enforces an upper bound on the 4-byte length field before calling `readexactly(n)` / allocating a buffer. A frame with `n = 0xFFFFFFFF` (4 GB) would cause `asyncio.StreamReader.readexactly(4294967295)` to attempt to buffer 4 GB of data before proceeding.
+
+**Keepalive mechanism:**
+- The TCP frame protocol includes PING (type 6) / PONG (type 7). The server responds to device PINGs (main.py line 473–474; server.js line 495–496).
+- The server does **not** send unsolicited PINGs to the device on the TCP channel; it only reacts.
+- The `server.js` WebSocket `/ws/ui` handler (line 523–525) pings connected browser clients every 45 seconds to survive Cloudflare's 100-second idle timeout. The Python server has no equivalent browser-side keepalive.
+- There is no TCP-level read timeout on the device connection after the handshake completes; a stale connection will hold its slot until the OS closes the TCP socket.
+
+---
+
+### 4. Authentication Analysis
+
+| Interface | Auth Mechanism | Notes |
+|---|---|---|
+| HTTP `GET /` | None | Dashboard HTML served without any credential check (main.py line 637) |
+| WebSocket `/ws/ui` | None | `mgr.connect_ui(ws)` calls `ws.accept()` unconditionally (main.py line 333–335) |
+| WebSocket `/ws/audio/{device_id}` | None | `ws.accept()` unconditional after device-ID lookup (main.py line 581) |
+| TCP device channel (port 59100) | HMAC-SHA256 | Token derived from `AUDIO_BRIDGE_TOKEN` env var; handshake at connect; no per-frame auth; replay window unbounded |
+| Unix socket `@audio_bridge` (Java↔Daemon) | None | Documented in Phase 4/6; no change |
+
+**Token default value:** `AUTH_TOKEN = os.environ.get("AUDIO_BRIDGE_TOKEN", "default_secure_token_123")` (main.py line 99; server.js line 37). If the env var is not set, the well-known literal `default_secure_token_123` is used for both the TCP HMAC and is stored in `status.json` on the device (app.js line 23, loaded from `status.json` line 79).
+
+---
+
+### 5. WebUI Security Analysis
+
+#### `server/dashboard.html`
+
+- **XSS via `innerHTML`/`insertAdjacentHTML`:** Not present. The dashboard is a Vue 3 single-page application using `{{ expr }}` template interpolation throughout. Vue's template compiler HTML-escapes all interpolated values by default. No raw HTML insertion from server data was found. **No XSS risk from this pattern.**
+- **Auth token handling:** The dashboard has **no auth token concept at all**. It connects to `/ws/ui` using a relative WebSocket URL constructed from `location.host` (line 709–710): `proto + '://' + location.host + '/ws/ui'`. No token, cookie, or Authorization header is sent. The WebSocket upgrade succeeds unconditionally on the server side.
+- **Audio WebSocket URL:** Also constructed from `location.host` (line 784): `proto + '://' + location.host + '/ws/audio/' + selectedId.value + '?rate=' + rate + '&dir=' + dir`. No auth.
+- **Hardcoded URLs:** None. All URLs are relative to `location.host`.
+- **External resources:** Vue 3 loaded from `https://unpkg.com/vue@3/dist/vue.global.prod.js` (dashboard.html line 7) and Google Fonts loaded from `https://fonts.googleapis.com/` (line 9). Both are loaded over HTTPS from CDNs without Subresource Integrity (SRI) hashes — a supply-chain risk if those CDNs are compromised or the dashboard is served over HTTP.
+- **CORS (main.py):** No `CORSMiddleware` is added to the FastAPI `app` object anywhere in `main.py`. FastAPI's default CORS policy applies: cross-origin requests are not allowed by browser policy (no `Access-Control-Allow-Origin` header is emitted). This is conservative for HTTP, but since WebSocket upgrades ignore CORS, any page on any origin can connect to `/ws/ui` and `/ws/audio/{id}`.
+
+#### `zygisk/module/webroot/app.js` (Module WebUI)
+
+- **XSS via `innerHTML`/`insertAdjacentHTML`:** Not present. Log output is written to `logOutput.textContent` (app.js line 217), which is text-only and immune to HTML injection.
+- **Auth token in URL params:** The token is stored in the `<input type="password">` field (index.html line 62) and passed only to `ksu.exec()` shell commands (app.js lines 236, 272). It is never sent as a URL parameter, cookie, or WebSocket header.
+- **Token in `status.json`:** The fallback path (app.js lines 75–79) reads `status.json` which may contain the plaintext `TOKEN` value. `status.json` is served as a static file from the module webroot — **any process or app with network access to the KSU WebView local server can read the token** (see SEC-X below).
+- **Hardcoded token default:** `let config = { HOST: '', PORT: '59100', TOKEN: 'default_secure_token_123' }` (app.js line 23). This default is the same literal used in `main.py` and `server.js`.
+- **Hardcoded file paths:** `MODDIR = '/data/adb/modules/audio_bridge'`, `CONFFILE = '/data/local/tmp/audio_bridge.conf'`, `LOGFILE = '/data/local/tmp/audio_bridge.log'` (app.js lines 17–19). These are device-local paths used only in `ksu.exec()` shell commands — not network-facing.
+- **CORS (server.js):** No `Access-Control-Allow-Origin` header is set in the Node.js HTTP server (server.js line 614 onward). Same situation as Python server.
+
+---
+
+### 6. Server.js Analysis
+
+`server/server.js` is a **complete, production-grade alternative** to `main.py`, not a stub. It implements:
+- Full TCP device handler with HMAC handshake (lines 382–515)
+- Full `/ws/ui` WebSocket handler with 45-second browser keepalive pings (lines 518–557)
+- Full `/ws/audio/{device_id}` WebSocket handler (lines 560–609)
+- HTTP `GET /` serving `dashboard.html` (lines 614–627)
+- Opus encode/decode via `@discordjs/opus` or `opusscript` (lines 72–116)
+- Linear-interpolation sample-rate conversion (lines 120–135) instead of soxr
+
+**Parity with main.py:** Feature-complete for all protocol paths. The Node.js SRC (linear interpolation) is lower quality than soxr HQ, but functionally equivalent for protocol purposes.
+
+**Auth issues in server.js:** Identical to main.py — no auth on HTTP or WebSocket endpoints. The same default token (`default_secure_token_123`, line 37) is used.
+
+**Notable difference:** The `server.js` handshake (lines 407–410) has a subtle bug — it pads `recvMac` into a same-length buffer before calling `timingSafeEqual`, but then **also** does a non-constant-time `||` comparison `recvMac !== wantMac` (line 410). If `recvMac.length !== wantMac.length`, the `timingSafeEqual` branch short-circuits to `false` from the buffer-copy, but the fallback `||` check then exposes timing based on string comparison. In practice the HMAC is always a fixed-length hex string (64 chars), so this is not exploitable, but the pattern is fragile.
+
+---
+
+### 7. Dependency Audit
+
+#### Python (`server/requirements.txt`)
+
+| Package | Version Spec | Type | Notes |
+|---|---|---|---|
+| `fastapi` | `>=0.100.0` | Core | Unpinned upper bound — will install latest; no known critical CVE in 0.100+ at audit date |
+| `uvicorn` | `>=0.23.0` | Core | Unpinned upper bound |
+| `cryptography` | `>=41.0.0` | Core | Unpinned upper bound; `cryptography` has had periodic CVEs (memory unsafety in Rust extensions); `>=41` excludes most pre-41 vulns |
+| `opuslib` | `>=3.0.1` | Optional | Pure ctypes wrapper; no Python-level CVEs known |
+| `soxr` | `>=0.3.7` | Optional | Thin wrapper around libsoxr; no Python-level CVEs known |
+| `numpy` | `>=1.24.0` | Optional | Unpinned upper bound; numpy ≥1.24 is generally safe |
+
+**Unpinned versions:** All six packages specify only a lower bound (`>=`). This means `pip install -r requirements.txt` will always install the latest available version, which could introduce breaking changes or newly-disclosed CVEs without the operator being aware.
+
+**Missing packages:** No `websockets` or `httpx` listed — FastAPI's WebSocket support is provided by `starlette` (a dependency of `fastapi`), so this is fine. However, `starlette` itself is not pinned either (pulled transitively from `fastapi`).
+
+#### Node.js (`server/package.json`)
+
+| Package | Version Spec | Type | Notes |
+|---|---|---|---|
+| `ws` | `^8.18.0` | Core | Caret-pinned to `8.x`; `ws` 8.x has no known unpatched CVEs as of mid-2026 |
+| `@discordjs/opus` | `^0.9.0` | Optional | Native addon; requires build tools; no known CVEs in 0.9 |
+| `opusscript` | `^0.1.1` | Optional | WebAssembly fallback; no known CVEs |
+
+**Unpinned upper bound:** The caret `^8.18.0` allows any `8.x.y >= 8.18.0`, which is a reasonable semver pin but still allows minor-version updates that could introduce regressions.
+
+**No lockfile:** Neither `package-lock.json` nor `yarn.lock` is present in the repo. Without a lockfile, `npm install` resolves to latest-compatible at install time, introducing supply-chain drift.
+
+---
+
+### Issues Found
+
+### NET-1: No Authentication on HTTP Dashboard and WebSocket Endpoints
+**File:** `server/main.py`
+**Line:** 525 (`@app.websocket("/ws/ui")`), 565 (`@app.websocket("/ws/audio/{device_id}")`), 637 (`@app.get("/")`); `server/server.js` lines 636–648 (upgrade handler)
+**Issue:** All three HTTP/WS endpoints — the dashboard, the control WebSocket, and the audio WebSocket — accept connections without any credential check. No token, session cookie, or Authorization header is verified. Any host that can reach port 8000 can view the dashboard, send telephony commands (dial, hangup, answer, send_sms, etc.), and listen to or inject live call audio.
+**Impact:** Full remote control of all connected devices by any unauthenticated network client. On a public or shared network this is trivially exploitable.
+**Severity:** Critical
+**Fix:** Add a Bearer token check on WebSocket upgrade (compare `Authorization` header or a query-param token against `AUTH_TOKEN`). For HTTP, add a middleware or dependency that checks a session token. Example for FastAPI WS: add `token: str = Query(...)` parameter and reject with `ws.close(code=4401)` if it does not match `AUTH_TOKEN`.
+
+---
+
+### NET-2: HMAC Replay Attack — `date` Field Not Validated
+**File:** `server/main.py`
+**Line:** 381–392 (`do_handshake`)
+**Issue:** The handshake HMAC signs `"{device_id}-{date}"` where `date` is a free-form string sent by the device. The server never validates that `date` is a recent timestamp, never maintains a cache of seen `(id, date)` pairs, and never enforces a replay window. A captured handshake packet can be replayed indefinitely to authenticate as any known device.
+**Impact:** An attacker who captures one TCP handshake can impersonate that device at any future time, injecting call-control commands or audio frames as if they were the legitimate device.
+**Severity:** High
+**Fix:** Require `date` to be a Unix timestamp (seconds) and reject if `abs(server_time - date) > 60`. Also maintain an in-memory LRU set of seen `(id, date)` pairs for the window to prevent replay within the valid window.
+
+---
+
+### NET-3: No Maximum Frame Size Enforcement on TCP Channel
+**File:** `server/main.py`
+**Line:** 395–400 (`read_frame`); `server/server.js` line 150–153 (`FrameReader.push`)
+**Issue:** The 4-byte big-endian length field in each TCP binary frame is read without an upper-bound check. In `main.py`, `reader.readexactly(n)` is called with the raw value from the wire (up to 2^32 − 1 = ~4 GB). `asyncio.StreamReader.readexactly()` will attempt to buffer this many bytes, causing the server process to exhaust available memory. In `server.js`, `FrameReader` accumulates data in `this._buf` without bound.
+**Impact:** A single malformed frame from any authenticated device (or from an attacker who replays a valid handshake per NET-2) can cause a server-side out-of-memory condition, crashing the server and denying service to all connected devices.
+**Severity:** High
+**Fix:** Add a max-frame-size check before the read: e.g., `if n > 1_048_576: raise ValueError(f"frame too large: {n}")`. A 1 MB limit is more than sufficient for any legitimate Opus audio frame or control message.
+
+---
+
+### NET-4: Default Token is a Well-Known Hardcoded Literal
+**File:** `server/main.py`
+**Line:** 99; `server/server.js` line 37; `zygisk/module/webroot/app.js` line 23
+**Issue:** `AUTH_TOKEN = os.environ.get("AUDIO_BRIDGE_TOKEN", "default_secure_token_123")` — if the operator does not set the environment variable, the literal `default_secure_token_123` is used for TCP HMAC authentication. The same literal appears in `server.js` (line 37) and as the default in the module WebUI (`app.js` line 23) and in `config/audio_bridge.conf` (placeholder). Any adversary who reads this public repo source code knows the default token.
+**Impact:** Operators who deploy without explicitly setting `AUDIO_BRIDGE_TOKEN` have effectively no HMAC security — the token is publicly known. Combined with NET-2 (no replay protection), capturing even one handshake is unnecessary; the attacker can compute a valid HMAC directly.
+**Severity:** High
+**Fix:** Remove the fallback default. If `AUDIO_BRIDGE_TOKEN` is not set, log a critical error and refuse to start: `if not AUTH_TOKEN: raise SystemExit("AUDIO_BRIDGE_TOKEN must be set")`. Generate a random 32-byte token on first run and store it.
+
+---
+
+### NET-5: TCP Server Binds on All Interfaces Without Restriction
+**File:** `server/main.py`
+**Line:** 500; `server/server.js` line 658
+**Issue:** Both servers bind the device TCP channel (`0.0.0.0:59100`) and the HTTP/WS server (`0.0.0.0:8000`) on all network interfaces. There is no IP allowlist, firewall integration, or VPN/bind-address configuration.
+**Impact:** Both ports are exposed to any host reachable on any interface — including public/WAN interfaces if the server is internet-facing. Given NET-1 (no HTTP/WS auth) this is immediately exploitable from the public internet.
+**Severity:** Medium
+**Fix:** Default bind address to `127.0.0.1` and require operator to explicitly set `AUDIO_BRIDGE_BIND` to `0.0.0.0` if they need external access. Document VPN/reverse-proxy as the recommended deployment pattern.
+
+---
+
+### NET-6: Auth Token Exposed in `status.json` Webroot File
+**File:** `zygisk/module/webroot/app.js`
+**Line:** 75–79
+**Issue:** When `ksu.exec()` is unavailable, `app.js` falls back to reading `./status.json` to populate the token field (`if (status.token) config.TOKEN = status.token`). This means `service.sh` writes the daemon's auth token into `status.json`, which is served as a static file from the module webroot. Any app or process with access to the KernelSU WebView's local file server can fetch `status.json` and read the plaintext token.
+**Impact:** The TCP HMAC token — the only authentication mechanism for the device→server channel — is readable from a file served over HTTP. If `status.json` is accessible to other apps on the device (or via the KSU Manager's webroot serving), the token is compromised.
+**Severity:** Medium
+**Fix:** Do not write the token to `status.json`. The KSU WebUI should only read the token via `ksu.exec('cat /data/local/tmp/audio_bridge.conf')`, which requires root privilege to execute.
+
+---
+
+### NET-7: No Post-Handshake Keepalive Timeout on TCP Device Channel
+**File:** `server/main.py`
+**Line:** 429 (`while device.connected`)
+**Issue:** After the 10-second handshake timeout (line 382), there is no read deadline or keepalive timeout on the TCP device connection. The server loops on `read_frame(reader)` which is `await reader.readexactly(5)` — this will block indefinitely if the device stops sending data without closing the TCP connection (e.g., behind a NAT that silently drops idle connections). The device slot in `mgr.devices` remains occupied, and associated `asyncio.Task` resources are held, until the OS eventually raises a connection error.
+**Impact:** NAT-induced zombie connections accumulate device slots, potentially preventing legitimate reconnects if device ID is reused, and leaking memory/tasks over long uptimes.
+**Severity:** Low
+**Fix:** Set a TCP keepalive on the socket (`SO_KEEPALIVE` with short idle/interval settings) or implement an application-level PING: send `T_PING` every N seconds from the server and close the connection if `T_PONG` is not received within a timeout. `server.js` already has browser-side WS pings; apply the same pattern to the TCP device channel.
+
+---
+
+### NET-8: No SRI Hashes on CDN Resources in Dashboard
+**File:** `server/dashboard.html`
+**Line:** 7 (`<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js">`), 9 (`@import url('https://fonts.googleapis.com/...')`)
+**Issue:** The dashboard loads Vue 3 from unpkg.com and fonts from Google Fonts without Subresource Integrity (SRI) `integrity` attributes. If the CDN is compromised or the dashboard is served over plain HTTP (no TLS per SEC-2/3 from Phase 6), an attacker can replace the Vue bundle with malicious code that captures keystrokes, exfiltrates call audio, or sends arbitrary WebSocket commands.
+**Impact:** Supply-chain XSS — if unpkg.com serves a tampered Vue build, full JavaScript execution in the dashboard context. All call control commands and audio streams could be intercepted.
+**Severity:** Medium
+**Fix:** Add `integrity="sha384-..."` and `crossorigin="anonymous"` to the Vue `<script>` tag. Better: vendor Vue locally (copy `vue.global.prod.js` into the `server/` directory and serve it from `/static/vue.js`). Remove the Google Fonts CDN import and use a system font stack or vendor the fonts.
+
+---
+
+### NET-9: server.js `timingSafeEqual` Bypass via Length-Mismatch Path
+**File:** `server/server.js`
+**Line:** 407–410
+**Issue:** The HMAC comparison in `handshake()` copies `recvMac` into a same-length zero-padded buffer before calling `crypto.timingSafeEqual(a, b)`, then falls through to a `||` check: `if (!crypto.timingSafeEqual(a, b) || recvMac !== wantMac)`. If `recvMac` is shorter than 64 hex chars, the buffer copy pads with zeros, `timingSafeEqual` compares against zeros and returns `false`, and then `recvMac !== wantMac` is evaluated via a non-constant-time string comparison. An attacker who sends a 1-byte `hmac` field can use timing side-channels on the `!==` string comparison to guess the expected HMAC one byte at a time.
+**Impact:** Partial timing oracle against the HMAC comparison in the Node.js server. Exploitability is low due to network jitter, but the pattern violates the intent of constant-time comparison.
+**Severity:** Low
+**Fix:** Reject the handshake immediately if `recvMac.length !== wantMac.length` (both should always be 64 hex chars). Then call `timingSafeEqual` without the `||` fallback:
+```js
+if (recvMac.length !== 64 || !crypto.timingSafeEqual(Buffer.from(recvMac), Buffer.from(wantMac))) {
+  return reject(new Error('invalid hmac'));
+}
+```
+
+---
+
+### NET-10: All Python Dependency Versions Unpinned (Upper Bound)
+**File:** `server/requirements.txt`
+**Line:** 7–12
+**Issue:** All six Python packages use `>=` version specifiers with no upper bound (`fastapi>=0.100.0`, `uvicorn>=0.23.0`, `cryptography>=41.0.0`, `opuslib>=3.0.1`, `soxr>=0.3.7`, `numpy>=1.24.0`). There is no `requirements-lock.txt` or pinned hashes. `pip install -r requirements.txt` resolves to the latest available version at install time.
+**Impact:** A future release of any dependency could introduce a breaking API change, a regression, or a newly-disclosed CVE without the operator being aware. The `cryptography` package in particular has had CVEs (e.g., `GHSA-jfh8-c2jp-jf07` in < 41.0.3) that would be silently upgraded through if the operator re-runs pip install.
+**Severity:** Low
+**Fix:** Pin all packages to exact versions with hashes: use `pip-compile` (from `pip-tools`) to generate a `requirements.lock` with `--generate-hashes`, and use that for deployments.
+
+---
+
+### NET-11: No Node.js `package-lock.json` — Supply-Chain Drift
+**File:** `server/package.json`
+**Line:** 1 (file-level)
+**Issue:** No `package-lock.json` or `yarn.lock` is committed to the repository. Running `npm install` resolves `^8.18.0` (ws), `^0.9.0` (@discordjs/opus), and `^0.1.1` (opusscript) to whatever latest-compatible versions are available at install time.
+**Impact:** Reproducibility is broken — different deployments install different versions. A malicious package update to any of these packages would be silently pulled in. `ws` in particular is a WebSocket implementation that handles all browser connections; a compromised version could exfiltrate traffic.
+**Severity:** Low
+**Fix:** Commit a `package-lock.json` generated via `npm install --package-lock-only`. Use `npm ci` instead of `npm install` in deployment scripts to enforce the lockfile.
+
+---
+
+### Phase 8 Summary Table
+
+| ID | Title | Severity | File | Line |
+|----|-------|----------|------|------|
+| NET-1 | No auth on HTTP dashboard and WebSocket endpoints | Critical | server/main.py | 525, 565, 637 |
+| NET-2 | HMAC replay attack — `date` field not validated against server time | High | server/main.py | 381–392 |
+| NET-3 | No max frame size on TCP channel — OOM via crafted frame | High | server/main.py | 395–400 |
+| NET-4 | Default auth token is a well-known public literal | High | server/main.py | 99 |
+| NET-5 | TCP and HTTP servers bind on all interfaces (0.0.0.0) | Medium | server/main.py | 500, 651 |
+| NET-6 | Auth token exposed in `status.json` served from webroot | Medium | zygisk/module/webroot/app.js | 75–79 |
+| NET-7 | No post-handshake keepalive timeout on TCP device channel | Low | server/main.py | 429 |
+| NET-8 | No SRI hashes on CDN resources in dashboard | Medium | server/dashboard.html | 7, 9 |
+| NET-9 | `server.js` `timingSafeEqual` bypass via length-mismatch path | Low | server/server.js | 407–410 |
+| NET-10 | Python dependencies all unpinned (upper bound) | Low | server/requirements.txt | 7–12 |
+| NET-11 | No Node.js `package-lock.json` — supply-chain drift | Low | server/package.json | file-level |
+
+**Critical / High findings in Phase 8:**
+- **NET-1 (Critical):** Zero authentication on the HTTP dashboard and both WebSocket endpoints. Any host that can reach port 8000 can control all connected phones and access live call audio.
+- **NET-2 (High):** The HMAC handshake on port 59100 offers no replay protection. A captured handshake is valid forever.
+- **NET-3 (High):** An unbounded frame length allows OOM-crash of the server with a single malformed frame.
+- **NET-4 (High):** The default token `default_secure_token_123` is committed in plain text to multiple source files. Operators who do not change it have no practical security on the TCP channel.
+
+---
+
+*End of Phase 8 — Network Analysis*
