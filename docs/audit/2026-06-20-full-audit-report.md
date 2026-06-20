@@ -948,3 +948,362 @@ The stale check waits up to 5 seconds for `pidof` to disappear. If `service.sh` 
 ---
 
 *End of Phase 2 — Boot Flow Analysis*
+
+---
+
+## Phase 3 — KernelSU Analysis
+
+### 1. module.prop Field Audit
+
+The KernelSU Module Guide defines the following fields for `module.prop`. There are two versions of this file: the one committed to the source tree (`zygisk/module/module.prop`) and the one generated at build time by `build.sh`'s `build_zygisk()` function (lines 537–546 of build.sh). The build-time version overwrites the committed version and is what actually gets flashed.
+
+#### Committed (on-disk) `zygisk/module/module.prop`
+
+Source: `zygisk/module/module.prop` (lines 1–6)
+
+| Field | Required? | Present? | Value | Compliance |
+|-------|-----------|----------|-------|------------|
+| `id` | YES | YES | `audio_bridge` | COMPLIANT — matches `^[a-zA-Z][a-zA-Z0-9._-]+$` |
+| `name` | YES | YES | `Audio Bridge` | COMPLIANT |
+| `version` | YES | YES | `v3.0` | COMPLIANT — human-readable string |
+| `versionCode` | YES | YES | `300` | COMPLIANT — integer |
+| `author` | NO | YES | `AudioBridge` | COMPLIANT |
+| `description` | NO | YES | `Virtual microphone and speaker capture for remote audio` | COMPLIANT |
+| `minKernelSU` | NO | **MISSING** | — | NON-COMPLIANT (absent in committed file; only in build-generated version) |
+| `updateJson` | NO | **MISSING** | — | NON-COMPLIANT (absent in committed file; only in build-generated version) |
+
+**Critical note:** The committed `module.prop` is a stale v3.0 placeholder. It carries `versionCode=300` while the build-generated version uses `versionCode=$(git rev-list --count HEAD)`, currently `93`. The committed file is **never flashed** — it is overwritten by `build_zygisk()` before the zip is assembled (build.sh line 537). Both `minKernelSU` and `updateJson` are absent from the committed file but required for KernelSU OTA and minimum-version enforcement to work.
+
+#### Build-generated `zygisk/module/module.prop`
+
+Source: `build.sh` lines 537–546 (heredoc written by `build_zygisk()`)
+
+| Field | Required? | Present? | Value | Compliance |
+|-------|-----------|----------|-------|------------|
+| `id` | YES | YES | `audio_bridge` | COMPLIANT |
+| `name` | YES | YES | `Audio Bridge` | COMPLIANT |
+| `version` | YES | YES | `v3.1.${VER_CODE}` (dynamic, e.g. `v3.1.93`) | COMPLIANT |
+| `versionCode` | YES | YES | `${VER_CODE}` (= `git rev-list --count HEAD`, e.g. `93`) | COMPLIANT — integer |
+| `author` | NO | YES | `AudioBridge` | COMPLIANT |
+| `description` | NO | YES | `Remote audio streaming, call control and SMS via Zygisk. Android 16 + KernelSU compatible.` | COMPLIANT |
+| `minKernelSU` | NO | YES | `11631` | COMPLIANT — declares minimum ksud API; build.sh comment (lines 533–534) states this corresponds to KernelSU 0.9.x stable |
+| `updateJson` | NO | YES | `https://raw.githubusercontent.com/validkanaheiuser/audio-bridge-concept/main/update.json` | COMPLIANT — points to raw update.json in repo root |
+
+**`versionCode` discrepancy:** The committed `module.prop` has `versionCode=300` while the build-generated file has `versionCode=93` (current commit count). These are completely inconsistent. If a developer inspects the committed file, they will see a version that never matches what is actually flashed.
+
+---
+
+### 2. Hook Scripts Audit
+
+#### `post-fs-data.sh`
+
+**Source:** `zygisk/module/post-fs-data.sh` (4 lines, checked-in); build-generated version `build.sh` lines 780–784.
+
+**KernelSU lifecycle stage:** `post-fs-data` — runs as root before `/data` is mounted, during early init. This is the earliest module hook. OverlayFS mounts have already been applied by KernelSU before this script runs.
+
+**What it does:**
+- Line 4: `MODDIR=${0%/*}` — sets `MODDIR` to the directory of the script. No other action taken.
+
+**Is it idempotent?** Yes, trivially. The single executable statement is a shell variable assignment (`MODDIR=${0%/*}`) with no filesystem side effects. Running it zero or N times produces identical system state.
+
+**Differences between committed and build-generated versions:**
+- Committed (lines 1–4): has a comment `# Audio Bridge - post-fs-data.sh` and `# Keep this empty/minimal to never block boot`
+- Build-generated (build.sh lines 781–783): has only `# Keep empty to avoid blocking boot` (shorter comment, no script name)
+- Functional behavior is identical
+
+**KernelSU guideline compliance:**
+- The KernelSU spec states `post-fs-data.sh` should not perform blocking operations (sleep, network, long loops). This script does not — it is intentionally empty. COMPLIANT.
+- The script uses `#!/system/bin/sh` (both versions) as required. COMPLIANT.
+
+---
+
+#### `service.sh`
+
+**Source:** `zygisk/module/service.sh` (181 lines, checked-in); build-generated version `build.sh` lines 592–776.
+
+**KernelSU lifecycle stage:** `late_start service` — runs as root after Zygote starts and most system services are up, but before `sys.boot_completed` is set.
+
+**What it does (summary):**
+1. Sets `MODDIR`, initializes log file (lines 1–5)
+2. Grants 9+ runtime permissions via `pm grant` (lines 8–16 committed; lines 600–610 build-generated)
+3. Applies SELinux rules via `magiskpolicy`/`ksud`/`supolicy` (lines 23–48 committed; lines 613–644 build-generated)
+4. Locates and launches the daemon binary (lines 50–91)
+5. Background subshell: waits for `boot_completed`, installs APK, starts FGS (lines 93–150)
+6. Background status refresh loop: writes `webroot/status.json` every 15 seconds indefinitely (lines 152–180)
+
+**Is it idempotent?**
+
+The daemon start is conditionally idempotent: the guard at line 71 (`! pidof audio-bridge`) prevents double-launch if the daemon is healthy. The APK install at line 116 uses `pm install -r` (replace/upgrade) — safe to run again but generates duplicate log entries. The `pm grant` calls at lines 8–16 are idempotent (granting an already-granted permission is a no-op). The SELinux `apply_rule` calls are idempotent (adding already-present rules is a no-op for `magiskpolicy --live`). The status loop (lines 155–180) creates a new background process on every invocation — **not idempotent**: if `service.sh` is executed twice (e.g., by a module manager action), two perpetual status-refresh loops will run simultaneously.
+
+**Critical difference between committed and build-generated `service.sh`:**
+
+The `ksud` invocation for live SELinux policy differs between the two versions:
+
+| Version | Line | ksud command |
+|---------|------|-------------|
+| Committed (`zygisk/module/service.sh`) | line 33 | `/data/adb/ksud apply-sepolicy "$RULE"` |
+| Build-generated (`build.sh`) | line 623 | `/data/adb/ksud sepolicy patch "$RULE"` |
+
+The build-generated version (`ksud sepolicy patch`) is the documented KernelSU CLI interface for live policy application. The committed version (`ksud apply-sepolicy`) uses a non-existent subcommand (consistent with the B8 anomaly identified in Phase 2). Since the build-generated version overwrites the committed one before zipping, the **flashed module uses the correct `ksud sepolicy patch` form** — but the checked-in source file contains the incorrect form.
+
+**Additional difference in build-generated service.sh:**
+- The SELinux rule application block is backgrounded in the build-generated version (inside a `( ... ) &` subshell, build.sh lines 628–644), while the committed version executes it inline (lines 38–48 of service.sh). The background form means `service.sh` does not block waiting for policy tool invocations, which is better practice.
+- The build-generated version also grants `android.permission.READ_CALL_LOG` (build.sh line 604) which is absent from the committed version.
+
+**KernelSU guideline compliance:**
+- Uses `#!/system/bin/sh`. COMPLIANT.
+- The spec discourages long-running operations in `service.sh` itself (as opposed to backgrounding them). The daemon launch includes a `sleep 3` (line 61) and the stale-check loop can run for up to 5 seconds (lines 78–84) inline — these block `service.sh` for up to 8 seconds before it reaches the background subshells. This is a minor guideline concern but not a hard violation.
+- The status refresh loop (`while true; do ... sleep 15; done`) runs indefinitely with no exit condition. The KernelSU spec does not explicitly prohibit this, but it is unusual and wastes resources. LOW concern.
+
+---
+
+#### `uninstall.sh`
+
+**Source:** `zygisk/module/uninstall.sh` (59 lines, checked-in); build-generated version `build.sh` lines 794–850.
+
+**KernelSU lifecycle stage:** `uninstall` — runs as root during module removal, triggered by KernelSU Manager when the user removes the module. The KernelSU spec states this runs at the `post-fs-data` stage (early boot, before Android framework starts).
+
+**What it does:**
+1. Kills the daemon process via `pidof`+`kill`+`kill -9` (lines 12–18 committed / lines 805–811 build-generated)
+2. Removes runtime/diagnostic files from `/data/local/tmp/` (lines 21–27 / lines 814–820)
+3. Writes a deferred APK-removal script to `/data/adb/service.d/audio_bridge_cleanup.sh` (lines 33–56 / lines 823–845)
+4. The cleanup script: polls `boot_completed`, calls `am force-stop` + `pm uninstall com.audiobridge`, then removes itself
+
+**Is it idempotent?**
+
+Largely yes:
+- `kill "$PID"` on a non-existent PID returns an error but `2>/dev/null` suppresses it — no failure on second run
+- `rm -f` on non-existent files is a no-op
+- Writing to `/data/adb/service.d/audio_bridge_cleanup.sh` via `cat >` (truncate-and-overwrite): idempotent — overwrites any prior version
+- The cleanup script itself removes itself after execution (`rm -f /data/adb/service.d/audio_bridge_cleanup.sh`) — idempotent from a deferred state perspective
+
+**KernelSU guideline compliance:**
+- The spec states that `uninstall.sh` must NOT call `pm` or `am` directly because the framework is not available at this stage. The script correctly avoids calling `pm`/`am` directly and instead defers them via `service.d`. COMPLIANT.
+- Uses `#!/system/bin/sh`. COMPLIANT.
+- Removes `/data/local/tmp/audio_bridge.sock` (line 24 committed / line 817 build-generated). As noted in Phase 2 anomaly B7, the daemon uses an abstract Unix socket (`@audio_bridge`) which does not create a filesystem entry. The `rm` on this path is either a no-op or removes an unrelated file. LOW concern.
+
+**Differences between committed and build-generated versions:**
+- The committed version's comment at line 7 says "we drop a one-shot cleanup script into `/data/adb/service.d/` which KernelSU executes later"
+- The build-generated version's comment at line 796 says "Runs during KernelSU/Magisk module removal (post-fs-data stage)"
+- The deferred cleanup script's log messages are slightly different (`"cleanup: waiting for boot_completed"` vs `"cleanup script: waiting for boot_completed"`)
+- Functionally equivalent; behavior is identical
+
+---
+
+#### `scripts/uninstall.sh` (manual helper, not in module zip)
+
+**Source:** `scripts/uninstall.sh` (20 lines)
+
+This is the **manual development-path uninstall script**, not part of the KernelSU module zip. It is NOT executed by KernelSU at any lifecycle stage. It is intended for manual `adb shell` use.
+
+**What it does:**
+- Calls `sh /data/local/tmp/stop.sh` (line 7) — delegates daemon termination to the manual `stop.sh` script
+- Removes files from `/data/local/tmp/` (lines 10–15)
+- Removes the entire module directory from `/data/adb/modules/audio_bridge` (line 18)
+
+**Key differences from `zygisk/module/uninstall.sh`:**
+- Does NOT schedule APK removal via `service.d` — leaves `com.audiobridge` installed
+- Removes the module directory itself (`rm -rf /data/adb/modules/audio_bridge`) — `zygisk/module/uninstall.sh` does not do this (KernelSU handles module directory removal internally)
+- Calls `stop.sh` which uses PID file, not `pidof`
+- This script is not covered by any KernelSU lifecycle requirement
+
+---
+
+### 3. OverlayFS Structure Audit
+
+#### Zip assembly command
+
+**Source:** `build.sh` line 908
+
+```sh
+cd "$PROJECT_DIR/zygisk/module"
+zip -r9 "$PROJECT_DIR/build/audio-bridge-module.zip" ./*
+```
+
+The zip is assembled from the entire contents of `zygisk/module/` directory using `./*` glob. This means every file and directory under `zygisk/module/` at build time is included.
+
+#### `system/` overlay directory
+
+**Finding: No `system/` overlay directory is present in the module.**
+
+The build comment at lines 889–892 mentions `system/priv-app/AudioBridge/AudioBridge.apk` as a former approach ("We ship two copies"), but no `mkdir -p system/priv-app/AudioBridge` or `cp ... system/priv-app/` commands exist anywhere in `build.sh`. The `customize.sh` script (build.sh lines 549–557) actively removes `$MODPATH/system/priv-app`, `$MODPATH/system/bin`, and `$MODPATH/system/etc` — it cleans up what the comment describes as "old builds." The current build produces **no `system/` directory in the zip**.
+
+**Confirmed by source tree:** The Glob of `zygisk/module/**/*` shows no `system/` subdirectory. The files present are: `module.prop`, `post-fs-data.sh`, `service.sh`, `uninstall.sh`, `webroot/index.html`, `webroot/app.js`, `webroot/style.css`. At build time, the following are added: `customize.sh`, `sepolicy.rule`, `zygisk/arm64-v8a.so`, `AudioBridge.apk`, `files/audio-bridge`.
+
+**OverlayFS mechanism used:** The APK is delivered via `pm install -r -g` from `service.sh`, not via `system/` OverlayFS overlay. This is an intentional design change (documented in service.sh comment, build.sh lines 102–110) to avoid an Android 16 `handleBindApplication` crash triggered by the priv-app overlay path.
+
+#### `system.prop` file
+
+**Finding: No `system.prop` file exists** in `zygisk/module/` or anywhere in the build pipeline. No `cat > system.prop` heredoc appears in `build.sh`. The module does not set any system properties via the module mechanism. ABSENT.
+
+#### `META-INF/com/google/android/update-binary`
+
+**Finding: No `META-INF/` directory is created** in `build.sh` or present in `zygisk/module/`. The zip is assembled with `zip -r9 ./*` from `zygisk/module/` which contains no `META-INF/` subtree.
+
+This is a significant spec deviation (see Section 5 below).
+
+#### Zip structure summary
+
+Files present in the module zip (as of the build pipeline at `build.sh` lines 904–908):
+
+```
+audio-bridge-module.zip
+├── module.prop              # generated by build_zygisk() line 537
+├── customize.sh             # generated by build_zygisk() line 549
+├── sepolicy.rule            # generated by build_zygisk() line 564
+├── service.sh               # generated by build_zygisk() line 592
+├── post-fs-data.sh          # generated by build_zygisk() line 780
+├── uninstall.sh             # generated by build_zygisk() line 794
+├── AudioBridge.apk          # copied by main() line 898
+├── files/
+│   └── audio-bridge         # daemon binary, copied by main() line 904
+├── zygisk/
+│   └── arm64-v8a.so         # built by build_zygisk(); compile step ~line 500–526
+└── webroot/
+    ├── index.html
+    ├── app.js
+    └── style.css
+```
+
+**Absent from zip:**
+- `system/` overlay directory (removed by design — customize.sh cleans it)
+- `system.prop` (never generated)
+- `META-INF/` tree (never generated)
+
+---
+
+### 4. `update.json` Audit
+
+**Source:** `update.json` (6 lines)
+
+```json
+{
+  "version": "v3.1.93",
+  "versionCode": 93,
+  "zipUrl": "https://github.com/validkanaheiuser/audio-bridge-concept/releases/download/v3.1.93/audio-bridge-module.zip",
+  "changelog": "https://github.com/validkanaheiuser/audio-bridge-concept/releases/tag/v3.1.93"
+}
+```
+
+The KernelSU Module Guide specifies the update feed format as:
+
+```json
+{
+    "version": "<version string>",
+    "versionCode": <integer>,
+    "zipUrl": "<direct download URL for the module zip>",
+    "changelog": "<URL or text of changelog>"
+}
+```
+
+Field-by-field verification:
+
+| Field | Required? | Present? | Value | Compliance |
+|-------|-----------|----------|-------|------------|
+| `version` | YES | YES | `"v3.1.93"` | COMPLIANT — string, matches module.prop build-generated `version` |
+| `versionCode` | YES | YES | `93` | COMPLIANT — integer, matches build-generated `versionCode` |
+| `zipUrl` | YES | YES | GitHub Releases direct download URL | COMPLIANT — direct link to zip asset |
+| `changelog` | NO | YES | GitHub Releases tag URL | COMPLIANT |
+
+**`update.json` is generated by CI** (`.github/workflows/build.yml` line 95) and committed back to `main` with a `[skip ci]` tag after each release build. The `updateJson` field in the build-generated `module.prop` points to this file at `https://raw.githubusercontent.com/validkanaheiuser/audio-bridge-concept/main/update.json`.
+
+**Consistency check:**
+- `update.json` `version`: `v3.1.93` — matches build-generated `module.prop` `version=v3.1.93`
+- `update.json` `versionCode`: `93` — matches build-generated `module.prop` `versionCode=93`
+- Both are consistent with `git rev-list --count HEAD = 93`
+- The committed `module.prop` `versionCode=300` does NOT match `update.json` `versionCode=93` — a discrepancy that only matters if the committed file is inspected directly rather than the flashed version
+
+**URL format note:** The `zipUrl` points to a GitHub Release asset named `audio-bridge-module.zip`. CI releases this file via `gh release create` (build.yml). The URL pattern `releases/download/v3.1.93/audio-bridge-module.zip` is a direct GitHub release asset download — no redirect. COMPLIANT.
+
+---
+
+### 5. Deviations from KernelSU Spec
+
+The KernelSU Module Guide defines the following requirements. Each deviation is listed with what the spec requires, what the module does, and severity.
+
+#### C1 — `META-INF/` tree absent from module zip
+
+| | Detail |
+|---|---|
+| **Spec requires** | Module zips must contain `META-INF/com/google/android/update-binary` and `META-INF/com/google/android/updater-script`. `update-binary` is the installer script run by TWRP/flasher; `updater-script` is typically empty or a comment. KernelSU Manager uses these to detect and execute module installation. |
+| **Module does** | Zip is assembled with `zip -r9 ./*` from `zygisk/module/` (build.sh line 908). No `META-INF/` directory is created anywhere in the build pipeline. |
+| **Severity** | **HIGH** — Without `META-INF/com/google/android/update-binary`, the module zip may fail to flash via TWRP or a recovery flasher. KernelSU Manager (version-dependent) may or may not require this; some versions of KernelSU Manager generate a synthetic `update-binary` wrapper and can install zips without it, but this is not guaranteed across all KernelSU versions. The module cannot be flashed via standard TWRP recovery without this structure. |
+
+#### C2 — Committed `module.prop` is stale and inconsistent with build output
+
+| | Detail |
+|---|---|
+| **Spec requires** | `module.prop` in the flashed zip must be accurate and consistent with `update.json` `versionCode`. |
+| **Module does** | The committed `module.prop` has `version=v3.0`, `versionCode=300`, and is missing `minKernelSU` and `updateJson`. The build-generated version (the actual flashed file) has `version=v3.1.93`, `versionCode=93`, and includes both optional fields. |
+| **Severity** | **MEDIUM** — The committed file is never flashed (overwritten at build time), so there is no runtime impact. However, any developer inspecting the source `module.prop` to understand the deployed state will see incorrect information. The `versionCode=300` vs `versionCode=93` discrepancy is particularly confusing. |
+
+#### C3 — `ksud apply-sepolicy` in committed `service.sh` is not a valid KernelSU CLI subcommand
+
+| | Detail |
+|---|---|
+| **Spec requires** | Live SELinux policy application on KernelSU uses `ksud sepolicy patch <rule>` or relies on the `sepolicy.rule` file auto-loaded at boot. |
+| **Module does** | Committed `service.sh` line 33: `/data/adb/ksud apply-sepolicy "$RULE"`. Build-generated `service.sh` (build.sh line 623): `/data/adb/ksud sepolicy patch "$RULE"`. |
+| **Severity** | **MEDIUM** — The committed file would not work correctly on KernelSU devices if used. However, since build.sh overwrites it before zip assembly, the flashed module uses the correct form. The committed file is misleading but not functionally deployed. (This finding was also identified in Phase 2 as anomaly B8, confirmed here from the build.sh source of truth.) |
+
+#### C4 — No `system/` overlay (intentional but undocumented)
+
+| | Detail |
+|---|---|
+| **Spec requires** | OverlayFS modules can optionally include a `system/` directory whose contents are overlaid onto `/system` at `post-fs-data` stage. This is the standard mechanism for installing APKs as system/priv-app. |
+| **Module does** | No `system/` directory exists. The APK is delivered via `pm install -r -g` from `service.sh` instead. `customize.sh` removes any residual `system/` overlay from prior builds. |
+| **Severity** | **INFORMATIONAL** — `system/` is optional per spec. The design decision is documented in build.sh comments (lines 102–110: Android 16 priv-app crash avoidance). The absence of `system/` means the APK installs as a data-app, not a true system app — with implications for privileged permission grants (see Phase 2 anomaly B2 and Stage 2 analysis). |
+
+#### C5 — No `system.prop` file
+
+| | Detail |
+|---|---|
+| **Spec requires** | Modules may optionally include `system.prop` at the module root; KernelSU will set these properties at `post-fs-data` stage via `resetprop`. |
+| **Module does** | No `system.prop` file is generated or shipped. |
+| **Severity** | **INFORMATIONAL** — `system.prop` is optional. The module does not require custom system properties at the kernel/init level. No deviation from a hard requirement. |
+
+#### C6 — `service.sh` status refresh loop never terminates
+
+| | Detail |
+|---|---|
+| **Spec requires** | The KernelSU spec does not explicitly prohibit non-terminating background processes from `service.sh`, but the spirit of the module lifecycle is that `service.sh` should perform setup work and exit, not maintain perpetual background processes independent of module lifetime. |
+| **Module does** | `service.sh` lines 155–180: a `while true; do ... sleep 15; done` loop runs in a background subshell indefinitely. It has no connection to module removal or daemon lifecycle — it continues running after module uninstall until reboot. |
+| **Severity** | **LOW** — No hard spec violation; `service.sh` is not required to exit. The perpetual loop consumes resources (logcat drain every 15 seconds) and survives module uninstall. |
+
+#### C7 — `versionCode` derived from commit count, not semantic versioning
+
+| | Detail |
+|---|---|
+| **Spec requires** | `versionCode` must be an integer that increments with each new release. The spec does not mandate a specific derivation method. |
+| **Module does** | `versionCode = git rev-list --count HEAD` (build.sh line 530). This is the total commit count on the branch, not a manually managed integer. |
+| **Severity** | **INFORMATIONAL** — Technically compliant (always an incrementing integer for a linear history). However, this means any commit — including `[skip ci]` CI housekeeping commits (e.g., `update.json` push-back) — increments `versionCode`. A commit-count `versionCode` also resets to 1 if the branch is rewritten, and diverges from `update.json` if commits are added without a release. |
+
+#### C8 — `uninstall.sh` removes abstract socket path as filesystem file
+
+| | Detail |
+|---|---|
+| **Spec requires** | The spec does not address socket cleanup specifically. |
+| **Module does** | `zygisk/module/uninstall.sh` line 24: `rm -f /data/local/tmp/audio_bridge.sock`. The daemon uses abstract Unix socket `@audio_bridge` (per CLAUDE.md) which has no filesystem entry. |
+| **Severity** | **LOW** — The `rm` is a no-op for the abstract socket. If no other process created a named socket at that path, this command has no effect. Not a spec violation but indicates a misunderstanding of abstract vs. named Unix sockets. (Also identified in Phase 2 as anomaly B7.) |
+
+---
+
+### 6. Phase 3 Summary
+
+| Finding | ID | Severity |
+|---------|----|----------|
+| No `META-INF/` tree in module zip — may prevent TWRP/recovery flashing | C1 | HIGH |
+| Committed `module.prop` stale (v3.0/versionCode=300) vs. build-generated (v3.1.x/versionCode=N) | C2 | MEDIUM |
+| Committed `service.sh` uses invalid `ksud apply-sepolicy`; build-generated uses correct `ksud sepolicy patch` | C3 | MEDIUM |
+| No `system/` overlay — intentional for Android 16 compatibility | C4 | INFORMATIONAL |
+| No `system.prop` file | C5 | INFORMATIONAL |
+| Status refresh loop (`while true; do...`) never terminates, survives uninstall | C6 | LOW |
+| `versionCode` from commit count — functional but brittle | C7 | INFORMATIONAL |
+| `uninstall.sh` tries to remove abstract socket as filesystem path | C8 | LOW |
+
+**Most significant finding:** The module zip lacks `META-INF/com/google/android/update-binary` (C1), which is the standard KernelSU/Magisk module installer entry point. Whether this causes flash failure depends on the KernelSU Manager version — newer versions may synthesize the wrapper internally, but older versions and TWRP recovery require it. This should be verified against the target KernelSU Manager version.
+
+**Committed-vs-built discrepancy pattern:** A systemic issue across Phase 3 is that the committed source files (`module.prop`, `service.sh`, `post-fs-data.sh`, `uninstall.sh`) are **all overwritten at build time** by `build.sh` heredocs. The checked-in versions are stale drafts that do not represent what is actually flashed. This creates an ongoing source-of-truth confusion for anyone reading the repo without running the build.
+
+---
+
+*End of Phase 3 — KernelSU Analysis*
