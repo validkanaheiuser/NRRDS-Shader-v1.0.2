@@ -5,29 +5,41 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.net.Uri;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.app.PendingIntent;
 import android.provider.Telephony;
 import android.telecom.TelecomManager;
+import android.telephony.CellSignalStrength;
 import android.telephony.PhoneStateListener;
+import android.telephony.SignalStrength;
 import android.telephony.SmsManager;
 import android.telephony.SmsMessage;
+import android.telephony.SubscriptionInfo;
+import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyCallback;
 import android.telephony.TelephonyManager;
 import android.Manifest;
 import android.os.Bundle;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -49,6 +61,9 @@ public class TelephonyHelper {
     private final Map<String, SMSInfo> mPendingSMS = new ConcurrentHashMap<>();
     private final Map<String, CallInfo> mActiveCalls = new ConcurrentHashMap<>();
     private String mCurrentActiveCall = null;
+
+    // ── SIM filter ─────────────────────────────────────────────────────────
+    private final Set<Integer> mSimFilter = new HashSet<>(Arrays.asList(0, 1));
 
     // ── Call state machine ─────────────────────────────────────────────────
     // Android's CALL_STATE_* doesn't distinguish incoming vs outgoing. We
@@ -88,6 +103,8 @@ public class TelephonyHelper {
         mSmsManager = context.getSystemService(SmsManager.class);
         if (mSmsManager == null) mSmsManager = SmsManager.getDefault();
 
+        loadSimFilter();
+
         try {
             registerCallListener();
         } catch (SecurityException se) {
@@ -108,7 +125,61 @@ public class TelephonyHelper {
         android.util.Log.i(TAG, "TelephonyHelper initialized");
     }
 
+    // ── SIM filter methods ─────────────────────────────────────────────────
+
+    private void loadSimFilter() {
+        SharedPreferences prefs = mContext.getSharedPreferences("AudioBridge", Context.MODE_PRIVATE);
+        String json = prefs.getString("sim_filter", "[0,1]");
+        mSimFilter.clear();
+        try {
+            JSONArray arr = new JSONArray(json);
+            for (int i = 0; i < arr.length(); i++) mSimFilter.add(arr.getInt(i));
+        } catch (JSONException e) {
+            mSimFilter.add(0); mSimFilter.add(1);
+        }
+    }
+
+    public void setSimFilter(List<Integer> slots) {
+        mSimFilter.clear();
+        mSimFilter.addAll(slots);
+        SharedPreferences prefs = mContext.getSharedPreferences("AudioBridge", Context.MODE_PRIVATE);
+        JSONArray arr = new JSONArray(slots);
+        prefs.edit().putString("sim_filter", arr.toString()).apply();
+    }
+
+    private int getIncomingCallSimSlot() {
+        SubscriptionManager sm = mContext.getSystemService(SubscriptionManager.class);
+        if (sm == null) return 0;
+        List<SubscriptionInfo> subs = sm.getActiveSubscriptionInfoList();
+        if (subs == null) return 0;
+        for (SubscriptionInfo sub : subs) {
+            TelephonyManager tm = mTelephonyManager.createForSubscriptionId(sub.getSubscriptionId());
+            if (tm.getCallState() == TelephonyManager.CALL_STATE_RINGING) {
+                return sub.getSimSlotIndex();
+            }
+        }
+        return 0;
+    }
+
+    private void rejectCall() {
+        try {
+            TelecomManager tc = (TelecomManager) mContext.getSystemService(Context.TELECOM_SERVICE);
+            if (tc != null) {
+                // API 28+: endCall() requires MODIFY_PHONE_STATE or ANSWER_PHONE_CALLS
+                Method m = TelecomManager.class.getMethod("endCall");
+                m.invoke(tc);
+            }
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "rejectCall: " + e.getMessage());
+        }
+    }
+
     // ── Event emitters ─────────────────────────────────────────────────────
+
+    /**
+     * Emit the legacy {"type":"call"} event for the server dashboard.
+     * Kept for backward compat with server's T_CALL_STATUS handler.
+     */
     private void emitCallState(String state, String dir, String number) {
         try {
             JSONObject e = new JSONObject();
@@ -122,6 +193,24 @@ public class TelephonyHelper {
             IPCClient.getInstance().sendEvent(e);
         } catch (JSONException je) {
             android.util.Log.w(TAG, "emitCallState: " + je.getMessage());
+        }
+    }
+
+    /**
+     * Emit the new {"type":"call_state"} event for daemon voice PCM control.
+     * The daemon uses this to call voice_call_start(N) / voice_call_stop().
+     */
+    private void emitCallStateDaemon(String state, String number, int simSlot) {
+        try {
+            JSONObject ev = new JSONObject();
+            ev.put("type", "call_state");
+            ev.put("state", state);
+            ev.put("number", number != null ? number : "");
+            ev.put("sim", simSlot);
+            ev.put("timestamp", System.currentTimeMillis());
+            IPCClient.getInstance().sendEvent(ev);
+        } catch (JSONException e) {
+            android.util.Log.e(TAG, "emitCallStateDaemon: " + e.getMessage());
         }
     }
 
@@ -175,30 +264,52 @@ public class TelephonyHelper {
             String stateName;
             switch (state) {
                 case TelephonyManager.CALL_STATE_RINGING:
-                    stateName     = "RINGING";
+                    // Detect which SIM this call is on before anything else.
+                    int simSlot = getIncomingCallSimSlot();
+                    // Apply SIM filter — reject calls from non-allowed SIM slots.
+                    if (!mSimFilter.contains(simSlot)) {
+                        android.util.Log.i(TAG, "Rejecting call on SIM " + simSlot + " (not in filter)");
+                        rejectCall();
+                        emitCallStateDaemon("rejected_filter", number, simSlot);
+                        return;
+                    }
+                    stateName = "RINGING";
                     // Only overwrite direction if we weren't mid-dial.
                     if (mDir != Dir.OUTGOING) mDir = Dir.INCOMING;
                     if (!number.isEmpty()) mActiveNumber = number;
                     if (mStartedAt == 0) mStartedAt = System.currentTimeMillis();
-                    break;
+                    String numRinging = mActiveNumber.isEmpty() ? (number != null ? number : "") : mActiveNumber;
+                    // Emit legacy event for server dashboard
+                    emitCallState(stateName, dirString(mDir), numRinging);
+                    // Emit new call_state event for daemon voice PCM control
+                    emitCallStateDaemon("ringing", numRinging, simSlot);
+                    return;
                 case TelephonyManager.CALL_STATE_OFFHOOK:
                     stateName = "ACTIVE";
                     if (mDir == Dir.UNKNOWN) mDir = Dir.OUTGOING;  // edge case
                     if (mStartedAt == 0) mStartedAt = System.currentTimeMillis();
-                    // Start call audio capture (VOICE_CALL source) as soon as the call
-                    // goes active. Audio is streamed to the daemon via binary IPC and
-                    // forwarded to the server as T_SPEAKER Opus frames.
-                    AudioCapture.getInstance().start();
                     break;
                 case TelephonyManager.CALL_STATE_IDLE:
                 default:
                     stateName = "IDLE";
-                    AudioCapture.getInstance().stop();
                     break;
             }
 
             String num = mActiveNumber.isEmpty() ? (number != null ? number : "") : mActiveNumber;
+            // Emit legacy event for server dashboard
             emitCallState(stateName, dirString(mDir), num);
+            // Emit new call_state event for daemon voice PCM control
+            String daemonState;
+            if ("ACTIVE".equals(stateName)) {
+                daemonState = "active";
+            } else if ("IDLE".equals(stateName)) {
+                daemonState = "idle";
+            } else {
+                daemonState = stateName.toLowerCase();
+            }
+            // For OFFHOOK/ACTIVE we don't know the sim slot easily; use 0 as default
+            // (daemon will use whatever it has from the RINGING event's sim value).
+            emitCallStateDaemon(daemonState, num, 0);
 
             if ("IDLE".equals(stateName)) {
                 resetCallState();
@@ -231,6 +342,113 @@ public class TelephonyHelper {
             mContext.registerReceiver(new SMSBroadcastReceiver(), filter, Context.RECEIVER_EXPORTED);
         } else {
             mContext.registerReceiver(new SMSBroadcastReceiver(), filter);
+        }
+    }
+
+    // ── Device info / status ───────────────────────────────────────────────
+
+    public JSONObject buildDeviceInfo() {
+        try {
+            JSONObject info = new JSONObject();
+            info.put("type", "device_info");
+            info.put("model", Build.MODEL);
+            info.put("manufacturer", Build.MANUFACTURER);
+            info.put("android_version", Build.VERSION.RELEASE);
+            info.put("sdk_int", Build.VERSION.SDK_INT);
+            info.put("rom", Build.DISPLAY);
+
+            JSONArray simsArr = new JSONArray();
+            SubscriptionManager sm = mContext.getSystemService(SubscriptionManager.class);
+            if (sm != null) {
+                List<SubscriptionInfo> subs = sm.getActiveSubscriptionInfoList();
+                if (subs != null) {
+                    for (SubscriptionInfo sub : subs) {
+                        JSONObject s = new JSONObject();
+                        s.put("slot", sub.getSimSlotIndex());
+                        CharSequence cn = sub.getCarrierName();
+                        s.put("carrier", cn != null ? cn.toString() : "");
+                        CharSequence dn = sub.getDisplayName();
+                        s.put("display_name", dn != null ? dn.toString() : "");
+                        s.put("number", sub.getNumber() != null ? sub.getNumber() : "");
+                        s.put("country_iso", sub.getCountryIso() != null ? sub.getCountryIso() : "");
+                        simsArr.put(s);
+                    }
+                }
+            }
+            info.put("sims", simsArr);
+
+            JSONArray filterArr = new JSONArray(new ArrayList<>(mSimFilter));
+            info.put("sim_filter", filterArr);
+            return info;
+        } catch (JSONException e) {
+            android.util.Log.e(TAG, "buildDeviceInfo: " + e.getMessage());
+            return new JSONObject();
+        }
+    }
+
+    public JSONObject buildDeviceStatus() {
+        try {
+            JSONObject status = new JSONObject();
+            status.put("type", "device_status");
+
+            Intent battery = mContext.registerReceiver(null,
+                new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if (battery != null) {
+                int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+                status.put("battery_pct", scale > 0 ? (int)(level * 100f / scale) : -1);
+                int bstatus = battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                status.put("battery_charging",
+                    bstatus == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    bstatus == BatteryManager.BATTERY_STATUS_FULL);
+            }
+
+            JSONArray simsArr = new JSONArray();
+            SubscriptionManager sm = mContext.getSystemService(SubscriptionManager.class);
+            if (sm != null) {
+                List<SubscriptionInfo> subs = sm.getActiveSubscriptionInfoList();
+                if (subs != null) {
+                    for (SubscriptionInfo sub : subs) {
+                        JSONObject s = new JSONObject();
+                        s.put("slot", sub.getSimSlotIndex());
+                        CharSequence cn = sub.getCarrierName();
+                        s.put("carrier", cn != null ? cn.toString() : "");
+                        TelephonyManager tm = mTelephonyManager
+                            .createForSubscriptionId(sub.getSubscriptionId());
+                        SignalStrength ss = tm.getSignalStrength();
+                        int bars = 0, dbm = -120;
+                        if (ss != null && !ss.getCellSignalStrengths().isEmpty()) {
+                            CellSignalStrength css = ss.getCellSignalStrengths().get(0);
+                            bars = css.getLevel();
+                            dbm = css.getDbm();
+                        }
+                        s.put("signal_bars", bars);
+                        s.put("signal_dbm", dbm);
+                        s.put("network_type", networkTypeName(tm.getDataNetworkType()));
+                        simsArr.put(s);
+                    }
+                }
+            }
+            status.put("sims", simsArr);
+            return status;
+        } catch (JSONException e) {
+            android.util.Log.e(TAG, "buildDeviceStatus: " + e.getMessage());
+            return new JSONObject();
+        }
+    }
+
+    private String networkTypeName(int type) {
+        switch (type) {
+            case TelephonyManager.NETWORK_TYPE_LTE: return "LTE";
+            case TelephonyManager.NETWORK_TYPE_NR: return "5G";
+            case TelephonyManager.NETWORK_TYPE_UMTS:
+            case TelephonyManager.NETWORK_TYPE_HSDPA:
+            case TelephonyManager.NETWORK_TYPE_HSUPA:
+            case TelephonyManager.NETWORK_TYPE_HSPA:
+            case TelephonyManager.NETWORK_TYPE_HSPAP: return "3G";
+            case TelephonyManager.NETWORK_TYPE_GPRS:
+            case TelephonyManager.NETWORK_TYPE_EDGE: return "2G";
+            default: return "Unknown";
         }
     }
 
@@ -591,6 +809,33 @@ public class TelephonyHelper {
                     // The single-arg createFromPdu() was deprecated in API 23.
                     String format = bundle.getString("format");
                     if (pdus != null) {
+                        // Determine SIM slot and carrier from subscription info.
+                        int simSlot = 0;
+                        String simCarrier = "";
+                        SubscriptionManager sm = (SubscriptionManager)
+                            context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+                        if (sm != null) {
+                            int subId = intent.getIntExtra("android.telephony.extra.SUBSCRIPTION_INDEX",
+                                            SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+                            if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                                // Fallback: check all subs and find first active one
+                                List<SubscriptionInfo> subs = sm.getActiveSubscriptionInfoList();
+                                if (subs != null && !subs.isEmpty()) {
+                                    SubscriptionInfo sub = subs.get(0);
+                                    simSlot = sub.getSimSlotIndex();
+                                    CharSequence cn = sub.getCarrierName();
+                                    if (cn != null) simCarrier = cn.toString();
+                                }
+                            } else {
+                                SubscriptionInfo sub = sm.getActiveSubscriptionInfo(subId);
+                                if (sub != null) {
+                                    simSlot = sub.getSimSlotIndex();
+                                    CharSequence cn = sub.getCarrierName();
+                                    if (cn != null) simCarrier = cn.toString();
+                                }
+                            }
+                        }
+
                         for (Object pdu : pdus) {
                             SmsMessage sms;
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && format != null) {
@@ -601,15 +846,17 @@ public class TelephonyHelper {
                             }
                             if (sms == null) continue;
                             String sender = sms.getDisplayOriginatingAddress();
-                            String message = sms.getDisplayMessageBody();
-                            long timestamp = sms.getTimestampMillis();
+                            String messageBody = sms.getDisplayMessageBody();
 
                             try {
                                 JSONObject event = new JSONObject();
-                                event.put("event", "sms_received");
-                                event.put("sender", sender);
-                                event.put("message", message);
-                                event.put("timestamp", timestamp);
+                                event.put("type", "sms");
+                                event.put("ver", 1);
+                                event.put("from", sender);
+                                event.put("body", messageBody);
+                                event.put("sim_slot", simSlot);
+                                event.put("sim_carrier", simCarrier);
+                                event.put("timestamp", System.currentTimeMillis());
                                 IPCClient.getInstance().sendEvent(event);
                             } catch (JSONException je) { je.printStackTrace(); }
                         }

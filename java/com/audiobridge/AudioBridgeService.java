@@ -78,6 +78,17 @@ public class AudioBridgeService extends Service {
             diag("TelephonyHelper init failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
         try {
+            // Register the connected listener before init() starts the connection thread.
+            IPCClient.getInstance().setOnConnectedListener(() -> {
+                TelephonyHelper th = TelephonyHelper.getInstance();
+                if (th != null) {
+                    try {
+                        IPCClient.getInstance().sendEvent(th.buildDeviceInfo());
+                    } catch (Exception e) {
+                        diag("sendDeviceInfo on connect: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    }
+                }
+            });
             IPCClient.init(this);
         } catch (Exception e) {
             diag("IPCClient init failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());

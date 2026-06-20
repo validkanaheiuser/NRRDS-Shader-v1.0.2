@@ -6,19 +6,20 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -38,15 +39,24 @@ public class IPCClient {
     private PrintWriter mOut;
     private BufferedReader mIn;
 
-    // Dedicated binary socket for streaming PCM audio to the daemon.
-    // Kept separate from mSocket so audio writes never block the JSON IPC path.
-    private LocalSocket     mAudioSocket;
-    private OutputStream    mAudioOut;
-
     private boolean mRunning = false;
     private ExecutorService mExecutor = Executors.newSingleThreadExecutor();
     private Handler mMainHandler = new Handler(Looper.getMainLooper());
     private android.content.Context mContext;
+
+    // ── Connect listener ───────────────────────────────────────────────────
+
+    public interface OnConnectedListener {
+        void onConnected();
+    }
+
+    private OnConnectedListener mOnConnectedListener;
+
+    public void setOnConnectedListener(OnConnectedListener l) {
+        mOnConnectedListener = l;
+    }
+
+    // ── Singleton ──────────────────────────────────────────────────────────
 
     public static synchronized IPCClient init(android.content.Context ctx) {
         if (sInstance == null) {
@@ -69,7 +79,7 @@ public class IPCClient {
             // grants in our sepolicy.rule; if not, we still have logcat.
         }
     }
-    
+
     public static synchronized IPCClient getInstance() {
         if (sInstance == null) {
             sInstance = new IPCClient();
@@ -123,7 +133,11 @@ public class IPCClient {
         mOut.println("HELO_JAVA");
         diag("Connected — HELO_JAVA sent");
         setStatus("Daemon connected · telephony ready");
-        connectAudioStream();
+
+        // Notify listener on connection (used by AudioBridgeService to send device_info).
+        if (mOnConnectedListener != null) {
+            mOnConnectedListener.onConnected();
+        }
 
         String line;
         while (mRunning && (line = mIn.readLine()) != null) {
@@ -141,11 +155,6 @@ public class IPCClient {
             mOut = null;
             mIn  = null;
             mSocket = null;
-            mAudioOut = null;
-            if (mAudioSocket != null) {
-                try { mAudioSocket.close(); } catch (IOException ignored) {}
-                mAudioSocket = null;
-            }
         }
         try { sock.close(); } catch (IOException ignored) {}
         throw new IOException("Socket closed by remote");
@@ -155,25 +164,49 @@ public class IPCClient {
         mMainHandler.post(() -> {
             try {
                 String cmd = json.getString("command");
-                TelephonyHelper th = TelephonyHelper.getInstance(null);
-                if (th == null) return;
-                
+                TelephonyHelper th = TelephonyHelper.getInstance();
+
                 if ("place_call".equals(cmd)) {
-                    th.placeCall(json.getString("number"));
+                    if (th != null) th.placeCall(json.getString("number"));
                 } else if ("end_call".equals(cmd)) {
-                    th.endCall();
+                    if (th != null) th.endCall();
                 } else if ("answer_call".equals(cmd)) {
-                    th.answerCall();
+                    if (th != null) th.answerCall();
                 } else if ("mute".equals(cmd)) {
-                    th.setMute(json.optBoolean("on", true));
+                    if (th != null) th.setMute(json.optBoolean("on", true));
                 } else if ("send_sms".equals(cmd)) {
-                    th.sendSMS(json.getString("number"), json.getString("message"));
+                    if (th != null) th.sendSMS(json.getString("number"), json.getString("message"));
                 } else if ("dtmf".equals(cmd)) {
-                    th.sendDtmf(json.optString("digit", ""));
+                    if (th != null) th.sendDtmf(json.optString("digit", ""));
                 } else if ("audio_route".equals(cmd)) {
-                    th.setAudioRoute(json.optString("route", "earpiece"));
+                    if (th != null) th.setAudioRoute(json.optString("route", "earpiece"));
                 } else if ("volume".equals(cmd)) {
-                    th.setVolume(json.optInt("level", 7));
+                    if (th != null) th.setVolume(json.optInt("level", 7));
+                } else if ("set_sim_filter".equals(cmd)) {
+                    JSONArray slots = json.optJSONArray("allowed_sims");
+                    if (slots != null && th != null) {
+                        List<Integer> slotList = new ArrayList<>();
+                        for (int i = 0; i < slots.length(); i++) {
+                            try { slotList.add(slots.getInt(i)); } catch (JSONException ignore) {}
+                        }
+                        th.setSimFilter(slotList);
+                    }
+                } else if ("get_device_status".equals(cmd)) {
+                    if (th != null) {
+                        try {
+                            sendEvent(th.buildDeviceStatus());
+                        } catch (Exception e) {
+                            Log.e(TAG, "get_device_status: " + e.getMessage());
+                        }
+                    }
+                } else if ("get_device_info".equals(cmd)) {
+                    if (th != null) {
+                        try {
+                            sendEvent(th.buildDeviceInfo());
+                        } catch (Exception e) {
+                            Log.e(TAG, "get_device_info: " + e.getMessage());
+                        }
+                    }
                 } else {
                     Log.w(TAG, "Unknown command from daemon: " + cmd);
                 }
@@ -192,69 +225,6 @@ public class IPCClient {
                 mOut.println(json.toString());
             } else {
                 Log.w(TAG, "sendEvent: IPC not connected, dropped: " + json.toString());
-            }
-        }
-    }
-
-    /**
-     * Open a second abstract socket connection dedicated to binary PCM streaming.
-     * Protocol: [b"HELO_AUDIO\n"] then repeating [4-byte BE length][PCM bytes].
-     */
-    private void connectAudioStream() {
-        new Thread(() -> {
-            try {
-                LocalSocket s = new LocalSocket();
-                s.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
-                OutputStream out = s.getOutputStream();
-                out.write("HELO_AUDIO\n".getBytes("UTF-8"));
-                out.flush();
-                synchronized (IPCClient.this) {
-                    mAudioSocket = s;
-                    mAudioOut    = out;
-                }
-                diag("Audio stream connected");
-                // Keep thread alive to maintain the connection until the main socket closes.
-                InputStream in = s.getInputStream();
-                //noinspection ResultOfMethodCallIgnored
-                while (mRunning) {
-                    int r = in.read(new byte[64]);
-                    if (r < 0) break;
-                }
-            } catch (IOException e) {
-                diag("Audio stream connect failed: " + e.getMessage());
-            }
-            synchronized (IPCClient.this) {
-                if (mAudioSocket != null) {
-                    try { mAudioSocket.close(); } catch (IOException ignored) {}
-                    mAudioSocket = null;
-                }
-                mAudioOut = null;
-            }
-        }, "AudioIPC").start();
-    }
-
-    /**
-     * Send a raw PCM chunk to the daemon over the binary audio socket.
-     * Frame format: [4-byte big-endian length][PCM bytes (S16LE, 8 kHz, mono)].
-     * Non-blocking: silently drops the frame if the socket is not yet ready.
-     */
-    public void sendAudio(byte[] buf, int offset, int len) {
-        OutputStream out;
-        synchronized (this) { out = mAudioOut; }
-        if (out == null) return;
-        byte[] hdr = {
-            (byte)(len >> 24), (byte)(len >> 16), (byte)(len >> 8), (byte)len
-        };
-        try {
-            out.write(hdr);
-            out.write(buf, offset, len);
-        } catch (IOException e) {
-            synchronized (this) {
-                mAudioOut = null;
-                if (mAudioSocket != null) {
-                    try { mAudioSocket.close(); } catch (IOException ignored) {}
-                    mAudioSocket = null;
-                }
             }
         }
     }
