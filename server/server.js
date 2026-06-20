@@ -14,6 +14,8 @@
  *     ?dir=listen|speak|both
  */
 
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
 const net    = require('net');
 const http   = require('http');
 const crypto = require('crypto');

@@ -10,6 +10,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
