@@ -224,16 +224,54 @@ const DAEMON  = MODDIR + '/files/audio-bridge';
 const ksuAvail = typeof ksu !== 'undefined' && typeof ksu.exec === 'function';
 if (!ksuAvail) document.getElementById('ro-notice').classList.remove('hidden');
 
+// KernelSU's WebUI exec bridge is CALLBACK-based on most managers:
+//   ksu.exec(cmd, optionsJson, callbackName)  -> void
+//   ...later...  window[callbackName](errno, stdout, stderr)
+// The old code did `await ksu.exec(cmd)`, which is undefined on those builds, so
+// every write reported "save failed: null". This wrapper drives the callback
+// API and transparently handles promise-/string-returning variants too
+// (KernelSU-Next, MMRL, etc.).
+function ksuExec(command) {
+  return new Promise((resolve) => {
+    const cbName = 'ksuCb_' + Date.now() + '_' + Math.floor(Math.random() * 1e9);
+    let settled = false;
+    const finish = (errno, stdout, stderr) => {
+      if (settled) return;
+      settled = true;
+      try { delete window[cbName]; } catch (_) {}
+      resolve({ errno: errno | 0, stdout: stdout || '', stderr: stderr || '' });
+    };
+    window[cbName] = (errno, stdout, stderr) => finish(errno, stdout, stderr);
+
+    let ret;
+    try {
+      ret = ksu.exec(command, '{}', cbName);   // standard callback API
+    } catch (_) {
+      try { ret = ksu.exec(command); }          // single-arg variants
+      catch (e) { return finish(1, '', String(e)); }
+    }
+
+    if (ret && typeof ret.then === 'function') {          // promise-style
+      ret.then(
+        r => (r && typeof r === 'object')
+          ? finish(r.errno, r.stdout != null ? r.stdout : r.output, r.stderr)
+          : finish(0, r == null ? '' : String(r), ''),
+        e => finish(1, '', String(e)));
+    } else if (typeof ret === 'string') {                 // sync string-style
+      finish(0, ret, '');
+    } else {
+      // callback-style: result arrives via window[cbName]; guard a hung bridge.
+      setTimeout(() => finish(1, '', 'exec timeout'), 20000);
+    }
+  });
+}
+
 async function sh(cmd) {
   if (!ksuAvail) return { ok: false, out: '', err: 'ksu unavailable' };
   try {
-    const r = await ksu.exec(cmd);
-    if (!r) return { ok: false, out: '', err: 'null' };
-    const errno  = r.errno  !== undefined ? r.errno  : 1;
-    const stdout = (r.stdout !== undefined ? r.stdout : r.output || '').trimEnd();
-    const stderr = (r.stderr || '').trimEnd();
-    return { ok: errno === 0, out: stdout, err: stderr };
-  } catch(e) { return { ok: false, out: '', err: String(e) }; }
+    const r = await ksuExec(cmd);
+    return { ok: (r.errno | 0) === 0, out: (r.stdout || '').trimEnd(), err: (r.stderr || '').trimEnd() };
+  } catch (e) { return { ok: false, out: '', err: String(e) }; }
 }
 
 // fetch fallback for read-only (KSU Manager serves webroot via local HTTP)
@@ -377,11 +415,23 @@ async function saveAndRestart() {
   const wr = await writeConfig(cfg);
   if (!wr.ok) { showAlert('save failed: ' + (wr.err || wr.out), 'err'); return; }
   showAlert('restarting daemon…', 'info');
-  await sh('pkill -f audio-bridge 2>/dev/null; true');
-  await new Promise(r => setTimeout(r, 6000));
+  await sh('pkill -9 -x audio-bridge 2>/dev/null; true');
+  await new Promise(r => setTimeout(r, 2000));
+  // Relaunch explicitly (don't rely on a respawn loop that may not be running).
+  await sh(daemonLaunchCmd());
+  await new Promise(r => setTimeout(r, 5000));   // let daemon bind @audio_bridge + Java reconnect
   await refreshStatus();
   showAlert('done — daemon restarted.', 'ok');
   updateServerKV(cfg);
+}
+
+// Launch command shared by start / restart. MUST use --daemon so the process
+// fork()+setsid()s into its own session — otherwise it stays a child of the
+// ksu.exec shell and dies (SIGHUP) when that shell exits, taking the
+// @audio_bridge IPC socket with it (APK can then never reconnect).
+function daemonLaunchCmd() {
+  return 'export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64; '
+    + DAEMON + ' --daemon --config ' + CFG + ' >> ' + SVCLOG + ' 2>&1 &';
 }
 
 async function killDaemon() {
@@ -395,12 +445,10 @@ async function killDaemon() {
 
 async function startDaemon() {
   if (!ksuAvail) { showAlert('kernelsu manager required.', 'err'); return; }
-  const cmd = '[ -f ' + CFG + ' ] || { echo "no config"; exit 1; }; '
-    + 'export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64; '
-    + DAEMON + ' --config ' + CFG + ' >> ' + SVCLOG + ' 2>&1 &';
+  const cmd = '[ -f ' + CFG + ' ] || { echo "no config"; exit 1; }; ' + daemonLaunchCmd();
   const r = await sh(cmd);
   if (r.ok) {
-    await new Promise(res => setTimeout(res, 2000));
+    await new Promise(res => setTimeout(res, 3000));   // daemonize + bind socket + Java reconnect
     await refreshStatus();
     showAlert('daemon started.', 'ok');
   } else {

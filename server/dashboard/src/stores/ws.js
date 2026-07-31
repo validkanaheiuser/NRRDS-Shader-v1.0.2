@@ -58,27 +58,40 @@ export const useWsStore = defineStore('ws', () => {
   });
 
   // ── WebSocket ──────────────────────────────────────────────
-  let ws = null, reconnectTimer = null;
+  let ws = null, reconnectTimer = null, failCount = 0;
 
   function connect() {
     if (!auth.token) return;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     authFailed.value = false;
+    let opened = false;
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}/ws/ui?session=${auth.token}`);
 
-    ws.onopen  = () => { connected.value = true; authFailed.value = false; addLog('Đã kết nối', 'ev'); };
+    ws.onopen  = () => { opened = true; failCount = 0; connected.value = true; authFailed.value = false; addLog('Đã kết nối', 'ev'); };
     ws.onclose = (ev) => {
       connected.value = false;
-      if (ev.code === 4401 || ev.code === 1006) {
-        // 1006 = abnormal close (server rejected the upgrade → 401)
+      // 4401 = server explicitly rejected auth. Everything else — including 1006
+      // (abnormal close on a server restart / network blip) — must reconnect.
+      if (ev.code === 4401) {
         authFailed.value = true;
         addLog('Xác thực thất bại', 'er');
         return;
       }
-      addLog('Mất kết nối — thử lại...', 'er');
-      reconnectTimer = setTimeout(connect, 3000);
+      if (opened) {
+        // Was connected then dropped (server restart / network) → reconnect fast.
+        authFailed.value = false;
+        addLog('Mất kết nối — thử lại...', 'er');
+        reconnectTimer = setTimeout(connect, 2000);
+      } else {
+        // Never established: server still coming up, or bad token. Keep retrying
+        // with backoff; only hint at an auth problem after a few failures.
+        failCount++;
+        if (failCount >= 4) { authFailed.value = true; addLog('Không kết nối được — kiểm tra đăng nhập/server', 'er'); }
+        else addLog('Chưa kết nối được — thử lại...', 'er');
+        reconnectTimer = setTimeout(connect, Math.min(2000 * failCount, 10000));
+      }
     };
     ws.onerror = () => {};
     ws.onmessage = ev => {

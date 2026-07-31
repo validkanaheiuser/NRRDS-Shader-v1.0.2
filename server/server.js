@@ -842,8 +842,22 @@ const tcpServer = net.createServer(socket => {
   handleDevice(socket).catch(e => warn('handleDevice:', e && e.message));
 });
 
-tcpServer.on('error', e => warn('tcpServer error:', e && e.message));
-httpServer.on('error', e => warn('httpServer error:', e && e.message));
+// A failed listen (esp. EADDRINUSE) must be LOUD and fatal — otherwise the
+// process keeps running half-bound (e.g. HTTP up but the device port :59100
+// dead), which looks "started" but silently accepts no devices.
+function onListenError(name, port) {
+  return (e) => {
+    if (e && e.code === 'EADDRINUSE') {
+      warn(`FATAL: ${name} port ${port} is already in use.`);
+      warn(`  Another instance is still running, or another app owns the port.`);
+      warn(`  Stop it (or change the port in .env) and start again. Exiting.`);
+      process.exit(1);
+    }
+    warn(`${name} server error:`, e && e.message);
+  };
+}
+tcpServer.on('error',  onListenError('TCP',  TCP_PORT));
+httpServer.on('error', onListenError('HTTP', HTTP_PORT));
 
 tcpServer.listen(TCP_PORT, '0.0.0.0', () => {
   info(`TCP on :${TCP_PORT} (HMAC auth, Opus@48k)`);

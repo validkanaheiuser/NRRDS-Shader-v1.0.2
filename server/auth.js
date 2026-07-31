@@ -1,11 +1,14 @@
-const Database = require('better-sqlite3');
+// Uses Node's built-in SQLite (node:sqlite) — no native module to compile,
+// works on Node 22.5+ (with --experimental-sqlite) and Node 23.4+/24 without a
+// flag. This avoids the better-sqlite3 prebuild/ABI headaches entirely.
+const { DatabaseSync } = require('node:sqlite');
 const crypto   = require('crypto');
 const path     = require('path');
 
 const DB_PATH = process.env.AUTH_DB || path.join(__dirname, 'auth.db');
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+const db = new DatabaseSync(DB_PATH);
+db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA foreign_keys = ON');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -96,7 +99,15 @@ const getUserDevices = userId =>
 function setUserDevices(userId, deviceIds) {
   const del = db.prepare('DELETE FROM user_devices WHERE user_id = ?');
   const ins = db.prepare('INSERT OR IGNORE INTO user_devices (user_id, device_id) VALUES (?, ?)');
-  db.transaction(() => { del.run(userId); for (const d of deviceIds) ins.run(userId, d); })();
+  db.exec('BEGIN');
+  try {
+    del.run(userId);
+    for (const d of deviceIds) ins.run(userId, d);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 module.exports = {

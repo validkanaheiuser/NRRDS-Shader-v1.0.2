@@ -12,9 +12,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api':      { target: 'http://localhost:8000', changeOrigin: true },
-      '/ws/ui':    { target: 'ws://localhost:8000',   ws: true },
-      '/ws/audio': { target: 'ws://localhost:8000',   ws: true },
+      '/api':      { target: 'http://localhost:8090', changeOrigin: true },
+      '/ws/ui':    { target: 'ws://localhost:8090',   ws: true },
+      '/ws/audio': { target: 'ws://localhost:8090',   ws: true },
     },
   },
 });

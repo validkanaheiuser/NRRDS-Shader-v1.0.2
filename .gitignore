@@ -11,3 +11,9 @@ server/__pycache__/
 *.pyc
 server/opus.dll
 server/server.zip
+
+# Dashboard build output (served by server) + runtime auth DB
+server/public/
+server/auth.db
+server/auth.db-*
+*.db
