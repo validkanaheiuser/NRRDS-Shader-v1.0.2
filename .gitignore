@@ -1,2 +1,13 @@
 server/server.crt
 server/server.key
+
+# Secrets and runtime config
+server/.env
+
+# Dependencies / build artifacts
+server/node_modules/
+server/dashboard/node_modules/
+server/__pycache__/
+*.pyc
+server/opus.dll
+server/server.zip

@@ -23,6 +23,7 @@ const path   = require('path');
 const fs     = require('fs');
 const { URL } = require('url');
 const WebSocket = require('ws');
+const auth   = require('./auth');
 
 // ── Protocol constants ────────────────────────────────────────────────────────
 const T_SPEAKER     = 1;
@@ -37,6 +38,12 @@ const AUTH_TOKEN = process.env.AUDIO_BRIDGE_TOKEN;
 if (!AUTH_TOKEN) throw new Error('AUDIO_BRIDGE_TOKEN environment variable is required');
 const TCP_PORT   = parseInt(process.env.AUDIO_BRIDGE_TCP_PORT  || '59100', 10);
 const HTTP_PORT  = parseInt(process.env.AUDIO_BRIDGE_HTTP_PORT || '8000',  10);
+
+// Realtime audio jitter buffers (in 20ms frames). Smaller = lower latency but
+// less tolerance for network jitter (dropped/late frames = brief audio gaps).
+// Under backpressure we drop the OLDEST frame so latency never grows unbounded.
+const LISTEN_Q_MAX = Math.max(2, parseInt(process.env.AUDIO_BRIDGE_LISTEN_Q || '10', 10)); // speaker→browser
+const MIC_Q_MAX    = Math.max(2, parseInt(process.env.AUDIO_BRIDGE_MIC_Q    || '10', 10)); // browser→phone
 
 const NATIVE_RATE   = 48000;
 const FRAME_MS      = 20;
@@ -189,7 +196,7 @@ class UIListener {
     if (this._waiter) {
       const res = this._waiter; this._waiter = null; res(pcm);
     } else {
-      if (this._q.length >= 100) this._q.shift(); // drop oldest to bound latency
+      if (this._q.length >= LISTEN_Q_MAX) this._q.shift(); // drop oldest to bound latency
       this._q.push(pcm);
     }
   }
@@ -250,7 +257,7 @@ class AudioHub {
     if (this._upWaiter) {
       const res = this._upWaiter; this._upWaiter = null; res(pkt);
     } else {
-      if (this._upQ.length >= 50) this._upQ.shift();
+      if (this._upQ.length >= MIC_Q_MAX) this._upQ.shift();
       this._upQ.push(pkt);
     }
   }
@@ -321,7 +328,7 @@ class Device {
 class DeviceManager {
   constructor() {
     this.devices   = new Map();   // id → Device
-    this.uiClients = new Set();   // WebSocket
+    this.uiClients = new Map();   // ws → session
   }
 
   add(d) {
@@ -336,9 +343,9 @@ class DeviceManager {
     this.broadcastState();
   }
 
-  connectUI(ws) {
-    this.uiClients.add(ws);
-    ws.send(JSON.stringify(this._state()), err => {
+  connectUI(ws, session) {
+    this.uiClients.set(ws, session);
+    ws.send(JSON.stringify(this._stateFor(session)), err => {
       if (err) warn('connectUI send error:', err.message);
     });
   }
@@ -349,29 +356,41 @@ class DeviceManager {
     try { ws.send(s); } catch (_) { this.uiClients.delete(ws); }
   }
 
+  _allowedIds(session) {
+    if (!session || session.role === 'admin') return null; // null = all
+    return auth.getUserDevices(session.user_id);
+  }
+
   broadcastState() {
-    const s = JSON.stringify(this._state());
-    for (const ws of this.uiClients) this._wsend(ws, s);
+    for (const [ws, session] of this.uiClients) {
+      this._wsend(ws, JSON.stringify(this._stateFor(session)));
+    }
   }
 
   broadcastEvent(ev) {
     const s = JSON.stringify(ev);
-    for (const ws of this.uiClients) this._wsend(ws, s);
+    for (const [ws, session] of this.uiClients) {
+      const allowed = this._allowedIds(session);
+      if (!allowed || allowed.includes(ev.device_id)) this._wsend(ws, s);
+    }
   }
 
-  _state() {
+  _stateFor(session) {
+    const allowed = this._allowedIds(session);
     return {
       type:    'state_update',
-      devices: [...this.devices.values()].map(d => ({
-        id: d.id, name: d.name, brand: d.brand, android: d.android,
-        call: {
-          state:      d.callState,
-          direction:  d.callDirection,
-          number:     d.activeNumber,
-          started_at: d.callStartedAt,
-          muted:      d.callMuted,
-        },
-      })),
+      devices: [...this.devices.values()]
+        .filter(d => !allowed || allowed.includes(d.id))
+        .map(d => ({
+          id: d.id, name: d.name, brand: d.brand, android: d.android,
+          call: {
+            state:      d.callState,
+            direction:  d.callDirection,
+            number:     d.activeNumber,
+            started_at: d.callStartedAt,
+            muted:      d.callMuted,
+          },
+        })),
     };
   }
 }
@@ -455,7 +474,7 @@ async function handleDevice(socket) {
         if (!pkt) break;
         device.sendFrame(T_VIRTUAL_MIC, pkt);
       }
-    })();
+    })().catch(e => warn('uplink pump', device && device.id, e && e.message));
 
     // Main receive loop
     while (device.connected) {
@@ -515,10 +534,9 @@ async function handleDevice(socket) {
 }
 
 // ── WS: /ws/ui ───────────────────────────────────────────────────────────────
-function handleUI(ws) {
-  mgr.connectUI(ws);
+function handleUI(ws, session) {
+  mgr.connectUI(ws, session);
 
-  // Cloudflare drops idle WebSocket connections after 100s. Ping every 45s.
   const ping = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
     else clearInterval(ping);
@@ -533,8 +551,14 @@ function handleUI(ws) {
     const cmd = data.command;
     const did = data.device_id;
     if (!did || !mgr.devices.has(did)) return;
-    const d = mgr.devices.get(did);
 
+    // Authorization: non-admin can only control assigned devices
+    if (session.role !== 'admin') {
+      const allowed = auth.getUserDevices(session.user_id);
+      if (!allowed.includes(did)) return;
+    }
+
+    const d = mgr.devices.get(did);
     try {
       switch (cmd) {
         case 'dial':        d.sendControl('dial',        { number: data.number }); break;
@@ -545,6 +569,7 @@ function handleUI(ws) {
         case 'dtmf':        d.sendControl('dtmf',        { digit: String(data.digit || '') }); break;
         case 'audio_route': d.sendControl('audio_route', { route: String(data.route || 'earpiece') }); break;
         case 'volume':      d.sendControl('volume',      { level: parseInt(data.level || 7, 10) }); break;
+        case 'set_sim_filter': d.sendControl('set_sim_filter', { allowed_sims: data.allowed_sims || [] }); break;
         default:            warn('unknown ui command:', cmd);
       }
     } catch (e) {
@@ -579,7 +604,7 @@ function handleAudio(ws, deviceId, rate, dir) {
         if (!pcm) break;
         try { ws.send(pcm); } catch (_) { break; }
       }
-    })();
+    })().catch(e => warn('audio pump', deviceId, e && e.message));
   }
 
   ws.on('message', msg => {
@@ -608,22 +633,164 @@ function handleAudio(ws, deviceId, rate, dir) {
   ws.on('error', e => warn('audio ws:', e.message));
 }
 
-// ── HTTP server ───────────────────────────────────────────────────────────────
-const dashboardPath = path.join(__dirname, 'dashboard.html');
-
-const httpServer = http.createServer((req, res) => {
-  if (req.method !== 'GET' || req.url.split('?')[0] !== '/') {
-    res.writeHead(404); res.end('not found'); return;
-  }
-  fs.readFile(dashboardPath, 'utf8', (err, html) => {
-    if (err) {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<h1>Audio Bridge</h1><p>dashboard.html missing next to server.js</p>');
-    } else {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-    }
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end',  () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch(e) { resolve({}); } });
+    req.on('error', reject);
   });
+}
+
+function json(res, status, body) {
+  const s = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(s) });
+  res.end(s);
+}
+
+function sessionFromReq(req) {
+  const auth_hdr = req.headers['authorization'] || '';
+  const token = auth_hdr.startsWith('Bearer ') ? auth_hdr.slice(7) : null;
+  return token ? auth.getSession(token) : null;
+}
+
+function requireAdmin(req, res) {
+  const session = sessionFromReq(req);
+  if (!session)                 { json(res, 401, { error: 'Chưa đăng nhập' }); return null; }
+  if (session.role !== 'admin') { json(res, 403, { error: 'Chỉ admin' });      return null; }
+  return session;
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js':   'application/javascript',
+  '.css':  'text/css',
+  '.svg':  'image/svg+xml',
+  '.ico':  'image/x-icon',
+  '.png':  'image/png',
+  '.woff2':'font/woff2',
+};
+
+const PUBLIC = path.join(__dirname, 'public');
+
+function serveStatic(res, filePath) {
+  const ext  = path.extname(filePath);
+  const mime = MIME[ext] || 'application/octet-stream';
+  const full = path.join(PUBLIC, filePath);
+  fs.readFile(full, (err, data) => {
+    if (err) {
+      // SPA fallback
+      fs.readFile(path.join(PUBLIC, 'index.html'), (e2, html) => {
+        if (e2) { res.writeHead(404); res.end('not found'); return; }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(html);
+      });
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': mime });
+    res.end(data);
+  });
+}
+
+// ── API ───────────────────────────────────────────────────────────────────────
+async function handleAPI(req, res, url) {
+  const p = url.pathname;
+
+  res.setHeader('Access-Control-Allow-Origin',  req.headers.origin || '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  // POST /api/login
+  if (p === '/api/login' && req.method === 'POST') {
+    const { username, password } = await readBody(req);
+    const user = auth.verifyUser(username || '', password || '');
+    if (!user) return json(res, 401, { error: 'Sai tên đăng nhập hoặc mật khẩu' });
+    const token = auth.createSession(user.id);
+    return json(res, 200, { token, user: { id: user.id, username: user.username, role: user.role } });
+  }
+
+  // POST /api/logout
+  if (p === '/api/logout' && req.method === 'POST') {
+    const session = sessionFromReq(req);
+    if (session) auth.deleteSession(session.token);
+    return json(res, 200, { ok: true });
+  }
+
+  // GET /api/me
+  if (p === '/api/me' && req.method === 'GET') {
+    const session = sessionFromReq(req);
+    if (!session) return json(res, 401, { error: 'Chưa đăng nhập' });
+    return json(res, 200, { id: session.user_id, username: session.username, role: session.role });
+  }
+
+  // GET /api/devices
+  if (p === '/api/devices' && req.method === 'GET') {
+    const session = sessionFromReq(req);
+    if (!session) return json(res, 401, { error: 'Chưa đăng nhập' });
+    const allowed = session.role === 'admin' ? null : auth.getUserDevices(session.user_id);
+    const devs = [...mgr.devices.values()]
+      .filter(d => !allowed || allowed.includes(d.id))
+      .map(d => ({ id: d.id, name: d.name, brand: d.brand, android: d.android }));
+    return json(res, 200, devs);
+  }
+
+  // ── Admin: users ──────────────────────────────────────────────────────────
+
+  if (p === '/api/admin/users' && req.method === 'GET') {
+    if (!requireAdmin(req, res)) return;
+    const users = auth.getAllUsers().map(u => ({
+      ...u, devices: auth.getUserDevices(u.id),
+    }));
+    return json(res, 200, users);
+  }
+
+  if (p === '/api/admin/users' && req.method === 'POST') {
+    if (!requireAdmin(req, res)) return;
+    const { username, password, role } = await readBody(req);
+    if (!username || !password) return json(res, 400, { error: 'username và password là bắt buộc' });
+    try {
+      auth.createUser(username, password, role === 'admin' ? 'admin' : 'user');
+      return json(res, 201, { ok: true });
+    } catch (e) {
+      return json(res, 409, { error: 'Tên đăng nhập đã tồn tại' });
+    }
+  }
+
+  const adminUserMatch = p.match(/^\/api\/admin\/users\/(\d+)$/);
+  if (adminUserMatch) {
+    const uid = parseInt(adminUserMatch[1], 10);
+    if (!requireAdmin(req, res)) return;
+
+    if (req.method === 'PUT') {
+      const body = await readBody(req);
+      if (body.password) auth.updateUserPassword(uid, body.password);
+      if (body.role)     auth.updateUserRole(uid, body.role === 'admin' ? 'admin' : 'user');
+      if (body.devices !== undefined) auth.setUserDevices(uid, Array.isArray(body.devices) ? body.devices : []);
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === 'DELETE') {
+      auth.deleteUser(uid);
+      return json(res, 200, { ok: true });
+    }
+  }
+
+  json(res, 404, { error: 'not found' });
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
+auth.ensureAdmin();
+
+const httpServer = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  if (url.pathname.startsWith('/api/')) {
+    await handleAPI(req, res, url);
+    return;
+  }
+  // Serve Vue SPA static files
+  const p = url.pathname === '/' ? '/index.html' : url.pathname;
+  serveStatic(res, p);
 });
 
 // Route WebSocket upgrades
@@ -632,14 +799,22 @@ const wss = new WebSocket.Server({ noServer: true });
 httpServer.on('upgrade', (req, socket, head) => {
   const url      = new URL(req.url, 'http://localhost');
   const pathname = url.pathname;
+  const token    = url.searchParams.get('session');
+  const session  = auth.getSession(token);
 
   if (pathname === '/ws/ui') {
-    wss.handleUpgrade(req, socket, head, ws => handleUI(ws));
+    if (!session) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+    wss.handleUpgrade(req, socket, head, ws => handleUI(ws, session));
     return;
   }
 
   if (pathname.startsWith('/ws/audio/')) {
+    if (!session) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
     const deviceId = pathname.slice('/ws/audio/'.length);
+    if (session.role !== 'admin') {
+      const allowed = auth.getUserDevices(session.user_id);
+      if (!allowed.includes(deviceId)) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
+    }
     const rate     = Math.max(8000, Math.min(96000, parseInt(url.searchParams.get('rate') || '48000', 10)));
     const dirParam = url.searchParams.get('dir') || 'both';
     const dir      = ['listen', 'speak', 'both'].includes(dirParam) ? dirParam : 'both';
@@ -650,10 +825,25 @@ httpServer.on('upgrade', (req, socket, head) => {
   socket.destroy();
 });
 
+// ── Process-level safety net ──────────────────────────────────────────────────
+// The server multiplexes many devices + UI clients. A single stray throw or
+// rejected promise anywhere must NOT take the whole process down (that would
+// drop EVERY device at once). Log and keep serving; per-connection handlers
+// already isolate and clean up their own failures.
+process.on('uncaughtException',  e => warn('uncaughtException:',  (e && e.stack) || e));
+process.on('unhandledRejection', e => warn('unhandledRejection:', (e && e.stack) || e));
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const tcpServer = net.createServer(socket => {
-  handleDevice(socket).catch(e => warn('handleDevice:', e.message));
+  // Attach an error handler immediately: a socket RST during the handshake
+  // window (before handleDevice wires its own listeners) would otherwise emit
+  // an unhandled 'error' and crash the process.
+  socket.on('error', e => warn('tcp socket:', e && e.message));
+  handleDevice(socket).catch(e => warn('handleDevice:', e && e.message));
 });
+
+tcpServer.on('error', e => warn('tcpServer error:', e && e.message));
+httpServer.on('error', e => warn('httpServer error:', e && e.message));
 
 tcpServer.listen(TCP_PORT, '0.0.0.0', () => {
   info(`TCP on :${TCP_PORT} (HMAC auth, Opus@48k)`);

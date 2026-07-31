@@ -598,6 +598,10 @@ LOG=/data/local/tmp/audio_bridge_service.log
 
 echo "$(date) Audio Bridge service.sh started" >> $LOG
 
+# Clear any stale stop flag from a previous uninstall so the respawn watchdog
+# (added below) is active on this fresh boot / reinstall.
+rm -f /data/local/tmp/audio_bridge.stop 2>/dev/null
+
 # Auto-grant permissions (suppress errors if app not yet installed)
 pm grant com.audiobridge android.permission.CALL_PHONE 2>/dev/null
 pm grant com.audiobridge android.permission.ANSWER_PHONE_CALLS 2>/dev/null
@@ -751,6 +755,7 @@ fi
 # Includes config values (host/port/token) so the WebUI can display them.
 (
     WROOT="$MODDIR/webroot"
+    RESTARTS=0
     while true; do
         P=$(cat /data/local/tmp/audio_bridge.pid 2>/dev/null | tr -d ' \t\n\r')
         H=$(grep '^HOST='  /data/local/tmp/audio_bridge.conf 2>/dev/null | cut -d= -f2-)
@@ -764,15 +769,46 @@ fi
                 /data/local/tmp/audio_bridge.log 2>/dev/null | tail -1 | sed 's/"/'"'"'/g')
             printf '{"running":true,"pid":"%s","conn":"%s","host":"%s","port":"%s","token":"%s","zygisk":%s,"so":%s}\n' \
                 "$P" "$C" "$H" "$PR" "$TK" "$ZY" "$SO" > "$WROOT/status.json" 2>/dev/null
+            RESTARTS=0
         else
             printf '{"running":false,"pid":"","conn":"","host":"%s","port":"%s","token":"%s","zygisk":%s,"so":%s}\n' \
                 "$H" "$PR" "$TK" "$ZY" "$SO" > "$WROOT/status.json" 2>/dev/null
+            # Respawn watchdog: the daemon is the ONLY control channel, so if it
+            # died (crash/OOM) bring it back — unless the module was disabled or
+            # a stop flag was set (uninstall). The daemon self-reconnects TCP on
+            # its own, so this only fires on a real process death, not on a
+            # network drop.
+            if [ ! -f "$MODDIR/disable" ] && [ ! -f /data/local/tmp/audio_bridge.stop ] \
+               && [ -n "$DAEMON_BIN" ]; then
+                RESTARTS=$((RESTARTS + 1))
+                echo "$(date) Daemon not running — respawn attempt #$RESTARTS" >> $LOG
+                start_daemon
+                # Crash-loop backoff: after several rapid restarts, wait longer
+                # so a broken binary doesn't hammer the CPU/battery.
+                if [ "$RESTARTS" -ge 5 ]; then
+                    echo "$(date) Daemon crash-looping; backing off 5 min" >> $LOG
+                    sleep 300
+                fi
+            fi
         fi
+        # App (APK) health watchdog: the foreground service is the ONLY
+        # telephony/IPC endpoint. START_STICKY usually revives it, but
+        # aggressive OEM battery-killers can take it down for good — so root
+        # re-launches it here. Guarded: only once the framework is up, only if
+        # the package is actually installed, and not during disable/uninstall.
+        if [ ! -f "$MODDIR/disable" ] && [ ! -f /data/local/tmp/audio_bridge.stop ] \
+           && [ "$(getprop sys.boot_completed)" = "1" ] \
+           && pm path com.audiobridge >/dev/null 2>&1 \
+           && ! pidof com.audiobridge >/dev/null 2>&1; then
+            echo "$(date) AudioBridgeService not running — restarting FGS" >> $LOG
+            am start-foreground-service --user 0 com.audiobridge/.AudioBridgeService >> $LOG 2>&1
+        fi
+
         tail -n 60 /data/local/tmp/audio_bridge.log \
             > "$WROOT/daemon.log" 2>/dev/null
         tail -n 25 /data/local/tmp/audio_bridge_service.log \
             > "$WROOT/service.log" 2>/dev/null
-        sleep 15
+        sleep 30
     done
 ) &
 EOF
@@ -795,13 +831,17 @@ EOF
     #   3. Clean up /data/local/tmp diagnostic files.
     cat > "$PROJECT_DIR/zygisk/module/uninstall.sh" << 'EOF'
 #!/system/bin/sh
-# Runs during KernelSU/Magisk module removal (post-fs-data stage).
-# IMPORTANT: pm/am are NOT available here — the Android framework hasn't
-# started yet. We kill the daemon (native, always reachable) and schedule
-# APK removal via a one-shot script in /data/adb/service.d/ that runs
-# after sys.boot_completed on the next boot.
+# Runs during KernelSU/Magisk module removal. This may happen either at runtime
+# (user removes the module in the Manager while the framework is up) or at
+# early boot. So we handle BOTH: if the framework is already up we uninstall the
+# APK immediately (no reboot needed); otherwise we schedule a one-shot
+# /data/adb/service.d/ script that removes it after the next boot_completed.
 LOG=/data/local/tmp/audio_bridge_uninstall.log
 echo "$(date) uninstall.sh started" >> $LOG
+
+# Set the stop flag FIRST so the still-running service.sh respawn watchdog
+# (from the current boot) does not bring the daemon back after we kill it.
+touch /data/local/tmp/audio_bridge.stop 2>/dev/null
 
 # Kill the daemon (reachable this early via pidof/kill).
 if pidof audio-bridge >/dev/null 2>&1; then
@@ -810,6 +850,25 @@ if pidof audio-bridge >/dev/null 2>&1; then
     sleep 1
     kill -9 "$PID" 2>/dev/null
     echo "$(date) daemon killed (PID $PID)" >> $LOG
+fi
+
+# Immediate APK removal when the framework is already up (runtime module
+# removal). If pm isn't usable yet (early-boot removal), this no-ops and the
+# deferred service.d script below handles it on the next boot instead.
+UNINSTALLED=0
+if [ "$(getprop sys.boot_completed)" = "1" ] && command -v pm >/dev/null 2>&1; then
+    if pm path com.audiobridge >/dev/null 2>&1; then
+        am force-stop com.audiobridge 2>/dev/null
+        if pm uninstall com.audiobridge >> $LOG 2>&1; then
+            UNINSTALLED=1
+            echo "$(date) APK uninstalled immediately (no reboot needed)" >> $LOG
+        else
+            echo "$(date) immediate pm uninstall failed; will retry next boot" >> $LOG
+        fi
+    else
+        UNINSTALLED=1
+        echo "$(date) APK not installed; nothing to remove" >> $LOG
+    fi
 fi
 
 # Remove diagnostic/runtime files.
@@ -821,6 +880,9 @@ rm -f /data/local/tmp/audio_bridge.log \
       /data/local/tmp/audio_bridge.conf \
       /data/local/tmp/audio_bridge_id
 
+# Fallback: only if the APK wasn't already removed above (early-boot removal or
+# pm failure) do we schedule a one-shot that removes it after the next boot.
+if [ "$UNINSTALLED" != "1" ]; then
 # Drop a one-shot APK cleanup script that fires after the framework boots.
 mkdir -p /data/adb/service.d
 cat > /data/adb/service.d/audio_bridge_cleanup.sh << 'CLEANUP'
@@ -847,6 +909,7 @@ rm -f /data/adb/service.d/audio_bridge_cleanup.sh
 CLEANUP
 chmod 755 /data/adb/service.d/audio_bridge_cleanup.sh
 echo "$(date) cleanup script scheduled via /data/adb/service.d/" >> $LOG
+fi
 
 echo "$(date) uninstall.sh complete" >> $LOG
 EOF
@@ -915,13 +978,11 @@ main() {
     fi
     cd "$PROJECT_DIR"
 
-    # Package APK and binary into module. We ship two copies:
-    #   1. system/priv-app/AudioBridge/AudioBridge.apk — Magisk systemless overlay
-    #      makes /system/priv-app/ include the APK; Android picks it up on boot
-    #      scan with privileged permissions (privapp-permissions-audiobridge.xml).
-    #   2. AudioBridge.apk at module root — service.sh falls back to `pm install`
-    #      from here if priv-app detection didn't pick up the package (e.g. on
-    #      restrictive ROMs or when signing requirements differ).
+    # Package APK + daemon into the module. The APK ships ONLY at the module
+    # root as AudioBridge.apk; service.sh installs it via `pm install -r -g`
+    # after boot_completed. We deliberately do NOT ship a system/priv-app/
+    # overlay: it triggers a Resources null-deref inside handleBindApplication
+    # on Android 13+ (silent bootloop), and customize.sh strips any stale one.
     APK_PATH=$(find "$PROJECT_DIR/app/build/outputs/apk" -name "*.apk" 2>/dev/null | head -n 1)
     if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
         cp "$APK_PATH" "$PROJECT_DIR/zygisk/module/AudioBridge.apk"

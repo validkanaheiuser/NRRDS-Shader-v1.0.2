@@ -374,6 +374,24 @@ struct DaemonConfig {
     int  pcm_tx_rate            = 8000;
     int  pcm_rx_device          = 0;
     int  pcm_rx_rate            = 16000;
+    // ── Idle control-socket tuning (battery vs reliability) ───────────────────
+    // The persistent TCP is a lightweight control channel when no call is
+    // active; audio only flows during a call. These knobs control how often
+    // the radio is woken while idle. Larger = less battery, but slower
+    // dead-connection detection and higher risk of carrier NAT dropping the
+    // mapping (which loses server-pushed commands until the next reconnect).
+    int  ping_interval_sec      = 60;   // app-level heartbeat ping cadence
+    int  pong_timeout_sec       = 180;  // disconnect if no pong within this
+    int  tcp_keepidle_sec       = 60;   // kernel keepalive: idle before 1st probe
+    int  tcp_keepintvl_sec      = 20;   // kernel keepalive: probe interval
+    int  tcp_keepcnt            = 3;    // kernel keepalive: failed probes = dead
+    int  status_poll_every_pings = 5;   // device-status IPC poll every N pings (0=off)
+    // ── Mic-injection jitter buffer (browser mic → phone uplink) ──────────────
+    // Frames are 20ms of Opus audio. target = how many to pre-buffer before
+    // playback starts (fixed added latency); max = queue cap (drop-oldest).
+    // Smaller = lower latency but more prone to audio gaps on a jittery link.
+    int  tx_jitter_target_frames = 2;   // prefill (2 = 40ms latency)
+    int  tx_jitter_max_frames    = 8;   // cap    (8 = 160ms worst case)
 };
 static DaemonConfig g_cfg;
 
@@ -441,13 +459,34 @@ static void load_config_json(const char* path) {
     g_cfg.pcm_rx_device = json_get_int_field(buf, "pcm_rx_capture_device", 0);
     g_cfg.pcm_rx_rate   = json_get_int_field(buf, "pcm_rx_capture_rate", 16000);
 
+    g_cfg.ping_interval_sec      = json_get_int_field(buf, "ping_interval_sec", 60);
+    g_cfg.pong_timeout_sec       = json_get_int_field(buf, "pong_timeout_sec", 180);
+    g_cfg.tcp_keepidle_sec       = json_get_int_field(buf, "tcp_keepidle_sec", 60);
+    g_cfg.tcp_keepintvl_sec      = json_get_int_field(buf, "tcp_keepintvl_sec", 20);
+    g_cfg.tcp_keepcnt            = json_get_int_field(buf, "tcp_keepcnt", 3);
+    g_cfg.status_poll_every_pings = json_get_int_field(buf, "status_poll_every_pings", 5);
+    g_cfg.tx_jitter_target_frames = json_get_int_field(buf, "tx_jitter_target_frames", 2);
+    g_cfg.tx_jitter_max_frames    = json_get_int_field(buf, "tx_jitter_max_frames", 8);
+
+    // Guard against pathological values that would break the watchdog logic.
+    if (g_cfg.ping_interval_sec < 5)   g_cfg.ping_interval_sec = 5;
+    if (g_cfg.pong_timeout_sec  < g_cfg.ping_interval_sec * 2)
+        g_cfg.pong_timeout_sec = g_cfg.ping_interval_sec * 2;
+    if (g_cfg.tx_jitter_target_frames < 1) g_cfg.tx_jitter_target_frames = 1;
+    if (g_cfg.tx_jitter_max_frames < g_cfg.tx_jitter_target_frames + 1)
+        g_cfg.tx_jitter_max_frames = g_cfg.tx_jitter_target_frames + 1;
+
     LOGI("config.json: host=%s port=%d tls=%d tx_dev=%d rx_dev=%d",
          g_cfg.host, g_cfg.port, g_cfg.use_tls, g_cfg.pcm_tx_device, g_cfg.pcm_rx_device);
+    LOGI("idle tuning: ping=%ds pong_timeout=%ds keepalive=%d/%d/%d status_every=%d pings",
+         g_cfg.ping_interval_sec, g_cfg.pong_timeout_sec, g_cfg.tcp_keepidle_sec,
+         g_cfg.tcp_keepintvl_sec, g_cfg.tcp_keepcnt, g_cfg.status_poll_every_pings);
+    LOGI("audio tuning: tx_jitter target=%d max=%d frames (20ms each)",
+         g_cfg.tx_jitter_target_frames, g_cfg.tx_jitter_max_frames);
 }
 
 // ── Voice Call PCM Context ────────────────────────────────────────────────────
-static constexpr int TX_TARGET_FRAMES = 5;
-static constexpr int TX_MAX_FRAMES    = 15;
+// Jitter-buffer depth is configurable via g_cfg.tx_jitter_{target,max}_frames.
 
 struct VoiceCallContext {
     std::atomic<bool> active{false};
@@ -601,7 +640,7 @@ static void enqueue_tx_opus_frame(const uint8_t* data, int len) {
     std::vector<uint8_t> pkt(data, data + len);
     {
         std::unique_lock<std::mutex> lk(g_voice.queue_mtx);
-        while ((int)g_voice.tx_queue.size() >= TX_MAX_FRAMES) {
+        while ((int)g_voice.tx_queue.size() >= g_cfg.tx_jitter_max_frames) {
             g_voice.tx_queue.pop_front();
             LOGW("tx queue full, dropping oldest frame");
         }
@@ -664,7 +703,7 @@ static void voice_tx_thread() {
         std::unique_lock<std::mutex> lk(g_voice.queue_mtx);
         g_voice.queue_cv.wait_for(lk, std::chrono::milliseconds(500),
             [&]{ return !g_voice.active.load() ||
-                 (int)g_voice.tx_queue.size() >= TX_TARGET_FRAMES; });
+                 (int)g_voice.tx_queue.size() >= g_cfg.tx_jitter_target_frames; });
     }
     LOGI("voice_tx: jitter buffer pre-fill done, starting PCM write");
 
@@ -1104,11 +1143,15 @@ static bool tcp_connect(const char* host, int port) {
         return false;
     }
     
-    // Enable TCP Keepalive so we detect dropped connections
+    // Enable TCP Keepalive so we detect dropped connections. These intervals
+    // are the single biggest idle-battery factor: the kernel wakes the radio
+    // every keepidle/keepintvl seconds. Defaults (60/20/3) keep the carrier
+    // NAT mapping alive and detect a dead peer within ~keepidle+keepintvl*keepcnt
+    // seconds, while waking the radio far less than the old 5/2/3 settings.
     int keepalive = 1;
-    int keepcnt = 3;
-    int keepidle = 5;
-    int keepintvl = 2;
+    int keepcnt   = g_cfg.tcp_keepcnt      > 0 ? g_cfg.tcp_keepcnt      : 3;
+    int keepidle  = g_cfg.tcp_keepidle_sec > 0 ? g_cfg.tcp_keepidle_sec : 60;
+    int keepintvl = g_cfg.tcp_keepintvl_sec> 0 ? g_cfg.tcp_keepintvl_sec: 20;
     setsockopt(g_net.fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
     setsockopt(g_net.fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
     setsockopt(g_net.fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
@@ -1588,18 +1631,29 @@ int main(int argc, char** argv) {
         std::thread status_thread(status_sender_thread, &g_net);
         std::thread mic_thread(receive_virtual_mic_thread, &g_net);
         
-        // Connection watchdog: 15s ping, 90s pong timeout
+        // Connection watchdog: lightweight when idle. Ping every
+        // ping_interval_sec, disconnect after pong_timeout_sec of silence.
+        // Sleep in short chunks so a dropped connection (g_connected flipped by
+        // another thread) is noticed within ~5s without waking as often as a
+        // per-second poll.
+        int slept      = 0;
+        int ping_count = 0;
         while(g_running && g_connected) {
-            sleep(15);
-            if(!g_connected) break;
+            sleep(5);
+            if(!g_running || !g_connected) break;
+            slept += 5;
 
             time_t now = time(nullptr);
-            if (now - g_last_pong.load() > 90) {
-                LOGW("Heartbeat timeout (90s without pong), disconnecting");
+            if (now - g_last_pong.load() > g_cfg.pong_timeout_sec) {
+                LOGW("Heartbeat timeout (%ds without pong), disconnecting",
+                     g_cfg.pong_timeout_sec);
                 g_connected = false;
                 g_status_cv.notify_all();
                 break;
             }
+
+            if (slept < g_cfg.ping_interval_sec) continue;
+            slept = 0;
 
             if(!send_frame(&g_net, T_PING, nullptr, 0)) {
                 LOGW("Ping send failed, disconnecting");
@@ -1607,7 +1661,13 @@ int main(int argc, char** argv) {
                 g_status_cv.notify_all();
                 break;
             }
-            send_to_java_raw("{\"command\":\"get_device_status\"}");
+
+            // Refresh device status only every Nth ping so we don't wake the
+            // Java process on every heartbeat (0 disables the periodic poll).
+            if (g_cfg.status_poll_every_pings > 0 &&
+                (++ping_count % g_cfg.status_poll_every_pings) == 0) {
+                send_to_java_raw("{\"command\":\"get_device_status\"}");
+            }
         }
 
         voice_call_stop();
